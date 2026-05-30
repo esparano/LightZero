@@ -629,6 +629,25 @@ def get_max_entropy(action_space_size: int) -> np.float32:
     p = 1.0 / action_space_size
     return -action_space_size * p * np.log2(p)
 
+def _calculate_action_probabilities(visit_counts, temperature):
+    # Calculate raw action probabilities
+    action_probs_raw = [visit_count_i ** (1 / temperature) for visit_count_i in visit_counts]
+
+    # Check if the sum is zero to prevent division by zero
+    sum_action_probs_raw = sum(action_probs_raw)
+    if sum_action_probs_raw == 0:
+        # If all visit counts are zero, distribute probabilities equally
+        num_actions = len(visit_counts)
+        if num_actions > 0:
+            logging.critical("CRITICAL: All actions have 0 visit count. Selecting random action.")
+            action_probs = [1 / num_actions for _ in range(num_actions)]
+        else:
+            logging.critical("CRITICAL: No legal actions were supplied. Selecting no action.")
+            action_probs = [] # Handle case with no actions
+    else:
+        # Normalize probabilities
+        action_probs = [x / sum_action_probs_raw for x in action_probs_raw]
+    return action_probs
 
 def select_action(visit_counts: np.ndarray,
                   temperature: float = 1,
@@ -645,8 +664,10 @@ def select_action(visit_counts: np.ndarray,
         - action_pos (:obj:`np.int64`): The selected action position (index).
         - visit_count_distribution_entropy (:obj:`np.ndarray`): The entropy of the visit count distribution.
     """
-    action_probs = [visit_count_i ** (1 / temperature) for visit_count_i in visit_counts]
-    action_probs = [x / sum(action_probs) for x in action_probs]
+    # action_probs = [visit_count_i ** (1 / temperature) for visit_count_i in visit_counts]
+    # action_probs = [x / sum(action_probs) for x in action_probs]
+    # Address divide by zero issue
+    action_probs = _calculate_action_probabilities(visit_counts, temperature)
 
     if deterministic:
         action_pos = np.argmax([v for v in visit_counts])

@@ -225,7 +225,7 @@ cd LightZero
 python3 -u zoo/classic_control/cartpole/config/cartpole_muzero_config.py
 ```
 
-Train a MuZero agent to play [Pong](https://gymnasium.farama.org/environments/atari/pong/):
+Train a MuZero agent to play [Atari](https://gymnasium.farama.org/environments/atari/pong/):
 
 ```bash
 cd LightZero
@@ -239,11 +239,14 @@ cd LightZero
 python3 -u zoo/board_games/tictactoe/config/tictactoe_muzero_bot_mode_config.py
 ```
 
-Train a UniZero agent to play [Pong](https://gymnasium.farama.org/environments/atari/pong/):
+Train a UniZero agent to play [Atari](https://gymnasium.farama.org/environments/atari/pong/):
 
 ```bash
 cd LightZero
 python3 -u zoo/atari/config/atari_unizero_segment_config.py
+```
+```
+```
 ```
 
 ## 📚 Documentation

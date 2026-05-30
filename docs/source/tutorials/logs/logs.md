@@ -102,6 +102,18 @@ The `log/learner/learner_logger.txt` file records various information about the 
 
 To facilitate experiment management, LightZero saves all scattered log files in the `log/serial` folder as a single Tensorboard log file, named in the format `events.out.tfevents.<timestamp>.<hostname>`. Through Tensorboard, users can monitor the trends of various metrics during the training process in real-time.
 
+Command example:
+tensorboard --logdir={logdir} --host 0.0.0.0 --port 6006
+
+where if you ran something like
+python3 -u zoo/classic_control/cartpole/config/cartpole_muzero_config.py
+then {logdir} will contain the exp_name plus a run ID, for example:
+
+tensorboard --logdir=./data_muzero/cartpole_muzero_ns25_upc100_rer0_seed0_260530_005825/log/serial/ --host 0.0.0.0 --port 6006
+
+then navigate to
+http://localhost:6006/
+
 ## Checkpoint Files
 
 The `ckpt` folder stores the checkpoint files of the model parameters:

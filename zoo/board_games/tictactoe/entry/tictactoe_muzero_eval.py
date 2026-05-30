@@ -2,6 +2,9 @@ from zoo.board_games.tictactoe.config.tictactoe_muzero_bot_mode_config import ma
 from lzero.entry import eval_muzero
 import numpy as np
 
+
+## Example command: python3 -u zoo/board_games/tictactoe/entry/tictactoe_muzero_eval.py
+
 if __name__ == "__main__":
     """
     Entry point for the evaluation of the MuZero model on the TicTacToe environment. 

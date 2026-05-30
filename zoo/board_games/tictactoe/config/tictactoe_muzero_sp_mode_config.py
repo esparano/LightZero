@@ -39,7 +39,8 @@ tictactoe_muzero_config = dict(
             value_support_range=(-10., 11., 1.),
         ),
         # (str) The path of the pretrained model. If None, the model will be initialized by the default model.
-        model_path=None,
+        # copy path from repository root
+        model_path=r'data_muzero/tictactoe_muzero_bot-mode_ns25_upc50_rer0.0_seed0/ckpt/ckpt_best.pth.tar',
         cuda=True,
         env_type='board_games',
         action_type='varied_action_space',
