@@ -1,6 +1,9 @@
 from easydict import EasyDict
 from zoo.atari.config.atari_env_action_space_map import atari_env_action_space_map
-env_id = 'PongNoFrameskip-v4'  # You can specify any Atari game here
+
+# env_id = 'PongNoFrameskip-v4'  # You can specify any Atari game here
+env_id = 'ALE/Pong-v5'
+# 6 (shoot, URLD, PASS)
 action_space_size = atari_env_action_space_map[env_id]
 
 # ==============================================================
@@ -12,6 +15,7 @@ collector_env_num = 8
 n_episode = 8
 evaluator_env_num = 3
 num_simulations = 50
+# learns policy for this many batch sizes (1000 * 256 samples from the replay buffer)
 update_per_collect = 1000
 batch_size = 256
 max_env_step = int(1e6)
@@ -24,7 +28,8 @@ atari_sampled_efficientzero_config = dict(
     exp_name=f'data_sez/{env_id[:-14]}_sampled_efficientzero_k{K}_ns{num_simulations}_upc{update_per_collect}_rer{reanalyze_ratio}_seed0',
     env=dict(
         env_id=env_id,
-        obs_shape=(4, 64, 64),
+        # obs_shape=(4, 96, 64),
+        obs_shape=(4, 96, 96),
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
         n_evaluator_episode=evaluator_env_num,
@@ -32,7 +37,8 @@ atari_sampled_efficientzero_config = dict(
     ),
     policy=dict(
         model=dict(
-            observation_shape=(4, 64, 64),
+            # observation_shape=(4, 64, 64),
+            observation_shape=(4, 96, 96),
             frame_stack_num=4,
             action_space_size=action_space_size,
             downsample=True,
@@ -41,8 +47,11 @@ atari_sampled_efficientzero_config = dict(
             discrete_action_encoding_type='one_hot',
             norm_type='BN', 
         ),
+
+        # tensorboard --logdir=./data_sez/_sampled_efficientzero_k5_ns50_upc1000_rer0.0_seed0/log/serial/ --host 0.0.0.0 --port 6007
+
         # (str) The path of the pretrained model. If None, the model will be initialized by the default model.
-        model_path=None,
+        model_path='data_sez/_sampled_efficientzero_k5_ns50_upc1000_rer0.0_seed0/ckpt/ckpt_best.pth.tar',
         cuda=True,
         env_type='not_board_games',
         game_segment_length=400,

@@ -1,7 +1,8 @@
 from easydict import EasyDict
 from zoo.atari.config.atari_env_action_space_map import atari_env_action_space_map
 
-env_id = 'PongNoFrameskip-v4'  # You can specify any Atari game here
+# env_id = 'PongNoFrameskip-v4'  # You can specify any Atari game here
+env_id = 'ALE/Pong-v5'
 action_space_size = atari_env_action_space_map[env_id]
 
 # ==============================================================
@@ -48,6 +49,11 @@ atari_efficientzero_config = dict(
             reward_support_range=(-50., 51., 1.),
             value_support_range=(-50., 51., 1.),
         ),
+
+        # tensorboard --logdir=./data_efficientzero/_efficientzero_stack4_H5_seed0_260602_141543/log/serial/ --host 0.0.0.0 --port 6006
+
+        # (str) The path of the pretrained model. If None, the model will be initialized by the default model.
+        model_path='data_efficientzero/_efficientzero_stack4_H5_seed0/ckpt/ckpt_best.pth.tar',
         cuda=True,
         env_type='not_board_games',
         game_segment_length=400,
@@ -90,9 +96,12 @@ create_config = atari_efficientzero_create_config
 
 if __name__ == "__main__":
     # Define a list of seeds for multiple runs
-    seeds = [0, 1, 2]  # You can add more seed values here
-    for seed in seeds:
-        # Update exp_name to include the current seed
-        main_config.exp_name = f'data_efficientzero/{env_id[:-14]}_efficientzero_stack4_H{num_unroll_steps}_seed{seed}'
-        from lzero.entry import train_muzero
-        train_muzero([main_config, create_config], seed=seed, max_env_step=max_env_step)
+    from lzero.entry import train_muzero
+    train_muzero([main_config, create_config], seed=0, model_path=main_config.policy.model_path, max_env_step=max_env_step)
+
+    # seeds = [0, 1, 2]  # You can add more seed values here
+    # for seed in seeds:
+    #     # Update exp_name to include the current seed
+    #     main_config.exp_name = f'data_efficientzero/{env_id[:-14]}_efficientzero_stack4_H{num_unroll_steps}_seed{seed}'
+    #     from lzero.entry import train_muzero
+    #     train_muzero([main_config, create_config], seed=0, max_env_step=max_env_step)
