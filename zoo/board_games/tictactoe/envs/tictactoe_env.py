@@ -689,9 +689,9 @@ class TicTacToeEnv(BaseEnv):
             width = int(width)
             height = int(height)
 
-            # Use the width and height values to reshape the numpy array
-            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
-            img = img.reshape(height, width, 3)
+            img = np.frombuffer(fig.canvas.buffer_rgba(), dtype='uint8')
+            img = img.reshape(height, width, 4)
+            img = img[:, :, :3]
 
             plt.close(fig)
 
