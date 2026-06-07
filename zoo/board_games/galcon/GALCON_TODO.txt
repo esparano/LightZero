@@ -15,91 +15,64 @@ Current agreed v1 assumptions
   - source/target are decoded from action - 1
 - Send ratio is fixed at 50%.
 - min_send_ships = 1 initially.
+- Ships are floats internally.
+- fleet_speed = 40.0 coordinate units per second.
 - Initial K = 16.
 - Initial num_simulations = 50.
 - Start with seeded random maps.
 - Use grid-based observations later.
 - Do not finalize model design until grid observation spec is defined.
 
-Clarifications / key concepts
------------------------------
-- max_episode_steps limits one episode/game.
-- max_env_step limits the total training run.
-- If max_episode_steps = 200 and tick_seconds = 0.25, one game lasts at most 50 simulated seconds.
-- In play_with_bot_mode, one outer env.step may apply two internal ticks:
-  - agent tick
-  - bot tick
-  This may affect how we set game_segment_length later.
-
-Environment TODOs
------------------
-[ ] Replace placeholder planet dictionaries with finalized Planet representation.
-[ ] Replace placeholder fleet dictionaries with finalized Fleet representation.
-[ ] Decide whether to use dictionaries, dataclasses, namedtuples, or lightweight classes.
-[ ] Add exact constants for player IDs and neutral owner ID.
-[ ] Add explicit pass action:
+Completed Phase 2 items
+-----------------------
+[x] Add explicit pass action:
     - action 0 = pass
     - action_space_size = num_planets * num_planets + 1
-[ ] Update action decoding to return (None, None) for pass.
-[ ] Update legal_actions to always include pass.
-[ ] Implement _apply_action:
+[x] Update action decoding to return (None, None) for pass.
+[x] Update legal_actions to always include pass.
+[x] Implement initial Planet representation.
+[x] Implement initial Fleet representation.
+[x] Add exact constants for player IDs and neutral owner ID.
+[x] Implement _apply_action:
     - decode source/target
     - validate legal send action
     - calculate ships sent as 50%
     - enforce min_send_ships
     - subtract ships from source
     - create fleet
-[ ] Decide rounding for ships sent:
-    - floor?
-    - ceil?
-    - round?
-    - allow fractional ships?
-[ ] Decide whether source planets may send to owned planets.
-[ ] Decide whether source planets may send to neutral planets.
-[ ] Decide whether source planets may send to enemy planets.
-[ ] Decide whether sending to self should be illegal, no-op, or separate from pass.
-[ ] Implement _advance_one_tick:
+[x] Decide ship representation:
+    - allow fractional ships internally.
+[x] Implement _advance_one_tick:
     - add production
     - move fleets
     - resolve landings
     - remove landed fleets
-[ ] Confirm update order:
-    - production first, then fleet movement?
-    - fleet movement first, then production?
-    Current previous code did production first.
-[ ] Implement production:
+[x] Confirm update order:
+    - production first, then fleet movement.
+[x] Implement production:
     - production 100 means 120 ships per minute.
-    - Convert production to ships per tick.
-[ ] Resolve mismatch in old code constants:
-    - Note old snippet had PROD_TO_SHIPS_PER_SEC = 50 and incomplete futureShips formula.
-    - Need exact conversion for production=100 -> 120 ships/min = 2 ships/sec.
-[ ] Implement fleet speed:
-    - previous TIME_TO_DIST = 40 / 100 normalized.
-    - Need decide coordinate units and distance per second.
-[ ] Implement fleet spawn offset:
+    - production / 50 = ships per second.
+[x] Implement fleet speed:
+    - fleet_speed = 40.0 coordinate units per second.
+[x] Implement fleet spawn offset:
     - spawn at source edge along vector toward target.
-[ ] Implement fleet landing:
+[x] Implement fleet landing:
     - if friendly: add ships
     - if enemy/neutral: subtract ships
     - if fleet ships exceed target ships: capture and leftover ships remain
-[ ] Decide whether neutral planets produce ships.
-    Previous code says neutral planets do not produce.
-[ ] Implement elimination winner:
-    - a player loses if no planets and no fleets?
-[ ] Implement timeout winner:
+[x] Decide neutral production:
+    - neutral planets do not produce.
+[x] Implement elimination winner:
+    - a player loses if no planets and no fleets.
+[x] Implement timeout winner:
     - higher total production wins.
     - if tied, higher total ships wins.
     - if still tied, draw.
-[ ] Decide whether timeout ship count includes:
-    - ships on planets only
-    - fleets only
-    - planets + fleets
-[ ] Decide whether timeout production includes:
-    - owned planets only
-    - home planets only
-    - planets currently being captured/contested?
-[ ] Decide whether a player can win before timeout by production dominance or only elimination.
-[ ] Add info dict fields:
+[x] Decide timeout ship count:
+    - planets + fleets.
+[x] Decide timeout production:
+    - owned planets only.
+[x] Add info dict fields:
     - winner
     - eval_episode_return
     - production_player_1
@@ -108,36 +81,45 @@ Environment TODOs
     - ships_player_2
     - step_count
     - simulated_seconds
-
-Map generation TODOs
---------------------
-[ ] Implement seeded random map generation.
-[ ] Preserve symmetric home planets:
+[x] Implement seeded mirrored map generation.
+[x] Preserve symmetric home planets:
     - player 1 home at (-180, 0)
     - player 2 home at (180, 0)
     - home ships = 100
     - home production = 100
     - home radius = 24
-[ ] Implement neutral planet generation.
-[ ] Confirm num_planets = 8 means:
-    - 2 homes + 6 neutrals?
-    - or 2 homes + mirrored neutral pairs?
-[ ] If mirrored neutral pairs are used, num_planets should be even.
-[ ] Reconcile old generation:
-    - NUM_NEUTRALS_PER_SIDE gives 2 * NUM_NEUTRALS_PER_SIDE neutral planets.
-    - For 8 planets total, NUM_NEUTRALS_PER_SIDE = 3.
-[ ] Implement neutral cost/ships:
+[x] Implement neutral planet generation.
+[x] Confirm num_planets = 8 means:
+    - 2 homes + 6 neutrals.
+[x] Use mirrored neutral pairs:
+    - For 8 planets total, neutral pairs = 3.
+[x] Implement neutral cost/ships:
     - neutral_cost = random.random() * 50
-[ ] Implement neutral production:
+[x] Implement neutral production:
     - p = random.random() * 85 + 15
-[ ] Implement radius formula:
+[x] Implement radius formula:
     - radius = (production * 12 / 5 + 168) / 17
-[ ] Decide coordinate range:
+[x] Use coordinate range:
     - x in [-200, 200]
     - y in [-120, 120]
-[ ] Decide whether map coordinates are normalized for observation.
+[x] Update action_space_size to num_planets * num_planets + 1.
+[x] Keep K=16 initially.
+[x] Keep num_simulations=50 initially.
+
+Remaining Environment TODOs
+---------------------------
 [ ] Decide minimum distance between planets to avoid overlap.
 [ ] Decide whether homes can overlap neutral spawn range.
+[ ] Decide whether fleet landing time should account for partial ticks.
+[ ] Decide whether production should account for partial ticks on landing.
+[ ] Decide whether pass should consume a tick.
+    Current implementation: yes.
+[ ] Decide whether pass should be encouraged/discouraged by any reward shaping.
+[ ] Decide whether timeout scoring should return only +/-1/0 or a margin-based reward.
+    Current implementation: +/-1/0.
+[ ] Decide whether training should use fixed maps first or randomized maps immediately.
+[ ] Decide whether map seed should be per episode, per env, or fixed across training.
+[ ] Tune max_episode_steps if games are too short/long.
 
 Observation / grid TODOs
 ------------------------
@@ -174,24 +156,18 @@ Observation / grid TODOs
 
 Bots TODOs
 ----------
-[ ] Keep GalconRandomBot.
-[ ] Keep GalconFixedPolicyBot.
-[ ] Define fixed policy behavior:
-    - first legal non-pass action?
-    - strongest source to weakest target?
-    - home to nearest neutral?
+[x] Keep GalconRandomBot.
+[x] Keep GalconFixedPolicyBot.
+[x] Fixed policy behavior:
+    - first legal non-pass action; otherwise pass.
 [ ] Add heuristic/rule bot later:
     - expand to neutral planets
     - attack weak enemy planets
     - reinforce threatened planets
-[ ] Update test_rule_bot.py to cover fixed policy behavior once finalized.
-[ ] Add bot vs bot sanity games.
+[ ] Add stronger bot vs bot sanity games.
 
 SampledEfficientZero config TODOs
 ---------------------------------
-[ ] Update action_space_size to num_planets * num_planets + 1.
-[ ] Keep K=16 initially.
-[ ] Keep num_simulations=50 initially.
 [ ] Decide final observation_shape after grid design.
 [ ] Set model_type='conv' and downsample=False for grid.
 [ ] Confirm SampledEfficientZeroModel supports chosen grid shape.
@@ -214,42 +190,28 @@ SampledEfficientZero config TODOs
 
 Testing TODOs
 -------------
-[ ] Update action-space tests for pass action.
-[ ] Test pass action is legal after reset.
-[ ] Test decode_action(0) returns pass.
-[ ] Test decode_action(1) returns source=0,target=0 or decide exact mapping.
-[ ] Test action_to_string(0) returns "Pass".
-[ ] Test legal action mask includes pass.
+[x] Update action-space tests for pass action.
+[x] Test pass action is legal after reset.
+[x] Test decode_action(0) returns pass.
+[x] Test action_to_string(0) returns "Pass".
+[x] Test legal action mask includes pass.
+[x] Test timeout winner by production.
+[x] Test production adds ships correctly.
+[x] Test seeded map determinism.
+[ ] Test decode_action(1) returns source=0,target=0.
 [ ] Test no legal sends still allows pass.
-[ ] Test timeout winner by production.
 [ ] Test timeout winner by ships if production tied.
 [ ] Test timeout draw if production and ships tied.
-[ ] Test production adds ships correctly.
-[ ] Test neutral planets do not produce, if that rule is kept.
+[ ] Test neutral planets do not produce.
 [ ] Test fleet movement.
 [ ] Test fleet capture.
 [ ] Test friendly fleet reinforcement.
 [ ] Test elimination winner.
-[ ] Test seeded map determinism.
 [ ] Test random maps differ with different seeds.
 [ ] Test bot mode reward perspective.
 [ ] Test eval mode reward perspective.
 
-Open design decisions
----------------------
-[ ] Exact Planet representation.
-[ ] Exact Fleet representation.
-[ ] Whether ships are floats or ints.
-[ ] Ship send rounding rule.
-[ ] Exact production conversion formula.
-[ ] Coordinate units and speed units.
-[ ] Whether fleet landing time should account for partial ticks.
-[ ] Whether production should account for partial ticks on landing.
-[ ] Whether players act sequentially or simultaneous approximation is needed later.
-[ ] Whether pass should consume a tick.
-[ ] Whether pass should be encouraged/discouraged by any reward shaping.
-[ ] Whether timeout scoring should return only +/-1/0 or a margin-based reward.
-[ ] Whether training should use fixed maps first or randomized maps immediately.
-[ ] Whether map seed should be per episode, per env, or fixed across training.
-[ ] Whether to support rendering in Phase 2 or delay it.
-[ ] Whether to create an eval script in zoo/board_games/galcon/eval/.
+Rendering / eval TODOs
+----------------------
+[ ] Decide whether to support rendering in Phase 2 or delay it.
+[ ] Decide whether to create an eval script in zoo/board_games/galcon/eval/.

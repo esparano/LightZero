@@ -1,4 +1,6 @@
 import copy
+import math
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -10,17 +12,50 @@ from gymnasium import spaces
 from zoo.board_games.galcon.envs.rule_bot import GalconFixedPolicyBot, GalconRandomBot
 
 
+@dataclass
+class Planet:
+    id: int
+    owner: int
+    ships: float
+    x: float
+    y: float
+    production: float
+    radius: float
+    neutral: bool
+
+
+@dataclass
+class Fleet:
+    id: int
+    owner: int
+    ships: float
+    x: float
+    y: float
+    source: int
+    target: int
+    radius: float
+
+
 @ENV_REGISTRY.register('galcon')
 class GalconEnv(BaseEnv):
     """
     Overview:
         A LightZero-compatible Galcon-style two-player environment.
 
-        Phase 1 scaffold only:
-        - Fixed small discrete action space: source_planet * num_planets + target_planet.
-        - Actions send a fixed ratio of ships.
-        - Exact planet/fleet/map/combat mechanics will be filled in later.
+        Phase 2 mechanics:
+        - action 0 is pass.
+        - actions 1..N*N are source-target send actions.
+        - send action sends a fixed ratio of source ships.
+        - one player action advances one simulation tick.
+        - timeout winner is decided by production, then total ships.
     """
+
+    PLAYER_1 = 1
+    PLAYER_2 = 2
+    NEUTRAL = 0
+
+    # production=100 means 120 ships/min = 2 ships/sec => production / 50 ships/sec.
+    PRODUCTION_TO_SHIPS_PER_SECOND_DIVISOR = 50.0
 
     config = dict(
         env_id='Galcon',
@@ -30,7 +65,11 @@ class GalconEnv(BaseEnv):
         min_send_ships=1,
         send_ratio=0.5,
         tick_seconds=0.25,
+        fleet_speed=40.0,
+        # TODO: update radius
+        fleet_radius=5,
         max_episode_steps=200,
+        map_seed=None,
         collector_env_num=8,
         evaluator_env_num=5,
         n_evaluator_episode=5,
@@ -60,21 +99,24 @@ class GalconEnv(BaseEnv):
 
         self.num_planets = self.cfg.num_planets
         self.pass_action = 0
-        # +1 for the "pass" action
         self.total_num_actions = self.num_planets * self.num_planets + 1
-        self.min_send_ships = self.cfg.min_send_ships
-        self.send_ratio = self.cfg.send_ratio
-        self.tick_seconds = self.cfg.tick_seconds
-        self.max_episode_steps = self.cfg.max_episode_steps
+        self.min_send_ships = float(self.cfg.min_send_ships)
+        self.send_ratio = float(self.cfg.send_ratio)
+        self.tick_seconds = float(self.cfg.tick_seconds)
+        self.fleet_speed = float(self.cfg.fleet_speed)
+        self.fleet_radius = float(self.cfg.fleet_radius)
+        self.max_episode_steps = int(self.cfg.max_episode_steps)
+        self.map_seed = self.cfg.get('map_seed', None)
 
         self.channel_last = self.cfg.channel_last
         self.scale = self.cfg.scale
         self.battle_mode = self.cfg.battle_mode
         assert self.battle_mode in ['self_play_mode', 'play_with_bot_mode', 'eval_mode']
 
-        self.players = [1, 2]
-        self._current_player = 1
+        self.players = [self.PLAYER_1, self.PLAYER_2]
+        self._current_player = self.PLAYER_1
         self._step_count = 0
+        self._next_fleet_id = self.num_planets
 
         self._action_space = spaces.Discrete(self.total_num_actions)
         self._reward_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
@@ -102,14 +144,15 @@ class GalconEnv(BaseEnv):
         else:
             raise ValueError(f'Unsupported Galcon bot_action_type: {self.bot_action_type}')
 
-        self.planets = []
-        self.fleets = []
+        self.planets: List[Planet] = []
+        self.fleets: List[Fleet] = []
         self.reset()
 
     def reset(self, start_player_index: int = 0, replay_name_suffix: Optional[str] = None) -> dict:
         self._step_count = 0
-        self.players = [1, 2]
+        self.players = [self.PLAYER_1, self.PLAYER_2]
         self._current_player = self.players[start_player_index]
+        self._next_fleet_id = self.num_planets
 
         self._generate_map()
 
@@ -117,33 +160,95 @@ class GalconEnv(BaseEnv):
 
     def _generate_map(self) -> None:
         """
-        TODO: Placeholder seeded/random map generation.
+        Generate a seeded mirrored Galcon map.
+
+        For num_planets=8:
+        - 2 home planets
+        - 6 neutral planets as 3 mirrored pairs
         """
-        self.planets = [
-            {
-                'id': i,
-                'owner': 0,
-                'ships': 0,
-                'production': 0,
-            }
-            for i in range(self.num_planets)
+        if self.num_planets < 2:
+            raise ValueError('GalconEnv requires at least 2 planets.')
+
+        if self.num_planets % 2 != 0:
+            raise ValueError('GalconEnv currently expects an even number of neutral planets.')
+
+        if self.map_seed is not None:
+            rng = np.random.RandomState(self.map_seed)
+        elif hasattr(self, '_seed'):
+            rng = np.random.RandomState(self._seed)
+        else:
+            rng = np.random.RandomState()
+
+        planets = [
+            Planet(
+                id=0,
+                owner=self.PLAYER_1,
+                ships=100.0,
+                x=-180.0,
+                y=0.0,
+                production=100.0,
+                radius=24.0,
+                neutral=False,
+            ),
+            Planet(
+                id=1,
+                owner=self.PLAYER_2,
+                ships=100.0,
+                x=180.0,
+                y=0.0,
+                production=100.0,
+                radius=24.0,
+                neutral=False,
+            ),
         ]
+
+        next_planet_id = 2
+        neutral_pairs = (self.num_planets - 2) // 2
+        for _ in range(neutral_pairs):
+            x = (rng.random_sample() * 2.0 - 1.0) * 200.0
+            y = (rng.random_sample() * 2.0 - 1.0) * 120.0
+            neutral_ships = rng.random_sample() * 50.0
+            production = rng.random_sample() * 85.0 + 15.0
+            radius = self._radius_from_production(production)
+
+            planets.append(
+                Planet(
+                    id=next_planet_id,
+                    owner=self.NEUTRAL,
+                    ships=float(neutral_ships),
+                    x=float(x),
+                    y=float(y),
+                    production=float(production),
+                    radius=float(radius),
+                    neutral=True,
+                )
+            )
+            next_planet_id += 1
+
+            planets.append(
+                Planet(
+                    id=next_planet_id,
+                    owner=self.NEUTRAL,
+                    ships=float(neutral_ships),
+                    x=float(-x),
+                    y=float(-y),
+                    production=float(production),
+                    radius=float(radius),
+                    neutral=True,
+                )
+            )
+            next_planet_id += 1
+
+        self.planets = planets
         self.fleets = []
 
-        if self.num_planets >= 2:
-            self.planets[0]['owner'] = 1
-            self.planets[0]['ships'] = 10
-            self.planets[0]['production'] = 1
-
-            self.planets[1]['owner'] = 2
-            self.planets[1]['ships'] = 10
-            self.planets[1]['production'] = 1
+    @staticmethod
+    def _radius_from_production(production: float) -> float:
+        return (production * 12.0 / 5.0 + 168.0) / 17.0
 
     def step(self, action: int) -> BaseEnvTimestep:
         if self.battle_mode == 'self_play_mode':
-            timestep = self._player_step(action, flag='agent')
-
-            return timestep
+            return self._player_step(action, flag='agent')
 
         elif self.battle_mode in ['play_with_bot_mode', 'eval_mode']:
             timestep_player1 = self._player_step(action, flag='agent')
@@ -165,7 +270,7 @@ class GalconEnv(BaseEnv):
 
     def _player_step(self, action: int, flag: str) -> BaseEnvTimestep:
         if action not in self.legal_actions:
-            action = self.random_action()
+            action = self.pass_action
 
         self._apply_action(action)
         self._advance_one_tick()
@@ -183,7 +288,7 @@ class GalconEnv(BaseEnv):
         else:
             reward = np.array(0).astype(np.float32)
 
-        info = {}
+        info = self._get_state_info(winner if done else -1)
         if done:
             info['eval_episode_return'] = reward
 
@@ -193,32 +298,101 @@ class GalconEnv(BaseEnv):
         return BaseEnvTimestep(obs, reward, done, info)
 
     def _apply_action(self, action: int) -> None:
-        """
-        Placeholder action application.
-
-        Later:
-        - decode source/target
-        - send fixed 50% ships
-        - create fleet
-        """
-        source, target = self.decode_action(action)
-        if source is None and target is None:
+        source_id, target_id = self.decode_action(action)
+        if source_id is None and target_id is None:
             return
 
-        _ = source, target
+        source = self.planets[source_id]
+        target = self.planets[target_id]
+
+        if source.owner != self._current_player:
+            return
+        if source_id == target_id:
+            return
+        if source.ships < self.min_send_ships:
+            return
+
+        ships_to_send = min(source.ships, source.ships * self.send_ratio)
+        if ships_to_send <= 0:
+            return
+
+        source.ships -= ships_to_send
+        source.ships = max(0.0, source.ships)
+
+        spawn_dx, spawn_dy = self._vector_components(source.x, source.y, target.x, target.y, source.radius)
+
+        self.fleets.append(
+            Fleet(
+                id=self._next_fleet_id,
+                owner=source.owner,
+                ships=float(ships_to_send),
+                x=float(source.x + spawn_dx),
+                y=float(source.y + spawn_dy),
+                source=source.id,
+                target=target.id,
+                radius=self.fleet_radius,
+            )
+        )
+        self._next_fleet_id += 1
 
     def _advance_one_tick(self) -> None:
-        """
-        Placeholder time update.
+        self._add_production()
+        self._move_fleets()
 
-        Later:
-        - move fleets
-        - resolve arrivals
-        - grow planets
-        """
-        pass
+    def _add_production(self) -> None:
+        for planet in self.planets:
+            if planet.neutral:
+                continue
+            if planet.owner == self.NEUTRAL:
+                continue
+            planet.ships += self._production_to_ships_per_second(planet.production) * self.tick_seconds
 
-    def decode_action(self, action: int) -> Tuple[int, int]:
+    def _production_to_ships_per_second(self, production: float) -> float:
+        return production / self.PRODUCTION_TO_SHIPS_PER_SECOND_DIVISOR
+
+    def _move_fleets(self) -> None:
+        fleet_update_distance = self.fleet_speed * self.tick_seconds
+        remaining_fleets = []
+
+        for fleet in self.fleets:
+            target = self.planets[fleet.target]
+            distance_to_target = self._distance(fleet.x, fleet.y, target.x, target.y)
+
+            if distance_to_target - fleet_update_distance < target.radius:
+                self._land_fleet(fleet)
+            else:
+                dx, dy = self._vector_components(fleet.x, fleet.y, target.x, target.y, fleet_update_distance)
+                fleet.x += dx
+                fleet.y += dy
+                remaining_fleets.append(fleet)
+
+        self.fleets = remaining_fleets
+
+    def _land_fleet(self, fleet: Fleet) -> None:
+        target = self.planets[fleet.target]
+
+        if fleet.owner == target.owner:
+            target.ships += fleet.ships
+            return
+
+        diff = target.ships - fleet.ships
+        if diff < 0:
+            target.ships = -diff
+            target.owner = fleet.owner
+            target.neutral = False
+        else:
+            target.ships = diff
+
+    @staticmethod
+    def _distance(x1: float, y1: float, x2: float, y2: float) -> float:
+        return math.hypot(x1 - x2, y1 - y2)
+
+    @staticmethod
+    def _vector_components(x1: float, y1: float, x2: float, y2: float, distance: float) -> Tuple[float, float]:
+        angle = math.atan2(y2 - y1, x2 - x1)
+        return distance * math.cos(angle), distance * math.sin(angle)
+
+    def decode_action(self, action: int) -> Tuple[Optional[int], Optional[int]]:
         if action == self.pass_action:
             return None, None
 
@@ -234,15 +408,11 @@ class GalconEnv(BaseEnv):
             source, target = self.decode_action(action)
             if source == target:
                 continue
-            if self.planets[source]['owner'] != self._current_player:
+            if self.planets[source].owner != self._current_player:
                 continue
-            if self.planets[source]['ships'] < self.min_send_ships:
+            if self.planets[source].ships < self.min_send_ships:
                 continue
             legal.append(action)
-
-        # Keep env usable during scaffolding.
-        if len(legal) == 0:
-            return [0]
 
         return legal
 
@@ -269,49 +439,77 @@ class GalconEnv(BaseEnv):
         """
         Placeholder grid observation.
 
-        The proper grid-based planet/fleet channels will be designed in a later phase.
+        Proper grid-based planet/fleet channels will be designed in the model/observation phase.
         """
         obs = np.zeros(self._observation_shape, dtype=np.float32)
 
         for planet in self.planets:
-            idx = planet['id']
-            # TODO: This code doesn't make sense
-            owner_value = planet['owner'] / 2.0 if self.scale else planet['owner']
+            idx = planet.id
+            owner_value = planet.owner / 2.0 if self.scale else planet.owner
             obs[0, idx, idx] = owner_value
 
         return obs
 
     def get_done_winner(self) -> Tuple[bool, int]:
-        """
-        Placeholder winner logic.
+        winner_by_elimination = self._winner_by_elimination()
+        if winner_by_elimination != -1:
+            return True, winner_by_elimination
 
-        Later:
-        - elimination winner
-        - at time limit: higher production wins; if tied, more ships wins; if tied, draw.
-        """
         if self._step_count >= self.max_episode_steps:
             return True, self._winner_by_timeout()
 
         return False, -1
 
+    def _winner_by_elimination(self) -> int:
+        p1_alive = self._player_has_planets_or_fleets(self.PLAYER_1)
+        p2_alive = self._player_has_planets_or_fleets(self.PLAYER_2)
+
+        if p1_alive and not p2_alive:
+            return self.PLAYER_1
+        if p2_alive and not p1_alive:
+            return self.PLAYER_2
+        return -1
+
+    def _player_has_planets_or_fleets(self, player: int) -> bool:
+        return any(p.owner == player for p in self.planets) or any(f.owner == player for f in self.fleets)
+
     def _winner_by_timeout(self) -> int:
-        p1_production = sum(p['production'] for p in self.planets if p['owner'] == 1)
-        p2_production = sum(p['production'] for p in self.planets if p['owner'] == 2)
+        p1_production = self._total_production(self.PLAYER_1)
+        p2_production = self._total_production(self.PLAYER_2)
 
         if p1_production > p2_production:
-            return 1
+            return self.PLAYER_1
         if p2_production > p1_production:
-            return 2
+            return self.PLAYER_2
 
-        p1_ships = sum(p['ships'] for p in self.planets if p['owner'] == 1)
-        p2_ships = sum(p['ships'] for p in self.planets if p['owner'] == 2)
+        p1_ships = self._total_ships(self.PLAYER_1)
+        p2_ships = self._total_ships(self.PLAYER_2)
 
         if p1_ships > p2_ships:
-            return 1
+            return self.PLAYER_1
         if p2_ships > p1_ships:
-            return 2
+            return self.PLAYER_2
 
         return -1
+
+    def _total_production(self, player: int) -> float:
+        return float(sum(p.production for p in self.planets if p.owner == player))
+
+    def _total_ships(self, player: int) -> float:
+        planet_ships = sum(p.ships for p in self.planets if p.owner == player)
+        fleet_ships = sum(f.ships for f in self.fleets if f.owner == player)
+        return float(planet_ships + fleet_ships)
+
+    def _get_state_info(self, winner: int) -> dict:
+        return {
+            'winner': winner,
+            'step_count': self._step_count,
+            'simulated_seconds': self._step_count * self.tick_seconds,
+            'production_player_1': self._total_production(self.PLAYER_1),
+            'production_player_2': self._total_production(self.PLAYER_2),
+            'ships_player_1': self._total_ships(self.PLAYER_1),
+            'ships_player_2': self._total_ships(self.PLAYER_2),
+        }
 
     def random_action(self) -> int:
         return int(np.random.choice(self.legal_actions))
@@ -346,8 +544,7 @@ class GalconEnv(BaseEnv):
 
     @property
     def current_player_index(self) -> int:
-        # Hack
-        return 0 if self._current_player == 1 else 1
+        return self.players.index(self._current_player)
 
     @property
     def next_player(self) -> int:

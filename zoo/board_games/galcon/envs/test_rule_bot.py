@@ -58,3 +58,24 @@ class TestGalconRuleBots:
         obs, reward, done, info = env.step(action)
 
         assert isinstance(obs, dict)
+
+    def test_random_bot_prefers_non_pass_when_available(self) -> None:
+        env = GalconEnv(EasyDict(self.cfg))
+        env.reset()
+
+        bot = GalconRandomBot(env)
+        action = bot.get_action()
+
+        assert action in env.legal_actions
+        assert action != env.pass_action
+
+
+    def test_fixed_policy_bot_prefers_non_pass_when_available(self) -> None:
+        env = GalconEnv(EasyDict(self.cfg))
+        env.reset()
+
+        bot = GalconFixedPolicyBot(env)
+        action = bot.get_action()
+
+        assert action in env.legal_actions
+        assert action != env.pass_action
