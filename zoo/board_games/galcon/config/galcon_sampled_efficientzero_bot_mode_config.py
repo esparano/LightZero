@@ -7,7 +7,9 @@ num_planets = 8
 min_send_ships = 1
 send_ratio = 0.5
 tick_seconds = 0.25
+fleet_speed = 40.0
 max_episode_steps = 200
+map_seed = None
 
 collector_env_num = 8
 n_episode = 8
