@@ -150,14 +150,17 @@ class SampledEfficientZeroModel(nn.Module):
         self.norm_type = norm_type
         self.num_of_sampled_actions = num_of_sampled_actions
 
-        if observation_shape[1] == 96:
-            latent_size = math.ceil(observation_shape[1] / 16) * math.ceil(observation_shape[2] / 16)
-        elif observation_shape[1] == 84:
-            latent_size = math.ceil(observation_shape[1] / 14) * math.ceil(observation_shape[2] / 14)
-        elif observation_shape[1] == 64:
-            latent_size = math.ceil(observation_shape[1] / 8) * math.ceil(observation_shape[2] / 8)
+        if downsample:
+            if observation_shape[1] == 96:
+                latent_size = math.ceil(observation_shape[1] / 16) * math.ceil(observation_shape[2] / 16)
+            elif observation_shape[1] == 84:
+                latent_size = math.ceil(observation_shape[1] / 14) * math.ceil(observation_shape[2] / 14)
+            elif observation_shape[1] == 64:
+                latent_size = math.ceil(observation_shape[1] / 8) * math.ceil(observation_shape[2] / 8)
+            else:
+                raise ValueError("Invalid observation shape, only support 64, 84, 96 when downsample=True.")
         else:
-            raise ValueError("Invalid observation shape, only support 64, 84, 96 for now.")
+            latent_size = observation_shape[1] * observation_shape[2]
 
         flatten_input_size_for_reward_head = (
             (reward_head_channels * latent_size) if downsample else

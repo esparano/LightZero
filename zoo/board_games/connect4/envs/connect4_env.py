@@ -169,7 +169,7 @@ class Connect4Env(BaseEnv):
             print(np.array(self.board).reshape(6, 7))
             logging.warning(
                 f"You input illegal action: {action}, the legal_actions are {self.legal_actions}. "
-                f"flag is {flag}."
+                f"flag is '{flag}'. "
                 f"Now we randomly choice a action from self.legal_actions."
             )
             action = self.random_action()
