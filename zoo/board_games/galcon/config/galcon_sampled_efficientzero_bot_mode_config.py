@@ -12,11 +12,12 @@ fleet_speed = 40.0
 max_episode_steps = 200
 map_seed = None
 
-grid_square_size = 20.0
+# Max grid size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8
+grid_square_size = 25.0
 grid_min_x = -200.0
 grid_max_x = 200.0
-grid_min_y = -120.0
-grid_max_y = 120.0
+grid_min_y = -125.0
+grid_max_y = 125.0
 neutral_min_cost = 0
 neutral_max_cost = 50
 neutral_min_production = 15

@@ -1,6 +1,9 @@
 import math
 from easydict import EasyDict
 
+# Monitoring: 
+# tensorboard --logdir=./data_sez/galcon_sampled_efficientzero_self-play_seed0_260608_030657/log/serial/ --host 0.0.0.0 --port 6006
+
 # ==============================================================
 # begin of the most frequently changed config specified by the user
 # ==============================================================
@@ -12,11 +15,12 @@ fleet_speed = 40.0
 max_episode_steps = 200
 map_seed = None
 
-grid_square_size = 20.0
+# Max grid size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8
+grid_square_size = 25.0
 grid_min_x = -200.0
 grid_max_x = 200.0
-grid_min_y = -120.0
-grid_max_y = 120.0
+grid_min_y = -125.0
+grid_max_y = 125.0
 neutral_min_cost = 0
 neutral_max_cost = 50
 neutral_min_production = 15
@@ -25,6 +29,7 @@ fleet_top_k = 3
 grid_width = int(math.ceil((grid_max_x - grid_min_x) / grid_square_size))
 grid_height = int(math.ceil((grid_max_y - grid_min_y) / grid_square_size))
 
+# TODO: Optimize all of this.
 collector_env_num = 8
 n_episode = 8
 evaluator_env_num = 5
@@ -45,6 +50,7 @@ galcon_sampled_efficientzero_config = dict(
     env=dict(
         # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
         battle_mode='self_play_mode',
+        # Which bot plays during eval
         bot_action_type='random',
         num_planets=num_planets,
         min_send_ships=min_send_ships,
@@ -87,6 +93,7 @@ galcon_sampled_efficientzero_config = dict(
             action_space_size=grid_width * grid_height * grid_width * grid_height + 1,
             continuous_action_space=False,
             num_of_sampled_actions=K,
+            # TODO: Strongly consider downsampling
             downsample=False,
             self_supervised_learning_loss=True,
             num_res_blocks=1,
