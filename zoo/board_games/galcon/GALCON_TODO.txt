@@ -106,6 +106,78 @@ Completed Phase 2 items
 [x] Keep K=16 initially.
 [x] Keep num_simulations=50 initially.
 
+Finalized Phase 3 action / observation design decisions
+--------------------------------------------------
+- The map is represented as a fixed grid.
+- Each grid square covers 20x20 world-coordinate units. This is because planets have a min radius of 12 with a spacing of 6.5 to allow ships through.
+- The grid must be large enough to cover:
+  - both home planets
+  - all neutral planet spawn locations
+  - expected fleet movement between planets
+- Action space uses grid-square source and target locations:
+  - action 0 = pass
+  - actions 1..G*G*G*G encode:
+    - Source_X
+    - Source_Y
+    - Target_X
+    - Target_Y
+  - Send percentage remains fixed for now.
+  - Percentage may become an explicit action component later.
+- Source_X, Source_Y, Target_X, and Target_Y are decoded mathematically from the action id.
+- If the selected source grid square contains one or more friendly planets, the send action uses the planet in that square as the source.
+- If the selected source grid square does not contain a valid friendly planet, the action is illegal and should be masked out.
+- If the selected target grid square contains a planet, the action targets that planet.
+- If the selected target grid square does not contain a planet, the action is illegal and should be masked out.
+- Fleet redirection is deferred:
+  - future action design will add an additional action layer with the same grid dimensions
+  - selecting a fleet-redirection source grid square will redirect all friendly fleets present in that square to the selected target square
+- Observation space is a channel-first grid tensor:
+  - shape = (channels, grid_height, grid_width)
+- X/Y grid-square coordinates are not included as channels because position is implicitly encoded by grid location.
+- Planet channels per grid square:
+  - planet local x offset within the 20x20 grid square
+  - planet local y offset within the 20x20 grid square
+  - planet production
+  - planet radius
+  - planet ships encoded linearly
+  - planet ships are broken up into 3 channels: friendly_ships, enemy_ships, neutral_ships
+- Fleet channels per grid square use K = 3 top fleets per side.
+- For each grid square, encode friendly fleets:
+  - largest K friendly fleets in descending ship count order
+  - one additional summary slot for all remaining smaller friendly fleets
+- For each grid square, encode enemy fleets:
+  - largest K enemy fleets in descending ship count order
+  - one additional summary slot for all remaining smaller enemy fleets
+- Each individual fleet slot encodes:
+  - target x
+  - target y
+  - fleet radius
+  - ship count encoded linearly for now
+  - time-to-land or distance encoded linearly
+- Remaining-fleet summary slots encode:
+  - sum of ship counts
+  - ship-weighted average target x
+  - ship-weighted average target y
+  - ship-weighted average time-to-land or distance
+  - ship-weighted average radius
+  - then normalize ship/time-or-distance fields as appropriate
+- Each grid square containing a planet also includes a future fleet landing schedule.
+- Future fleet landing schedule time buckets:
+  - [0, 1]
+  - [1, 2]
+  - [2, 4]
+  - [4, 6]
+  - [6, 8]
+  - [8, 10]
+  - [10, infinity)
+- For each landing schedule bucket, include four linearly-encoded / normalized ship channels (normalizing by 250 for now):
+  - friendly ships landing
+  - enemy ships landing
+  - max(friendly ships - enemy ships, 0)
+  - max(enemy ships - friendly ships, 0)
+- Landing schedule ship counts use the same linear ship encoding initially:
+  - ships / 250
+
 Remaining Environment TODOs
 ---------------------------
 [ ] Decide minimum distance between planets to avoid overlap.
@@ -120,39 +192,76 @@ Remaining Environment TODOs
 [ ] Decide whether training should use fixed maps first or randomized maps immediately.
 [ ] Decide whether map seed should be per episode, per env, or fixed across training.
 [ ] Tune max_episode_steps if games are too short/long.
+[ ] Implement grid-based action decoding:
+    - action 0 = pass
+    - actions 1..grid_width*grid_height*grid_width*grid_height encode source cell and target cell
+    - decode Source_X, Source_Y, Target_X, Target_Y mathematically from action id.
+[ ] Update legal action masking to use grid-source/grid-target actions.
+[ ] Add future fleet redirection action layer:
+    - same source/target grid dimensions
+    - all fleets present in selected source grid square are redirected to the target planet.
+[ ] Ensure there is only one planet in each square by separating planets by planet radius + 2*ship radius + delta
+[ ] Add approximate fleet "sticking" where the fleets bump into planets and are slowed down based on the cosine of crash angle
+[ ] Make sure that home planets can spawn at any point around the oval
 
 Observation / grid TODOs
 ------------------------
-[ ] Design grid observation representation.
-[ ] Decide grid size:
-    - e.g. 32x32, 48x48, 64x64?
+[x] Design grid observation representation.
+[x] Decide grid square world size:
+    - each grid square covers 20x20 world-coordinate units.
+[x] Decide that x/y grid-square coordinates are implicit and should not be included as channels.
+[x] Decide planet local-position channels:
+    - local x offset within the grid square
+    - local y offset within the grid square
+[x] Decide planet ownership encoding:
+    - separately encode friendly / enemy / neutral ships.
+[x] Decide initial planet ship encoding:
+    - Going with linear for now RATHER THAN logarithmic, i.e. (ln(ships + 1) / ln(150)).
+[x] Decide initial fleet aggregation rule:
+    - top K=3 friendly fleets by ship count plus one remaining-friendly summary slot
+    - top K=3 enemy fleets by ship count plus one remaining-enemy summary slot.
+[x] Decide future landing schedule buckets:
+    - [0,1], [1,2], [2,4], [4,6], [6,8], [8,10], [10,infinity).
+    - Note: on a 400 by 240 map, the longest possible flight is about 11.5 seconds
+[x] Decide landing schedule channels:
+    - friendly ships
+    - enemy ships
+    - max(friendly - enemy, 0)
+    - max(enemy - friendly, 0).
+[x] Decide whether grid origin should be centered on (0,0)
+    - Always center the map at (0,0)
+[ ] Implement final grid observation tensor.
 [ ] Decide channels for planets:
-    - current player planet indicator
-    - opponent planet indicator
-    - neutral planet indicator
-    - ship count
-    - production
-    - radius
-[ ] Decide channels for fleets:
-    - friendly fleet presence
-    - enemy fleet presence
-    - fleet ship count
-    - fleet direction x
-    - fleet direction y
-    - fleet target encoding
-[ ] Decide whether multiple planets/fleets can occupy same cell.
-[ ] Decide aggregation rule for multiple fleets in one grid cell.
-[ ] Decide scaling/normalization for:
-    - x/y
-    - ships
-    - production
-    - radius
-    - fleet distance/ETA
+    - planet local x offset
+    - planet local y offset
+    - friendly production (radius is a direct function of prod, so it isn't needed)
+    - enemy production
+    - friendly ship count
+    - enemy ship count
+    - neutral ship count
+[ ] Implement fleet top-K-per-cell encoding with K=3.
+[ ] Implement remaining-fleet summary slots with ship-weighted averages.
+[ ] Implement fleet target x/y encoding.
+[ ] Implement fleet radius encoding.
+[ ] Implement fleet ship count linear encoding.
+[ ] Implement fleet time-to-land or distance linear encoding.
+[ ] Implement future fleet landing schedule channels for planet-containing grid squares.
+[ ] Decide normalization for:
+    - local planet x/y offsets (0-1 based on grid cell position)
+    - target x/y (0-1 based on grid position)
+    - ships (0-1 based on the range 0-250)
+    - production (0-1 based on the range 15-100 which is the valid prod range)
+    - fleet radius (0-1 based on a radius of 200)
+    - fleet distance (linearly encoded based on max possible distance (hypotenuse of the grid) as the denominator)
 [ ] Decide whether to include current-player plane.
 [ ] Decide whether to encode observation from current-player perspective.
 [ ] Update observation_space after final observation shape is chosen.
 [ ] Update model.observation_shape after final observation shape is chosen.
 [ ] Update tests for final observation shape.
+[ ] Explore two-hot encoding instead of linear encoding for planet and fleet ships:
+    - use logarithmic base-2 ship-count bins
+    - example bins: 0 ships, 2 ships, 4 ships, 8 ships, ...
+    - example: 6 ships places 0.5 weight in the 4-ship bin and 0.5 weight in the 8-ship bin.
 
 Bots TODOs
 ----------

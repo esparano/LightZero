@@ -5,6 +5,8 @@ from gymnasium import spaces
 
 from zoo.board_games.galcon.envs.galcon_env import GalconEnv
 
+# Run all tests: 
+# pytest zoo/board_games/galcon/envs/
 
 @pytest.mark.envtest
 class TestGalconEnv:
@@ -20,6 +22,16 @@ class TestGalconEnv:
             fleet_speed=40.0,
             max_episode_steps=20,
             map_seed=0,
+            grid_square_size=20.0,
+            grid_min_x=-200.0,
+            grid_max_x=200.0,
+            grid_min_y=-120.0,
+            grid_max_y=120.0,
+            neutral_min_cost = 0,
+            neutral_max_cost = 50,
+            neutral_min_production = 15,
+            neutral_max_production = 100,
+            fleet_top_k=3,
             channel_last=False,
             scale=True,
             agent_vs_human=False,
@@ -38,15 +50,15 @@ class TestGalconEnv:
         assert 'observation' in obs
         assert 'action_mask' in obs
         assert 'to_play' in obs
-        assert obs['observation'].shape == (1, 8, 8)
-        assert obs['action_mask'].shape == (8 * 8 + 1,)
+        assert obs['observation'].shape == (76, 12, 20)
+        assert obs['action_mask'].shape == (20 * 12 * 20 * 12 + 1,)
 
     def test_action_space(self) -> None:
         env = GalconEnv(EasyDict(self.cfg))
         env.reset()
 
         assert isinstance(env.action_space, spaces.Discrete)
-        assert env.action_space.n == 8 * 8 + 1
+        assert env.action_space.n == 20 * 12 * 20 * 12 + 1
 
     def test_random_action_is_legal(self) -> None:
         env = GalconEnv(EasyDict(self.cfg))
@@ -61,14 +73,30 @@ class TestGalconEnv:
 
         assert env.pass_action == 0
         assert env.pass_action in env.legal_actions
-        assert env.decode_action(env.pass_action) == (None, None)
+        assert env.decode_action(env.pass_action) == (None, None, None, None)
         assert env.action_to_string(env.pass_action) == 'Pass'
+
+    def test_grid_action_encode_decode_round_trip(self) -> None:
+        env = GalconEnv(EasyDict(self.cfg))
+        env.reset()
+
+        action = env.encode_action(source_x=2, source_y=3, target_x=10, target_y=11)
+
+        assert env.decode_action(action) == (2, 3, 10, 11)
+
+    def test_decode_action_one_returns_first_grid_to_first_grid(self) -> None:
+        env = GalconEnv(EasyDict(self.cfg))
+        env.reset()
+
+        assert env.decode_action(1) == (0, 0, 0, 0)
 
     def test_send_action_creates_fleet(self) -> None:
         env = GalconEnv(EasyDict(self.cfg))
         env.reset()
 
-        action = 2  # shifted action 1 => source=0, target=1 for num_planets=8
+        source_grid_x, source_grid_y = env._world_to_grid(env.planets[0].x, env.planets[0].y)
+        target_grid_x, target_grid_y = env._world_to_grid(env.planets[1].x, env.planets[1].y)
+        action = env.encode_action(source_grid_x, source_grid_y, target_grid_x, target_grid_y)
         source_ships_before = env.planets[0].ships
 
         assert action in env.legal_actions
@@ -103,8 +131,8 @@ class TestGalconEnv:
         env1.reset()
         env2.reset()
 
-        planets1 = [(p.x, p.y, p.ships, p.production, p.radius) for p in env1.planets]
-        planets2 = [(p.x, p.y, p.ships, p.production, p.radius) for p in env2.planets]
+        planets1 = [(p.x, p.y, p.ships, p.production) for p in env1.planets]
+        planets2 = [(p.x, p.y, p.ships, p.production) for p in env2.planets]
 
         assert planets1 == planets2
 

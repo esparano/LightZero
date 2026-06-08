@@ -1,3 +1,4 @@
+import math
 from easydict import EasyDict
 
 # ==============================================================
@@ -10,6 +11,21 @@ tick_seconds = 0.25
 fleet_speed = 40.0
 max_episode_steps = 200
 map_seed = None
+
+grid_square_size = 20.0
+grid_min_x = -200.0
+grid_max_x = 200.0
+grid_min_y = -120.0
+grid_max_y = 120.0
+neutral_min_cost = 0
+neutral_max_cost = 50
+neutral_min_production = 15
+neutral_max_production = 100
+fleet_top_k = 3
+grid_width = int(math.ceil((grid_max_x - grid_min_x) / grid_square_size))
+grid_height = int(math.ceil((grid_max_y - grid_min_y) / grid_square_size))
+
+
 
 collector_env_num = 8
 n_episode = 8
@@ -29,13 +45,26 @@ mcts_ctree = False
 galcon_sampled_efficientzero_config = dict(
     exp_name='data_sez/galcon_sampled_efficientzero_bot_seed0',
     env=dict(
+        # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
         battle_mode='play_with_bot_mode',
         bot_action_type='fixed',
         num_planets=num_planets,
         min_send_ships=min_send_ships,
         send_ratio=send_ratio,
         tick_seconds=tick_seconds,
+        fleet_speed=fleet_speed,
         max_episode_steps=max_episode_steps,
+        map_seed=map_seed,
+        grid_square_size=grid_square_size,
+        grid_min_x=grid_min_x,
+        grid_max_x=grid_max_x,
+        grid_min_y=grid_min_y,
+        grid_max_y=grid_max_y,
+        neutral_min_cost=neutral_min_cost,
+        neutral_max_cost=neutral_max_cost,
+        neutral_min_production=neutral_min_production,
+        neutral_max_production=neutral_max_production,
+        fleet_top_k=fleet_top_k,
         channel_last=False,
         scale=True,
         collector_env_num=collector_env_num,
@@ -52,11 +81,12 @@ galcon_sampled_efficientzero_config = dict(
     policy=dict(
         model=dict(
             model_type='conv',
-            # Placeholder until the grid observation spec is finalized.
-            observation_shape=(1, num_planets, num_planets),
-            image_channel=1,
+            # There are currently 76 different channels represending planet and fleet info
+            observation_shape=(76, grid_height, grid_width),
+            image_channel=76,
+            # Only the most recent frame is passed to the NN
             frame_stack_num=1,
-            action_space_size=num_planets * num_planets + 1,
+            action_space_size=grid_width * grid_height * grid_width * grid_height + 1,
             continuous_action_space=False,
             num_of_sampled_actions=K,
             downsample=False,
