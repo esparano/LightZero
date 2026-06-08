@@ -421,7 +421,7 @@ class MuZeroEvaluator(ISerialEvaluator):
                 'avg_envstep_per_episode': envstep_count / n_episode if n_episode > 0 else 0,
                 'evaluate_time': duration,
                 'avg_envstep_per_sec': envstep_count / duration if duration > 0 else 0,
-                'avg_time_per_episode': n_episode / duration if duration > 0 else 0,
+                'avg_time_per_episode': duration / n_episode if n_episode > 0 else 0,
                 'reward_mean': np.mean(episode_return),
                 'reward_std': np.std(episode_return),
                 'reward_max': np.max(episode_return),
