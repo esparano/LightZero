@@ -59,7 +59,12 @@ class GalconEnv(BaseEnv):
     # production=100 means 120 ships/min = 2 ships/sec => production / 50 ships/sec.
     PRODUCTION_TO_SHIPS_PER_SECOND_DIVISOR = 50.0
     # TODO: For now, fleet radius is just a constant.
-    DUMMY_FLEET_RADIUS = 10
+    DUMMY_FLEET_RADIUS = 10.0
+    SHIP_RADIUS = 6.0
+    # Leave an extra bit of space between planets (beyond 2 * SHIP_RADIUS) so that ships can always fit through
+    PLANETS_SETTLE_DELTA = 0.5
+    # Number of attempts to settle planets (usually finishes in 1 or 2 attempts, and it will break early if successful)
+    MAX_SETTLE_ATTEMPTS = 10
 
     PLANET_LOCAL_X_CHANNEL = 0
     PLANET_LOCAL_Y_CHANNEL = 1
@@ -95,11 +100,12 @@ class GalconEnv(BaseEnv):
         fleet_speed=40.0,
         max_episode_steps=200,
         map_seed=None,
-        grid_square_size=20.0,
+        # Max grid size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8
+        grid_square_size=25.0,
         grid_min_x=-200.0,
         grid_max_x=200.0,
-        grid_min_y=-120.0,
-        grid_max_y=120.0,
+        grid_min_y=-125.0,
+        grid_max_y=125.0,
         neutral_min_cost = 0,
         neutral_max_cost = 50,
         neutral_min_production = 15,
@@ -231,6 +237,7 @@ class GalconEnv(BaseEnv):
 
         # Also resets planets and fleets
         self._generate_map()
+        self._settle_planets()
 
         return self.observe()
 
@@ -317,6 +324,73 @@ class GalconEnv(BaseEnv):
 
         self.planets = planets
         self.fleets = []
+
+    def _settle_planets(self):
+        # Settle planets to prevent overlap
+        min_gap = 2 * self.SHIP_RADIUS + self.PLANETS_SETTLE_DELTA
+
+        if self.map_seed is not None:
+            rng = np.random.RandomState(self.map_seed)
+        elif hasattr(self, '_seed'):
+            rng = np.random.RandomState(self._seed)
+        else:
+            rng = np.random.RandomState()
+
+        # Run relaxation simulation to settle the positions of neutral planets
+        for _ in range(self.MAX_SETTLE_ATTEMPTS):
+            moved = False
+            displacements = {}
+            for i in range(0, len(self.planets), 2):  # Only adjust the first of each neutral pair (even IDs)
+                p_i = self.planets[i]
+                dx_total = 0.0
+                dy_total = 0.0
+
+                for j in range(len(self.planets)):
+                    if j == i:
+                        continue
+                    p_j = self.planets[j]
+
+                    dist = math.hypot(p_i.x - p_j.x, p_i.y - p_j.y)
+                    min_dist = p_i.radius + p_j.radius + min_gap
+
+                    # If the planets are at least the minimum distance apart + half of the "tolerance", it's close enough. 
+                    if dist < min_dist:
+                        overlap = min_dist - dist
+                        if dist < 1e-4:
+                            # Perturb in a random direction if they are exactly at the same position
+                            angle = rng.uniform(0, 2 * math.pi)
+                            ux, uy = math.cos(angle), math.sin(angle)
+                        else:
+                            ux = (p_i.x - p_j.x) / dist
+                            uy = (p_i.y - p_j.y) / dist
+
+                        step = 0.5 * overlap + 0.01 # add a tiny bit more to deal with floating point numbers
+                        dx_total += ux * step
+                        dy_total += uy * step
+                        moved = True
+
+                displacements[i] = (dx_total, dy_total)
+
+            if not moved:
+                break
+
+            for i in range(0, len(self.planets), 2):
+                p_i = self.planets[i]
+                dx, dy = displacements[i]
+                p_i.x += dx
+                p_i.y += dy
+
+                # Keep within map boundaries
+                margin_x = p_i.radius + self.SHIP_RADIUS
+                margin_y = p_i.radius + self.SHIP_RADIUS
+                p_i.x = max(self.grid_min_x + margin_x, min(self.grid_max_x - margin_x, p_i.x))
+                p_i.y = max(self.grid_min_y + margin_y, min(self.grid_max_y - margin_y, p_i.y))
+
+                # Update the mirrored partner
+                p_odd = self.planets[i + 1]
+                p_odd.x = -p_i.x
+                p_odd.y = -p_i.y
+
 
     @staticmethod
     def _radius_from_production(production: float) -> float:

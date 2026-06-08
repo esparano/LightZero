@@ -165,3 +165,21 @@ class TestGalconEnv:
 
         assert done
         assert step <= self.cfg.max_episode_steps + 5
+
+    def test_planets_do_not_overlap(self) -> None:
+        env = GalconEnv(EasyDict(self.cfg))
+        for seed in range(10):
+            env.cfg.map_seed = seed
+            env.reset()
+
+            SHIP_RADIUS = 6.0
+            PLANETS_SETTLE_DELTA = 0.5
+            min_gap = 2 * SHIP_RADIUS + PLANETS_SETTLE_DELTA
+
+            for i in range(len(env.planets)):
+                p_i = env.planets[i]
+                for j in range(i + 1, len(env.planets)):
+                    p_j = env.planets[j]
+                    dist = np.hypot(p_i.x - p_j.x, p_i.y - p_j.y)
+                    min_dist = p_i.radius + p_j.radius + min_gap
+                    assert dist >= min_dist - 1e-5, f"Planets {i} and {j} overlap or are too close! dist={dist}, min_dist={min_dist}"
