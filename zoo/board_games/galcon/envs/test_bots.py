@@ -3,6 +3,8 @@ from easydict import EasyDict
 
 from zoo.board_games.galcon.envs.galcon_env import GalconEnv
 
+# Run all tests: 
+# pytest zoo/board_games/galcon/envs/
 
 @pytest.mark.unittest
 class TestGalconBots:
@@ -15,9 +17,19 @@ class TestGalconBots:
             min_send_ships=1,
             send_ratio=0.5,
             tick_seconds=0.25,
-            fleet_speed = 40.0,
-            max_episode_steps = 20,
-            map_seed = 0,
+            fleet_speed=40.0,
+            max_episode_steps=20,
+            map_seed=0,
+            grid_square_size=20.0,
+            grid_min_x=-200.0,
+            grid_max_x=200.0,
+            grid_min_y=-120.0,
+            grid_max_y=120.0,
+            neutral_min_cost = 0,
+            neutral_max_cost = 50,
+            neutral_min_production = 15,
+            neutral_max_production = 100,
+            fleet_top_k=3,
             channel_last=False,
             scale=True,
             agent_vs_human=False,
