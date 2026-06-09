@@ -445,6 +445,7 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         if self._cfg.model.continuous_action_space is True:
             # when the action space of the environment is continuous, action_mask[:] is None.
             action_mask = [
+                # Is this correct?
                 list(np.ones(self._cfg.model.action_space_size, dtype=np.int8)) for _ in range(transition_batch_size)
             ]
             # NOTE: in continuous action space env, we set all legal_actions as -1
@@ -457,7 +458,6 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         with torch.no_grad():
             policy_obs_list = prepare_observation(policy_obs_list, self._cfg.model.model_type)
             # split a full batch into slices of mini_infer_size: to save the GPU memory for more GPU actors
-            self._cfg.mini_infer_size = self._cfg.mini_infer_size
             slices = np.ceil(transition_batch_size / self._cfg.mini_infer_size).astype(np.int_)
             network_output = []
             for i in range(slices):
@@ -569,14 +569,14 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                                 policy = [visit_count / sum_visits for visit_count in distributions]
                                 target_policies.append(policy)
                             else:
-                                # for two_player board games
-                                policy_tmp = [0 for _ in range(self._cfg.model.num_of_sampled_actions)]
-                                # to make sure target_policies have the same dimension
+                                # for board games / varied action space:
+                                # distributions is already K-length (one per sampled action),
+                                # so just normalize and use directly.
+                                # Do NOT use legal_action as an array index — for large/sparse
+                                # action spaces (e.g. Galcon) the action ID >> num_of_sampled_actions.
                                 sum_visits = sum(distributions)
                                 policy = [visit_count / sum_visits for visit_count in distributions]
-                                for index, legal_action in enumerate(roots_legal_actions_list[policy_index]):
-                                    policy_tmp[legal_action] = policy[index]
-                                target_policies.append(policy_tmp)
+                                target_policies.append(policy)
 
                     policy_index += 1
 
@@ -585,6 +585,52 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         batch_target_policies_re = np.array(batch_target_policies_re)
 
         return batch_target_policies_re, root_sampled_actions
+
+    def _compute_target_policy_non_reanalyzed(
+            self, policy_non_re_context: List[Any], policy_shape: int
+    ) -> np.ndarray:
+        """
+        Overview:
+            Prepare policy targets from the non-reanalyzed context of policies for Sampled EfficientZero.
+            This overrides the base class method to handle sampled action spaces correctly.
+
+            In sampled buffers, ``child_visit[current_index]`` is already a K-length distribution
+            (visit counts normalized during collection), so we use it directly.
+            The base class's approach of indexing via raw action IDs (``policy_tmp[legal_action]``)
+            would crash for large/sparse action spaces (e.g. Galcon's ~10k actions) because
+            ``policy_shape = num_of_sampled_actions = K`` is only 16 or so.
+        Arguments:
+            - policy_non_re_context (:obj:`List`): List of policy context
+            - policy_shape (:obj:`int`): should be num_of_sampled_actions (K)
+        Returns:
+            - batch_target_policies_non_re (:obj:`np.ndarray`)
+        """
+        batch_target_policies_non_re = []
+        if policy_non_re_context is None:
+            return batch_target_policies_non_re
+
+        pos_in_game_segment_list, child_visits, game_segment_lens, action_mask_segment, to_play_segment = policy_non_re_context
+
+        for game_segment_len, child_visit, state_index in zip(game_segment_lens, child_visits, pos_in_game_segment_list):
+            target_policies = []
+            for current_index in range(state_index, state_index + self._cfg.num_unroll_steps + 1):
+                if current_index < game_segment_len:
+                    # child_visit[current_index] is already a K-length sampled distribution
+                    distributions = child_visit[current_index]
+                    if distributions is None or len(distributions) == 0:
+                        target_policies.append(
+                            list(np.ones(policy_shape) / policy_shape)
+                        )
+                    else:
+                        target_policies.append(list(distributions))
+                else:
+                    # Invalid padding: zero policy so cross_entropy_loss = 0
+                    target_policies.append([0. for _ in range(policy_shape)])
+
+            batch_target_policies_non_re.append(target_policies)
+
+        batch_target_policies_non_re = np.asarray(batch_target_policies_non_re)
+        return batch_target_policies_non_re
 
     def update_priority(self, train_data: List[np.ndarray], batch_priorities: Any) -> None:
         """
