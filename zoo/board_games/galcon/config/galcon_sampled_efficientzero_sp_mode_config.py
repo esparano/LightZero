@@ -7,37 +7,44 @@ from easydict import EasyDict
 # ==============================================================
 # begin of the most frequently changed config specified by the user
 # ==============================================================
-num_planets = 8
+# num_planets = 8
+num_planets = 4
 min_send_ships = 1
 send_ratio = 0.5
 tick_seconds = 0.25
 fleet_speed = 40.0
-max_episode_steps = 200
+# 100 * 0.25 = 25 seconds per game
+max_episode_steps = 100
 map_seed = None
 
-# Max grid size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8
+# grid square size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8 while still preventing more than 1 planet per cell
 grid_square_size = 25.0
-grid_min_x = -200.0
-grid_max_x = 200.0
-grid_min_y = -125.0
-grid_max_y = 125.0
+# grid_max_x = 200.0
+# grid_max_y = 125.0
+grid_max_x = 50.0
+grid_max_y = 50.0
+# If 1, homes always spawn on an ellipse touching the sides of the box. If in between, the ellipse shrinks proportionally.
+home_distance_fraction = 0.8
 neutral_min_cost = 0
-neutral_max_cost = 50
+# neutral_max_cost = 50
+neutral_max_cost = 10
 neutral_min_production = 15
 neutral_max_production = 100
 fleet_top_k = 3
-grid_width = int(math.ceil((grid_max_x - grid_min_x) / grid_square_size))
-grid_height = int(math.ceil((grid_max_y - grid_min_y) / grid_square_size))
+grid_width = int(math.ceil((2 * grid_max_x) / grid_square_size))
+grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
 
 # TODO: Optimize all of this.
 collector_env_num = 8
 n_episode = 8
+# The number of games to play during evaluation
 evaluator_env_num = 5
 num_simulations = 50
 K = 16
 update_per_collect = 50
 reanalyze_ratio = 0.
 batch_size = 256
+# Training will halt automatically after this many environment steps (ticks)
 max_env_step = int(5e5)
 model_path = None
 mcts_ctree = False
@@ -60,10 +67,11 @@ galcon_sampled_efficientzero_config = dict(
         max_episode_steps=max_episode_steps,
         map_seed=map_seed,
         grid_square_size=grid_square_size,
-        grid_min_x=grid_min_x,
+        # the map extends from -x to +x and -y to +y
         grid_max_x=grid_max_x,
-        grid_min_y=grid_min_y,
         grid_max_y=grid_max_y,
+        # If 1, homes always spawn on an ellipse touching the sides of the box. If in between, the ellipse shrinks proportionally.
+        home_distance_fraction=home_distance_fraction,
         neutral_min_cost=neutral_min_cost,
         neutral_max_cost=neutral_max_cost,
         neutral_min_production=neutral_min_production,
@@ -93,7 +101,6 @@ galcon_sampled_efficientzero_config = dict(
             action_space_size=grid_width * grid_height * grid_width * grid_height + 1,
             continuous_action_space=False,
             num_of_sampled_actions=K,
-            # TODO: Strongly consider downsampling
             downsample=False,
             self_supervised_learning_loss=True,
             num_res_blocks=1,

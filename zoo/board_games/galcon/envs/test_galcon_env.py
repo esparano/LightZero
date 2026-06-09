@@ -22,11 +22,10 @@ class TestGalconEnv:
             fleet_speed=40.0,
             max_episode_steps=20,
             map_seed=0,
-            grid_square_size=20.0,
-            grid_min_x=-200.0,
+            grid_square_size=25.0,
             grid_max_x=200.0,
-            grid_min_y=-120.0,
-            grid_max_y=120.0,
+            grid_max_y=125.0,
+            home_distance_fraction=0.8,
             neutral_min_cost = 0,
             neutral_max_cost = 50,
             neutral_min_production = 15,
@@ -50,15 +49,15 @@ class TestGalconEnv:
         assert 'observation' in obs
         assert 'action_mask' in obs
         assert 'to_play' in obs
-        assert obs['observation'].shape == (76, 12, 20)
-        assert obs['action_mask'].shape == (20 * 12 * 20 * 12 + 1,)
+        assert obs['observation'].shape == (76, 10, 16)
+        assert obs['action_mask'].shape == (16 * 10 * 16 * 10 + 1,)
 
     def test_action_space(self) -> None:
         env = GalconEnv(EasyDict(self.cfg))
         env.reset()
 
         assert isinstance(env.action_space, spaces.Discrete)
-        assert env.action_space.n == 20 * 12 * 20 * 12 + 1
+        assert env.action_space.n == 16 * 10 * 16 * 10 + 1
 
     def test_random_action_is_legal(self) -> None:
         env = GalconEnv(EasyDict(self.cfg))
@@ -80,9 +79,9 @@ class TestGalconEnv:
         env = GalconEnv(EasyDict(self.cfg))
         env.reset()
 
-        action = env.encode_action(source_x=2, source_y=3, target_x=10, target_y=11)
+        action = env.encode_action(source_x=1, source_y=2, target_x=3, target_y=4)
 
-        assert env.decode_action(action) == (2, 3, 10, 11)
+        assert env.decode_action(action) == (1, 2, 3, 4)
 
     def test_decode_action_one_returns_first_grid_to_first_grid(self) -> None:
         env = GalconEnv(EasyDict(self.cfg))
