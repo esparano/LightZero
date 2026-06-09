@@ -14,18 +14,17 @@ map_seed = None
 
 # Max grid size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8
 grid_square_size = 25.0
-grid_min_x = -200.0
 grid_max_x = 200.0
-grid_min_y = -125.0
 grid_max_y = 125.0
+# If 1, homes always spawn on an ellipse touching the sides of the box. If in between, the ellipse shrinks proportionally.
+home_distance_fraction = 0.8
 neutral_min_cost = 0
 neutral_max_cost = 50
 neutral_min_production = 15
 neutral_max_production = 100
 fleet_top_k = 3
-grid_width = int(math.ceil((grid_max_x - grid_min_x) / grid_square_size))
-grid_height = int(math.ceil((grid_max_y - grid_min_y) / grid_square_size))
-
+grid_width = int(math.ceil((2 * grid_max_x) / grid_square_size))
+grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
 
 
 collector_env_num = 8
@@ -57,10 +56,11 @@ galcon_sampled_efficientzero_config = dict(
         max_episode_steps=max_episode_steps,
         map_seed=map_seed,
         grid_square_size=grid_square_size,
-        grid_min_x=grid_min_x,
+        # the map extends from -x to +x and -y to +y
         grid_max_x=grid_max_x,
-        grid_min_y=grid_min_y,
         grid_max_y=grid_max_y,
+        # If 1, homes always spawn on an ellipse touching the sides of the box. If in between, the ellipse shrinks proportionally.
+        home_distance_fraction=home_distance_fraction,
         neutral_min_cost=neutral_min_cost,
         neutral_max_cost=neutral_max_cost,
         neutral_min_production=neutral_min_production,

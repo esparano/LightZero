@@ -102,10 +102,10 @@ class GalconEnv(BaseEnv):
         map_seed=None,
         # Max grid size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8
         grid_square_size=25.0,
-        grid_min_x=-200.0,
         grid_max_x=200.0,
-        grid_min_y=-125.0,
         grid_max_y=125.0,
+        # If 1, homes always spawn on an ellipse touching the sides of the box. If in between, the ellipse shrinks proportionally.
+        home_distance_fraction = 0.8,
         neutral_min_cost = 0,
         neutral_max_cost = 50,
         neutral_min_production = 15,
@@ -158,14 +158,14 @@ class GalconEnv(BaseEnv):
         self.map_seed = self.cfg.get('map_seed', None)
 
         self.grid_square_size = float(self.cfg.grid_square_size)
-        self.grid_min_x = float(self.cfg.grid_min_x)
         self.grid_max_x = float(self.cfg.grid_max_x)
-        self.grid_min_y = float(self.cfg.grid_min_y)
         self.grid_max_y = float(self.cfg.grid_max_y)
-        self.grid_width = int(math.ceil((self.grid_max_x - self.grid_min_x) / self.grid_square_size))
-        self.grid_height = int(math.ceil((self.grid_max_y - self.grid_min_y) / self.grid_square_size))
+        self.grid_width = int(math.ceil((2 * self.grid_max_x) / self.grid_square_size))
+        self.grid_height = int(math.ceil((2 * self.grid_max_y) / self.grid_square_size))
         self.grid_cell_count = self.grid_width * self.grid_height
         self.total_num_actions = self.grid_cell_count * self.grid_cell_count + 1
+
+        self.home_distance_fraction = float(self.cfg.home_distance_fraction)
 
         self.neutral_min_cost = float(self.cfg.neutral_min_cost)
         self.neutral_max_cost = float(self.cfg.neutral_max_cost)
@@ -262,13 +262,19 @@ class GalconEnv(BaseEnv):
         else:
             rng = np.random.RandomState()
 
+        # spawn angle for the homes
+        a = rng.random_sample() * 2 * math.pi
+        # distance from the center of the map for the homes
+        home_x = self.grid_max_x * self.home_distance_fraction * math.cos(a)
+        home_y = self.grid_max_y * self.home_distance_fraction * math.sin(a)
+
         planets = [
             Planet(
                 id=0,
                 owner=self.PLAYER_1,
                 ships=100.0,
-                x=-180.0,
-                y=0.0,
+                x=home_x,
+                y=home_y,
                 production=100.0,
                 radius=24.0,
                 neutral=False,
@@ -277,8 +283,8 @@ class GalconEnv(BaseEnv):
                 id=1,
                 owner=self.PLAYER_2,
                 ships=100.0,
-                x=180.0,
-                y=0.0,
+                x=-home_x,
+                y=-home_y,
                 production=100.0,
                 radius=24.0,
                 neutral=False,
@@ -288,8 +294,8 @@ class GalconEnv(BaseEnv):
         next_planet_id = 2
         neutral_pairs = (self.num_planets - 2) // 2
         for _ in range(neutral_pairs):
-            x = self.grid_min_x + (self.grid_max_x - self.grid_min_x) * rng.random_sample()
-            y = self.grid_min_y + (self.grid_max_y - self.grid_min_y) * rng.random_sample()
+            x = -self.grid_max_x + (2 * self.grid_max_x) * rng.random_sample()
+            y = -self.grid_max_y + (2 * self.grid_max_y) * rng.random_sample()
             neutral_ships = self.neutral_min_cost + (self.neutral_max_cost - self.neutral_min_cost) * rng.random_sample()
             production = self.neutral_min_production + (self.neutral_max_production - self.neutral_min_production) * rng.random_sample()
             radius = self._radius_from_production(production)
@@ -337,7 +343,7 @@ class GalconEnv(BaseEnv):
             rng = np.random.RandomState()
 
         # Run relaxation simulation to settle the positions of neutral planets
-        for _ in range(self.MAX_SETTLE_ATTEMPTS):
+        for attempt_num in range(self.MAX_SETTLE_ATTEMPTS):
             moved = False
             displacements = {}
             for i in range(0, len(self.planets), 2):  # Only adjust the first of each neutral pair (even IDs)
@@ -383,13 +389,27 @@ class GalconEnv(BaseEnv):
                 # Keep within map boundaries
                 margin_x = p_i.radius + self.SHIP_RADIUS
                 margin_y = p_i.radius + self.SHIP_RADIUS
-                p_i.x = max(self.grid_min_x + margin_x, min(self.grid_max_x - margin_x, p_i.x))
-                p_i.y = max(self.grid_min_y + margin_y, min(self.grid_max_y - margin_y, p_i.y))
+                p_i.x = max(-self.grid_max_x + margin_x, min(self.grid_max_x - margin_x, p_i.x))
+                p_i.y = max(-self.grid_max_y + margin_y, min(self.grid_max_y - margin_y, p_i.y))
 
                 # Update the mirrored partner
                 p_odd = self.planets[i + 1]
                 p_odd.x = -p_i.x
                 p_odd.y = -p_i.y
+
+            # Print warning if the planets are not settled on the final attempt
+            if attempt_num == self.MAX_SETTLE_ATTEMPTS:
+                # find the minimum distance between any two planets
+                min_dist = float('inf')
+                for i in range(len(self.planets)):
+                    for j in range(i + 1, len(self.planets)):
+                        dist = math.hypot(self.planets[i].x - self.planets[j].x, self.planets[i].y - self.planets[j].y)
+                        min_dist = min(min_dist, dist)
+                
+                # warning
+                if min_dist < 1:
+                    print(f'WARNING: Planets are too close. Min distance: {min_dist}')
+            
 
 
     @staticmethod
@@ -550,8 +570,8 @@ class GalconEnv(BaseEnv):
 
     # Given world coordinates (x, y), return the equivalent grid (x, y)
     def _world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
-        grid_x = int(math.floor((x - self.grid_min_x) / self.grid_square_size))
-        grid_y = int(math.floor((y - self.grid_min_y) / self.grid_square_size))
+        grid_x = int(math.floor((x - (-self.grid_max_x)) / self.grid_square_size))
+        grid_y = int(math.floor((y - (-self.grid_max_y)) / self.grid_square_size))
         grid_x = int(np.clip(grid_x, 0, self.grid_width - 1))
         grid_y = int(np.clip(grid_y, 0, self.grid_height - 1))
         return grid_x, grid_y
@@ -567,23 +587,23 @@ class GalconEnv(BaseEnv):
 
     # returns the (x, y) world coordinate of the center of cell (x, y)
     def _grid_cell_center(self, grid_x: int, grid_y: int) -> Tuple[float, float]:
-        x = self.grid_min_x + (grid_x + 0.5) * self.grid_square_size
-        y = self.grid_min_y + (grid_y + 0.5) * self.grid_square_size
+        x = -self.grid_max_x + (grid_x + 0.5) * self.grid_square_size
+        y = -self.grid_max_y + (grid_y + 0.5) * self.grid_square_size
         return x, y
 
     def _local_grid_offset(self, x: float, y: float) -> Tuple[float, float]:
         grid_x, grid_y = self._world_to_grid(x, y)
-        cell_min_x = self.grid_min_x + grid_x * self.grid_square_size
-        cell_min_y = self.grid_min_y + grid_y * self.grid_square_size
+        cell_min_x = -self.grid_max_x + grid_x * self.grid_square_size
+        cell_min_y = -self.grid_max_y + grid_y * self.grid_square_size
         normalized_x = self._linear_encode(x - cell_min_x, self.grid_square_size)
         normalized_y = self._linear_encode(y - cell_min_y, self.grid_square_size)
         return normalized_x, normalized_y
 
     def _normalize_world_x(self, x: float) -> float:
-        return self._linear_encode(x - self.grid_min_x, self.grid_max_x - self.grid_min_x)
+        return self._linear_encode(x - (-self.grid_max_x), 2 * self.grid_max_x)
 
     def _normalize_world_y(self, y: float) -> float:
-        return self._linear_encode(y - self.grid_min_y, self.grid_max_y - self.grid_min_y)
+        return self._linear_encode(y - (-self.grid_max_y), 2 * self.grid_max_y)
 
     def _linear_encode(self, x: float, max_expected_value: float) -> float:
         return float(np.clip(x / max_expected_value, 0.0, 1.0))
@@ -620,7 +640,7 @@ class GalconEnv(BaseEnv):
 
         if len(matching_planets) > 1: 
             logging.warning(
-                'WARNING: More than one planet found in grid cell. This should not happen for grid cell size <= 21.'
+                'WARNING: More than one planet found in grid cell. This should not happen for grid cell size <= 25.'
             )
 
         # Deterministic tie-breaker if multiple planets share a grid square.
