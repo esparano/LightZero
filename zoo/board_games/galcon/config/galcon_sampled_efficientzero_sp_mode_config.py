@@ -37,7 +37,7 @@ grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
 # TODO: Optimize all of this.
 collector_env_num = 8
 n_episode = 8
-# The number of games to play during evaluation
+# The number of parallel environments to evaluate for
 evaluator_env_num = 5
 num_simulations = 50
 K = 16
@@ -45,9 +45,10 @@ update_per_collect = 50
 reanalyze_ratio = 0.
 batch_size = 256
 # Training will halt automatically after this many environment steps (ticks)
-max_env_step = int(5e5)
+max_env_step = int(1e8)
+# model_path = './data_sez/galcon_sampled_efficientzero_self-play_seed0_260608_224501/ckpt/iteration_31250.pth.tar'
 model_path = None
-mcts_ctree = False
+mcts_ctree = True
 # ==============================================================
 # end of the most frequently changed config specified by the user
 # ==============================================================
@@ -87,8 +88,16 @@ galcon_sampled_efficientzero_config = dict(
         prob_random_agent=0,
         prob_expert_agent=0,
         prob_random_action_in_bot=0.,
+        # replay_name_suffix='test',
         render_mode=None,
+        # render_mode='state_realtime_mode',
+        # render_mode='image_realtime_mode',
+        # render_mode='image_savefile_mode',
+        # replay_path='./video/galcon',
         replay_path=None,
+        # options are: {'mp4', 'gif'}. Only relevant for 'image_savefile_mode'
+        # replay_format='gif',
+        # replay_screen_scaling=9,
     ),
     policy=dict(
         model=dict(
@@ -139,7 +148,7 @@ galcon_sampled_efficientzero_config = dict(
         policy_loss_type='cross_entropy',
         use_priority=False,
         n_episode=n_episode,
-        eval_freq=int(2e3),
+        eval_freq=int(2000),
         replay_buffer_size=int(1e5),
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,

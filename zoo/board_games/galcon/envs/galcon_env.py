@@ -1,14 +1,25 @@
 import copy
 import math
+import os
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import logging
 
+import imageio
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import Polygon
 import numpy as np
 from ding.envs import BaseEnv, BaseEnvTimestep
 from ding.utils import ENV_REGISTRY
 from easydict import EasyDict
 from gymnasium import spaces
+
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning) 
 
 from zoo.board_games.galcon.envs.rule_bot import GalconFixedPolicyBot, GalconRandomBot
 
@@ -127,8 +138,12 @@ class GalconEnv(BaseEnv):
         manager=dict(shared_memory=False),
         channel_last=False,
         scale=True,
+        replay_name_suffix='',
         render_mode=None,
         replay_path=None,
+        # options are: {'mp4', 'gif'}. Only relevant for 'image_savefile_mode'
+        replay_format='gif',
+        replay_screen_scaling=9,
         agent_vs_human=False,
         prob_random_agent=0,
         prob_expert_agent=0,
@@ -213,6 +228,16 @@ class GalconEnv(BaseEnv):
             }
         )
 
+        # Set the parameters related to replay rendering.
+        self.screen_scaling = cfg.replay_screen_scaling
+        # options = {None, 'state_realtime_mode', 'image_realtime_mode', 'image_savefile_mode'}
+        self.render_mode = cfg.render_mode
+        self.replay_name_suffix = cfg.replay_name_suffix
+        self.replay_path = cfg.replay_path
+        self.replay_format = cfg.replay_format
+        self.screen = None
+        self.frames = []
+
         self.prob_random_agent = self.cfg.prob_random_agent
         self.prob_expert_agent = self.cfg.prob_expert_agent
         self.prob_random_action_in_bot = self.cfg.prob_random_action_in_bot
@@ -227,6 +252,7 @@ class GalconEnv(BaseEnv):
 
         self.planets: List[Planet] = []
         self.fleets: List[Fleet] = []
+        self.frames: List[np.ndarray] = []
         self.reset()
 
     def reset(self, start_player_index: int = 0, replay_name_suffix: Optional[str] = None) -> dict:
@@ -459,11 +485,19 @@ class GalconEnv(BaseEnv):
             reward = np.array(0).astype(np.float32)
 
         info = self._get_state_info(winner if done else -1)
-        if done:
-            info['eval_episode_return'] = reward
 
         self._current_player = self.next_player
+        
         obs = self.observe()
+        
+        # Render the new step.
+        if self.render_mode is not None:
+            self.render(self.render_mode)
+        if done:
+            info['eval_episode_return'] = reward
+            if self.render_mode == 'image_savefile_mode':
+                self.save_render_output(replay_name_suffix=self.replay_name_suffix, replay_path=self.replay_path,
+                                        format=self.replay_format)            
 
         return BaseEnvTimestep(obs, reward, done, info)
 
@@ -973,13 +1007,15 @@ class GalconEnv(BaseEnv):
 
         return -1
 
+    # total production, rounded to nearest 1/100th
     def _total_production(self, player: int) -> float:
-        return float(sum(p.production for p in self.planets if p.owner == player))
+        return float(round(sum(p.production for p in self.planets if p.owner == player), 2))
 
+    # total ships, rounded to nearest 1/100th
     def _total_ships(self, player: int) -> float:
         planet_ships = sum(p.ships for p in self.planets if p.owner == player)
         fleet_ships = sum(f.ships for f in self.fleets if f.owner == player)
-        return float(planet_ships + fleet_ships)
+        return float(round(planet_ships + fleet_ships, 2))
 
     def _get_state_info(self, winner: int) -> dict:
         return {
@@ -1017,11 +1053,222 @@ class GalconEnv(BaseEnv):
     def close(self) -> None:
         pass
 
-    # TODO: add visualization
     def render(self, mode: Optional[str] = None) -> None:
-        print(f'Galcon step={self._step_count}, current_player={self._current_player}')
-        print('planets:', self.planets)
-        print('fleets:', self.fleets)
+        """
+        Overview:
+            Render the current Galcon game state.
+        Arguments:
+            - mode (:obj:`str`): Rendering mode. Options:
+                - None / 'state_realtime_mode': Print state to console.
+                - 'image_realtime_mode': Display as a matplotlib figure in real time.
+                - 'image_savefile_mode': Capture frame for later saving as GIF/MP4.
+        """
+        if mode is None or mode == 'state_realtime_mode':
+            print(f'Galcon step={self._step_count}, current_player={self._current_player}')
+            print('planets:', self.planets)
+            print('fleets:', self.fleets)
+            return
+
+        frame = self._render_to_rgb_array()
+        self.frames.append(frame)
+
+        if mode == 'image_realtime_mode':
+            plt.imshow(frame)
+            plt.axis('off')
+            plt.draw()
+            plt.pause(0.001)
+
+    def _render_to_rgb_array(self) -> np.ndarray:
+        """
+        Overview:
+            Render the current Galcon game state to an RGB numpy array.
+
+        Color scheme:
+            - Player 1 planets/fleets: blue (#4A90D9)
+            - Player 2 planets/fleets: red (#E05A5A)
+            - Neutral planets: gray (#888888)
+            - Background: dark (#1A1A2E)
+
+        Planets are drawn as filled circles sized proportionally to their radius.
+        Fleets are drawn as solid triangles oriented toward their target, labeled with ship count.
+        """
+        # ---- color palette ----
+        COLOR_BG = '#1A1A2E'
+        COLOR_P1 = '#4A90D9'   # blue  – player 1
+        COLOR_P2 = '#E05A5A'   # red   – player 2
+        COLOR_NEUTRAL = '#888888'
+        COLOR_TEXT = '#FFFFFF'
+        COLOR_BORDER = '#CCCCCC'
+
+        def owner_color(owner: int) -> str:
+            if owner == self.PLAYER_1:
+                return COLOR_P1
+            elif owner == self.PLAYER_2:
+                return COLOR_P2
+            return COLOR_NEUTRAL
+
+        fig_w_in = 10.0
+        fig_h_in = fig_w_in * (2 * self.grid_max_y) / (2 * self.grid_max_x)
+        fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in))
+        fig.patch.set_facecolor(COLOR_BG)
+        ax.set_facecolor(COLOR_BG)
+
+        ax.set_xlim(-self.grid_max_x, self.grid_max_x)
+        ax.set_ylim(-self.grid_max_y, self.grid_max_y)
+        ax.set_aspect('equal')
+        ax.axis('off')
+
+        # ---- draw planets ----
+        for planet in self.planets:
+            color = owner_color(planet.owner)
+            # Scale circle radius from world units to data units
+            circle = plt.Circle(
+                (planet.x, planet.y),
+                radius=planet.radius,
+                color=color,
+                alpha=0.85,
+                zorder=2,
+            )
+            ax.add_patch(circle)
+            # Thin border ring
+            ring = plt.Circle(
+                (planet.x, planet.y),
+                radius=planet.radius,
+                color=COLOR_BORDER,
+                fill=False,
+                linewidth=0.8,
+                alpha=0.5,
+                zorder=3,
+            )
+            ax.add_patch(ring)
+            # Ship count label inside the planet
+            ship_str = f'{int(planet.ships)}'
+            ax.text(
+                planet.x, planet.y,
+                ship_str,
+                color=COLOR_TEXT,
+                fontsize=20,
+                ha='center', va='center',
+                fontweight='bold',
+                zorder=4,
+            )
+
+        # ---- draw fleets ----
+        for fleet in self.fleets:
+            target_planet = self.planets[fleet.target]
+            dx = target_planet.x - fleet.x
+            dy = target_planet.y - fleet.y
+            dist = math.hypot(dx, dy)
+
+            if dist < 1e-6:
+                angle = 0.0
+            else:
+                angle = math.atan2(dy, dx)
+
+            # Triangle size proportional to ship count, capped for readability
+            tri_size = max(4.0, min(14.0, 4.0 + fleet.ships / 15.0))
+
+            # Triangle pointing in direction of travel:
+            #   tip at the front, two base corners behind
+            tip = np.array([fleet.x + tri_size * math.cos(angle),
+                            fleet.y + tri_size * math.sin(angle)])
+            left_angle = angle + math.radians(140)
+            right_angle = angle - math.radians(140)
+            left  = np.array([fleet.x + tri_size * 0.65 * math.cos(left_angle),
+                               fleet.y + tri_size * 0.65 * math.sin(left_angle)])
+            right = np.array([fleet.x + tri_size * 0.65 * math.cos(right_angle),
+                               fleet.y + tri_size * 0.65 * math.sin(right_angle)])
+
+            triangle = Polygon(
+                [tip, left, right],
+                closed=True,
+                color=owner_color(fleet.owner),
+                alpha=0.9,
+                zorder=5,
+            )
+            ax.add_patch(triangle)
+
+            # Ship count label at the centroid of the triangle
+            centroid_x = (tip[0] + left[0] + right[0]) / 3.0
+            centroid_y = (tip[1] + left[1] + right[1]) / 3.0
+            ax.text(
+                centroid_x, centroid_y,
+                str(int(fleet.ships)),
+                color=COLOR_TEXT,
+                fontsize=20,
+                ha='center', va='center',
+                fontweight='bold',
+                zorder=6,
+            )
+
+        # ---- HUD ----
+        p1_ships = int(self._total_ships(self.PLAYER_1))
+        p2_ships = int(self._total_ships(self.PLAYER_2))
+        p1_prod  = int(self._total_production(self.PLAYER_1))
+        p2_prod  = int(self._total_production(self.PLAYER_2))
+        hud = (
+            f'Step {self._step_count}   '
+            f'P1 \u25cf  ships={p1_ships} prod={p1_prod}   '
+            f'P2 \u25cf  ships={p2_ships} prod={p2_prod}'
+        )
+        ax.set_title(hud, color=COLOR_TEXT, fontsize=20, pad=4)
+
+        # ---- capture ----
+        fig.tight_layout(pad=0.2)
+        fig.canvas.draw()
+        
+        rgba = np.asarray(fig.canvas.buffer_rgba())
+
+        plt.close(fig)
+
+        return rgba
+
+    def save_render_output(
+        self,
+        replay_name_suffix: str = '',
+        replay_path: Optional[str] = None,
+        format: str = 'gif',
+    ) -> None:
+        """
+        Overview:
+            Save the accumulated rendered frames to a GIF or MP4 file.
+        Arguments:
+            - replay_name_suffix (:obj:`str`): Suffix appended to the filename.
+            - replay_path (:obj:`str`): Directory to save the file. Defaults to current directory.
+            - format (:obj:`str`): 'gif' or 'mp4'.
+        """
+        if not self.frames:
+            logging.warning('save_render_output called but no frames were captured.')
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        
+        # At the end of the episode, save the frames.
+        if replay_name_suffix == '':
+            if replay_path is None:
+                filename = f'galcon_{os.getpid()}_{timestamp}.{format}'
+            else:
+                os.makedirs(replay_path, exist_ok=True)
+                filename = os.path.join(
+                    replay_path,
+                    f'galcon_{os.getpid()}_{timestamp}.{format}'
+                )
+        else:
+            if replay_path is None:
+                filename = f'galcon_{replay_name_suffix}_{os.getpid()}_{timestamp}.{format}'
+            else:
+                os.makedirs(replay_path, exist_ok=True)
+                filename = os.path.join(replay_path, f'galcon_{replay_name_suffix}_{os.getpid()}_{timestamp}.{format}')
+
+        if format == 'gif':
+            imageio.mimsave(filename, self.frames, format='GIF', duration=self.tick_seconds)
+        elif format == 'mp4':
+            imageio.mimsave(filename, self.frames, fps=int(round(1.0 / self.tick_seconds)), codec='mpeg4')
+        else:
+            raise ValueError(f'Unsupported format: {format}')
+
+        logging.info(f'Galcon replay saved to {filename}')
+        self.frames = []
 
     @property
     def current_player(self) -> int:
