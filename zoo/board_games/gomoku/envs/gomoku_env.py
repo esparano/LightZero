@@ -760,9 +760,9 @@ class GomokuEnv(BaseEnv):
             # Save frames as an MP4 video with a frame rate of 30 frames per second.
             # imageio.mimsave(filename, self.frames, fps=30, codec='mpeg4')
             imageio.mimwrite(filename, self.frames, fps=30)
-
         else:
             raise ValueError("Unsupported format: {}".format(format))
+            
         logging.info("Saved output to {}".format(filename))
         self.frames = []
 

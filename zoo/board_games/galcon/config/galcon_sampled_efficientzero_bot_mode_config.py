@@ -37,7 +37,7 @@ reanalyze_ratio = 0.
 batch_size = 256
 max_env_step = int(5e5)
 model_path = None
-mcts_ctree = False
+mcts_ctree = True
 # ==============================================================
 # end of the most frequently changed config specified by the user
 # ==============================================================
