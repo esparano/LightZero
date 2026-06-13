@@ -4,6 +4,9 @@ from easydict import EasyDict
 # Monitoring: 
 # tensorboard --logdir=./data_sez/galcon_sampled_efficientzero_self-play_seed0_260608_030657/log/serial/ --host 0.0.0.0 --port 6006
 
+# Debug: 
+# python3 /home/evan/.antigravity-ide-server/extensions/ms-python.debugpy-2026.6.0/bundled/libs/debugpy/adapter/../../debugpy/launcher 44683 -- /home/evan/LightZero/zoo/board_games/galcon/config/galcon_sampled_efficientzero_sp_mode_config_SIMPLE.py 
+
 # ==============================================================
 # begin of the most frequently changed config specified by the user
 # ==============================================================
@@ -42,11 +45,13 @@ evaluator_env_num = 5
 # Raising number of simulations a bit to better utilize the GPU and the more efficient non-Galcon code...
 num_simulations = 25
 K = 8
-update_per_collect = 50
+# Increase by 4x because symmetry augmentation is enabled
+update_per_collect = 50 * 4
 reanalyze_ratio = 0.
+# This is recommended for RTX 5080 for network of this size... May need to reduce this if increasing action space size.
 batch_size = 256
 # Training will halt automatically after this many environment steps (ticks)
-max_env_step = int(1e8)
+max_env_step = int(1e9)
 model_path = None
 # model_path = './data_sez/galcon_sampled_efficientzero_self-play_seed0_260608_224501/ckpt/iteration_31250.pth.tar'
 mcts_ctree = True
@@ -55,7 +60,7 @@ mcts_ctree = True
 # ==============================================================
 
 galcon_sampled_efficientzero_config = dict(
-    exp_name='data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4',
+    exp_name='data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_symmetry',
     # exp_name='data_sez/galcon_sampled_efficientzero_self-play_seed0',
     env=dict(
         # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
@@ -153,9 +158,17 @@ galcon_sampled_efficientzero_config = dict(
         use_priority=False,
         n_episode=n_episode,
         eval_freq=int(500),
-        replay_buffer_size=int(1e5),
+        # Increase replay buffer by 4 because symmetry augmentation is enabled
+        # 100k is typical for alphazero / muzero. With update_per_collect = 200 and batch size 256, we train on 51.2k out of 400k samples. 
+        # If validation loss is spiking, decrease update_per_collect. If running out of VRAM, decrease batch size.
+        replay_buffer_size=int(1e5 * 4),
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
+        # Whether to reflect games on x and y to augment the game buffer
+        symmetric_augment_x=True,
+        symmetric_augment_y=True,
+        # Use the Galcon obs and action space encoding 
+        symmetric_augment_type='Galcon',
     ),
 )
 

@@ -12,6 +12,120 @@ if TYPE_CHECKING:
     from lzero.policy import MuZeroPolicy, EfficientZeroPolicy, SampledEfficientZeroPolicy, GumbelMuZeroPolicy
 
 
+def reflect_game_segment(cfg: Any, game_segment: Any, reflect_x: bool, reflect_y: bool) -> Any:
+    # HACK - this should be in another class, maybe GalconEnv, but I'm not sure how to get
+    # a reference to the environment from here.
+
+    # if the environment is Galcon, proceed... 
+    if cfg.get('symmetric_augment_type', '') != 'Galcon':
+        return
+
+    # 1. Deepcopy the game segment to avoid sharing state/arrays
+    reflected = copy.deepcopy(game_segment)
+    
+    # Ensure numpy arrays for segments
+    obs_segment = np.asarray(reflected.obs_segment)
+    
+    # 2. Extract spatial dimensions from obs_segment
+    # obs_segment is a numpy array of shape (T, C, H, W)
+    T, C, H, W = obs_segment.shape
+    
+    # 3. Compute fleet_top_k
+    # TODO: remove magic constants by referencing galcon env
+    planet_channels = 8
+    landing_channels = 16
+    fleet_features = 5
+    fleet_slot_count = (C - planet_channels - landing_channels) // (2 * fleet_features)
+    fleet_top_k = fleet_slot_count - 1
+    
+    # 4. Reflect the observations
+    # A. Flip the grids spatially
+    if reflect_x:
+        obs_segment = np.flip(obs_segment, axis=3)
+    if reflect_y:
+        obs_segment = np.flip(obs_segment, axis=2)
+        
+    # B. Adjust channel values
+    # Planet channels - Adjust grid cell relative x / y if there is any planet info in channels 2-7 inclusive
+    planet_mask = np.sum(obs_segment[:, 2:8], axis=1) > 0  # Shape: (T, H, W)
+    if reflect_x:
+        obs_segment[:, 0] = np.where(planet_mask, 1.0 - obs_segment[:, 0], 0.0)
+    if reflect_y:
+        obs_segment[:, 1] = np.where(planet_mask, 1.0 - obs_segment[:, 1], 0.0)
+        
+    # Fleet channels
+    slot_count = fleet_top_k + 1
+    # Friendly fleets  - Adjust grid cell relative x / y if there is any planet info in channels 2-7 inclusive
+    for slot in range(slot_count):
+        base_ch = 8 + slot * 5
+        # Adjust grid cell relative x / y if there are ships in fleet channel 3
+        fleet_mask = obs_segment[:, base_ch + 3] > 0
+        if reflect_x:
+            obs_segment[:, base_ch + 0] = np.where(fleet_mask, 1.0 - obs_segment[:, base_ch + 0], 0.0)
+        if reflect_y:
+            obs_segment[:, base_ch + 1] = np.where(fleet_mask, 1.0 - obs_segment[:, base_ch + 1], 0.0)
+            
+    # Enemy fleets
+    for slot in range(slot_count):
+        base_ch = 8 + slot_count * 5 + slot * 5
+        # Adjust grid cell relative x / y if there are ships in fleet channel 3
+        fleet_mask = obs_segment[:, base_ch + 3] > 0
+        if reflect_x:
+            obs_segment[:, base_ch + 0] = np.where(fleet_mask, 1.0 - obs_segment[:, base_ch + 0], 0.0)
+        if reflect_y:
+            obs_segment[:, base_ch + 1] = np.where(fleet_mask, 1.0 - obs_segment[:, base_ch + 1], 0.0)
+            
+    reflected.obs_segment = obs_segment
+    
+    # 5. Reflect actions and action masks
+    num_actions = W * H * W * H + 1
+    actions_arr = np.arange(num_actions)
+    # All non-pass actions (by excluding index 0)
+    shifted = actions_arr[1:] - 1
+    grid_cell_count = W * H
+    source_cell = shifted // grid_cell_count
+    target_cell = shifted % grid_cell_count
+    
+    source_y = source_cell // W
+    source_x = source_cell % W
+    target_y = target_cell // W
+    target_x = target_cell % W
+    
+    if reflect_x:
+        source_x = W - 1 - source_x
+        target_x = W - 1 - target_x
+    if reflect_y:
+        source_y = H - 1 - source_y
+        target_y = H - 1 - target_y
+        
+    new_source_cell = source_y * W + source_x
+    new_target_cell = target_y * W + target_x
+    perm = np.zeros(num_actions, dtype=np.int64)
+    perm[1:] = new_source_cell * grid_cell_count + new_target_cell + 1
+    
+    # Apply action permutation
+    if hasattr(reflected, 'action_segment') and reflected.action_segment is not None:
+        reflected.action_segment = perm[np.asarray(reflected.action_segment)]
+    
+    # Reflect action mask segment
+    if hasattr(reflected, 'action_mask_segment') and reflected.action_mask_segment is not None:
+        if isinstance(reflected.action_mask_segment, np.ndarray):
+            reflected.action_mask_segment = reflected.action_mask_segment[:, perm]
+        else:
+            reflected.action_mask_segment = [mask[perm] for mask in reflected.action_mask_segment]
+        
+    # 6. Reflect root_sampled_actions (for Sampled EfficientZero)
+    if hasattr(reflected, 'root_sampled_actions') and reflected.root_sampled_actions is not None:
+        if isinstance(reflected.root_sampled_actions, np.ndarray):
+            reflected.root_sampled_actions = perm[reflected.root_sampled_actions]
+        else:
+            reflected.root_sampled_actions = [
+                perm[actions.astype(int)] for actions in reflected.root_sampled_actions
+            ]
+            
+    return reflected
+
+
 @BUFFER_REGISTRY.register('game_buffer')
 class GameBuffer(ABC, object):
     """
@@ -635,6 +749,21 @@ class GameBuffer(ABC, object):
         data, meta = data_and_meta
         for (data_game, meta_game) in zip(data, meta):
             self._push_game_segment(data_game, meta_game)
+            
+             # Reflect X (if symmetric augmentation enabled)
+            if self._cfg.get('symmetric_augment_x', False):
+                segment_rx = reflect_game_segment(self._cfg, data_game, reflect_x=True, reflect_y=False)
+                self._push_game_segment(segment_rx, meta_game)
+
+            # Reflect Y (if symmetric augmentation enabled)
+            if self._cfg.get('symmetric_augment_y', False):
+                segment_ry = reflect_game_segment(self._cfg, data_game, reflect_x=False, reflect_y=True)
+                self._push_game_segment(segment_ry, meta_game)
+
+            # Reflect both X and Y (if symmetric augmentation enabled)
+            if self._cfg.get('symmetric_augment_x', False) and self._cfg.get('symmetric_augment_y', False):
+                segment_rxy = reflect_game_segment(self._cfg, data_game, reflect_x=True, reflect_y=True)
+                self._push_game_segment(segment_rxy, meta_game)
 
     def _push_game_segment(self, data: Any, meta: Optional[dict] = None) -> None:
         """
