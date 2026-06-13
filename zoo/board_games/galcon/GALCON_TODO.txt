@@ -324,3 +324,7 @@ Rendering / eval TODOs
 ----------------------
 [ ] Decide whether to support rendering in Phase 2 or delay it.
 [ ] Decide whether to create an eval script in zoo/board_games/galcon/eval/.
+
+Misc
+----------------------
+[ ] Upgrade to gymnasium (supposedly a drop-in replacement)

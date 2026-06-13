@@ -4,7 +4,7 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning) 
 
 from zoo.board_games.galcon.envs.galcon_env import GalconEnv
-from zoo.board_games.galcon.envs.rule_bot import GalconFixedPolicyBot, GalconRandomBot
+from zoo.board_games.galcon.envs.rule_bot import GalconFixedPolicyBot, GalconRandomBot, GalconPassBot
 
 # Run all tests: 
 # pytest zoo/board_games/galcon/envs/
@@ -16,6 +16,16 @@ class TestGalconRuleBots:
         self.cfg = GalconEnv.default_config() 
         self.cfg.update(dict(
         ))
+
+    def test_pass_bot_passes(self) -> None:
+        env = GalconEnv(self.cfg)
+        env.reset()
+
+        bot = GalconPassBot(env)
+        action = bot.get_action()
+
+        assert action in env.legal_actions
+        assert action == env.pass_action
 
     def test_random_bot_returns_legal_action(self) -> None:
         env = GalconEnv(self.cfg)

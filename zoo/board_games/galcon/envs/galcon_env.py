@@ -21,7 +21,7 @@ from gymnasium import spaces
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning) 
 
-from zoo.board_games.galcon.envs.rule_bot import GalconFixedPolicyBot, GalconRandomBot
+from zoo.board_games.galcon.envs.rule_bot import GalconFixedPolicyBot, GalconRandomBot, GalconPassBot
 
 
 @dataclass
@@ -155,6 +155,7 @@ class GalconEnv(BaseEnv):
         prob_random_agent=0,
         prob_expert_agent=0,
         prob_random_action_in_bot=0.,
+        prob_pass_action_in_bot=0.,
         stop_value=1,
     )
 
@@ -248,12 +249,15 @@ class GalconEnv(BaseEnv):
         self.prob_random_agent = self.cfg.prob_random_agent
         self.prob_expert_agent = self.cfg.prob_expert_agent
         self.prob_random_action_in_bot = self.cfg.prob_random_action_in_bot
+        self.prob_pass_action_in_bot = self.cfg.prob_pass_action_in_bot
         self.bot_action_type = self.cfg.bot_action_type
 
         if self.bot_action_type == 'random':
             self.bot = GalconRandomBot(self)
         elif self.bot_action_type == 'fixed':
             self.bot = GalconFixedPolicyBot(self)
+        elif self.bot_action_type == 'pass':
+            self.bot = GalconPassBot(self)
         else:
             raise ValueError(f'Unsupported Galcon bot_action_type: {self.bot_action_type}')
 
@@ -1041,6 +1045,8 @@ class GalconEnv(BaseEnv):
     def bot_action(self) -> int:
         if np.random.rand() < self.prob_random_action_in_bot:
             return self.random_action()
+        if np.random.rand() < self.prob_pass_action_in_bot:
+            return self.pass_action
         return self.bot.get_action()
 
     def action_to_string(self, action: int) -> str:

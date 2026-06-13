@@ -47,7 +47,9 @@ galcon_sampled_efficientzero_config = dict(
     env=dict(
         # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
         battle_mode='play_with_bot_mode',
-        bot_action_type='fixed',
+        # Which bot plays during eval. Values: ['random', 'pass', 'fixed']
+        # "random" bot is actually quite strong on a map with few, inexpensive neutrals. Changing the default to "pass" for now.
+        bot_action_type='random',
         num_planets=num_planets,
         min_send_ships=min_send_ships,
         send_ratio=send_ratio,
@@ -76,6 +78,7 @@ galcon_sampled_efficientzero_config = dict(
         prob_random_agent=0,
         prob_expert_agent=0,
         prob_random_action_in_bot=0.,
+        prob_pass_action_in_bot=0.8,
         render_mode=None,
         replay_path=None,
     ),
