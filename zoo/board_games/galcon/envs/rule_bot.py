@@ -1,6 +1,18 @@
 import numpy as np
 
 
+class GalconPassBot:
+    """
+    Fixed policy bot for Galcon which always passes
+    """
+
+    def __init__(self, env) -> None:
+        self.env = env
+
+    def get_action(self) -> int:
+        return int(self.env.pass_action)
+
+
 class GalconRandomBot:
     """
     Random policy bot for Galcon. Takes a random non-pass action.
