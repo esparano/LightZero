@@ -22,7 +22,7 @@ neutral_min_cost = 0
 neutral_max_cost = 50
 neutral_min_production = 15
 neutral_max_production = 100
-fleet_top_k = 3
+fleet_top_k = 1
 grid_width = int(math.ceil((2 * grid_max_x) / grid_square_size))
 grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
 
@@ -92,19 +92,24 @@ galcon_sampled_efficientzero_config = dict(
             num_of_sampled_actions=K,
             downsample=False,
             self_supervised_learning_loss=True,
-            num_res_blocks=1,
+            # TODO: bump this up to ~4+ to make sure info from one side of the board can reach the other. 3x3 conv on an 8x8 board needs more res blocks to reach the other side.
+            num_res_blocks=4,
             num_channels=64,
             lstm_hidden_size=128,
             reward_head_channels=16,
             value_head_channels=16,
             policy_head_channels=16,
-            reward_head_hidden_channels=[128],
-            value_head_hidden_channels=[128],
-            policy_head_hidden_channels=[128],
+            # Could even go to 256 here for reward and value heads. Policy should be at least 256 if not more.
+            reward_head_hidden_channels=[256],
+            value_head_hidden_channels=[256],
+            policy_head_hidden_channels=[512],
             reward_support_range=(-10., 11., 1.),
             value_support_range=(-10., 11., 1.),
             discrete_action_encoding_type='one_hot',
-            norm_type='BN',
+            norm_type='BN',            
+            # Reduce huge action space into a lower dimensional embedding space
+            embed_actions= True,
+            embedded_action_dim = 32,
         ),
         model_path=model_path,
         cuda=True,

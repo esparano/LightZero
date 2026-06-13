@@ -30,7 +30,7 @@ neutral_min_cost = 0
 neutral_max_cost = 10
 neutral_min_production = 15
 neutral_max_production = 100
-fleet_top_k = 3
+fleet_top_k = 1
 grid_width = int(math.ceil((2 * grid_max_x) / grid_square_size))
 grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
 
@@ -55,7 +55,8 @@ mcts_ctree = True
 # ==============================================================
 
 galcon_sampled_efficientzero_config = dict(
-    exp_name='data_sez/galcon_sampled_efficientzero_self-play_seed0',
+    exp_name='data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4',
+    # exp_name='data_sez/galcon_sampled_efficientzero_self-play_seed0',
     env=dict(
         # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
         battle_mode='self_play_mode',
@@ -92,8 +93,8 @@ galcon_sampled_efficientzero_config = dict(
         # replay_name_suffix='test',
         # render_mode='state_realtime_mode',
         # render_mode='image_realtime_mode',
-        render_mode='image_savefile_mode',
-        replay_path='./video/galcon',
+        # render_mode='image_savefile_mode',
+        # replay_path='./video/galcon',
         replay_path=None,
         # options are: {'mp4', 'gif'}. Only relevant for 'image_savefile_mode'
         # replay_format='gif',
@@ -102,9 +103,9 @@ galcon_sampled_efficientzero_config = dict(
     policy=dict(
         model=dict(
             model_type='conv',
-            # There are currently 76 different channels represending planet and fleet info
-            observation_shape=(76, grid_height, grid_width),
-            image_channel=76,
+            # There are currently 44 different channels represending planet and fleet info
+            observation_shape=(44, grid_height, grid_width),
+            image_channel=44,
             # Only the most recent frame is passed to the NN
             frame_stack_num=1,
             action_space_size=grid_width * grid_height * grid_width * grid_height + 1,
@@ -118,13 +119,16 @@ galcon_sampled_efficientzero_config = dict(
             reward_head_channels=8,
             value_head_channels=8,
             policy_head_channels=16,
-            reward_head_hidden_channels=[32],
-            value_head_hidden_channels=[32],
-            policy_head_hidden_channels=[32],
+            reward_head_hidden_channels=[64],
+            value_head_hidden_channels=[64],
+            policy_head_hidden_channels=[128],
             reward_support_range=(-10., 11., 1.),
             value_support_range=(-10., 11., 1.),
             discrete_action_encoding_type='one_hot',
             norm_type='BN',
+            # Reduce huge action space into a lower dimensional embedding space
+            embed_actions= True,
+            embedded_action_dim = 16,
         ),
         model_path=model_path,
         cuda=True,
@@ -135,9 +139,9 @@ galcon_sampled_efficientzero_config = dict(
         game_segment_length=max_episode_steps,
         update_per_collect=update_per_collect,
         batch_size=batch_size,
-        optim_type='Adam',
-        piecewise_decay_lr_scheduler=True,
-        learning_rate=0.2,
+        optim_type='AdamW',
+        piecewise_decay_lr_scheduler=False,
+        learning_rate=0.0001,
         grad_clip_value=0.5,
         num_simulations=num_simulations,
         reanalyze_ratio=reanalyze_ratio,
