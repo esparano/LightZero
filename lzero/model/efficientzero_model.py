@@ -431,6 +431,7 @@ class DynamicsNetwork(nn.Module):
         observation_shape: SequenceType,
         action_encoding_dim: int = 2,
         num_res_blocks: int = 1,
+        # Note: SampledEfficientZero passes (latent_channels + action_encoding_dim) here
         num_channels: int = 64,
         reward_head_channels: int = 64,
         reward_head_hidden_channels: SequenceType = [32],
@@ -441,6 +442,9 @@ class DynamicsNetwork(nn.Module):
         last_linear_layer_init_zero: bool = True,
         activation: Optional[nn.Module] = nn.ReLU(inplace=True),
         norm_type: Optional[str] = 'BN',
+        # If true, reduce embedded actions (not latent_channels) to embedded_action_dim
+        embed_actions: bool = False,
+        embedded_action_dim: int = 16,
     ):
         """
         Overview:
@@ -469,25 +473,49 @@ class DynamicsNetwork(nn.Module):
         assert num_channels > action_encoding_dim, f'num_channels:{num_channels} <= action_encoding_dim:{action_encoding_dim}'
 
         self.action_encoding_dim = action_encoding_dim
-        self.num_channels = num_channels
+        # Extract the true number of latent state channels (ignoring the concatenated action channels)
+        self.num_latent_channels = num_channels - action_encoding_dim
+        
         self.flatten_input_size_for_reward_head = flatten_input_size_for_reward_head
         self.lstm_hidden_size = lstm_hidden_size
         self.activation = activation
 
-        self.conv = nn.Conv2d(num_channels, num_channels - self.action_encoding_dim, kernel_size=3, stride=1, padding=1, bias=False)
+        self.embed_actions = embed_actions
+
+        # --- Action Embedding Layer ---
+        # Compress large action spaces down to fewer channels
+        if self.embed_actions:
+            self.embedded_action_dim = embedded_action_dim 
+            self.action_conv = nn.Conv2d(self.action_encoding_dim, self.embedded_action_dim, kernel_size=1, bias=False)
+
+            # --- UPDATED: Main Dynamics Convolution ---
+            # Now takes (latent_channels + 16) instead of (latent_channels + 4079)
+            self.conv = nn.Conv2d(
+                in_channels=self.num_latent_channels + self.embedded_action_dim, 
+                out_channels=self.num_latent_channels, 
+                kernel_size=3, stride=1, padding=1, bias=False
+            )
+        else:
+            self.conv = nn.Conv2d(
+                in_channels=num_channels, 
+                out_channels=num_channels - self.action_encoding_dim, 
+                kernel_size=3, stride=1, padding=1, bias=False)
+
+        
         if norm_type == 'BN':
-            self.norm_common = nn.BatchNorm2d(num_channels - self.action_encoding_dim)
+            self.norm_common = nn.BatchNorm2d(self.num_latent_channels)
         elif norm_type == 'LN':
             if downsample:
                 self.norm_common = nn.LayerNorm(
-                    [num_channels - self.action_encoding_dim, math.ceil(observation_shape[-2] / 16), math.ceil(observation_shape[-1] / 16)])
+                    [self.num_latent_channels, math.ceil(observation_shape[-2] / 16), math.ceil(observation_shape[-1] / 16)])
             else:
-                self.norm_common = nn.LayerNorm([num_channels - self.action_encoding_dim, observation_shape[-2], observation_shape[-1]])
+                self.norm_common = nn.LayerNorm([self.num_latent_channels, observation_shape[-2], observation_shape[-1]])
 
+        # Resblocks take the pure latent channel size
         self.resblocks = nn.ModuleList(
             [
                 ResBlock(
-                    in_channels=num_channels - self.action_encoding_dim,
+                    in_channels=self.num_latent_channels,
                     activation=self.activation,
                     norm_type='BN',
                     res_type='basic',
@@ -496,7 +524,7 @@ class DynamicsNetwork(nn.Module):
             ]
         )
 
-        self.conv1x1_reward = nn.Conv2d(num_channels - self.action_encoding_dim, reward_head_channels, 1)
+        self.conv1x1_reward = nn.Conv2d(self.num_latent_channels, reward_head_channels, 1)
         
         if norm_type == 'BN':
             self.norm_reward = nn.BatchNorm2d(reward_head_channels)
@@ -541,8 +569,23 @@ class DynamicsNetwork(nn.Module):
             - value_prefix (:obj:`torch.Tensor`): The predicted prefix sum of value for input state.
         """
         # take the state encoding, state_action_encoding[:, -self.action_encoding_dim:, :, :] is action encoding
-        state_encoding = state_action_encoding[:, :-self.action_encoding_dim:, :, :]
-        x = self.conv(state_action_encoding)
+        state_encoding = state_action_encoding[:, :-self.action_encoding_dim, :, :]
+
+        if self.embed_actions:
+            # 1. Separate the latent state from the action encoding
+            action_encoding = state_action_encoding[:, -self.action_encoding_dim:, :, :]
+
+            # 2. embed actions
+            embedded_action = self.action_conv(action_encoding)
+
+            # 3. rejoin latent state with the embedded action
+            compressed_state_action = torch.cat([state_encoding, embedded_action], dim=1)
+
+            # 4. PROCESS: Pass the much smaller tensor through the heavy 3x3 dynamics conv
+            x = self.conv(compressed_state_action)
+        else:
+            x = self.conv(state_action_encoding)
+
         x = self.norm_common(x)
 
         # the residual link: add state encoding to the state_action encoding

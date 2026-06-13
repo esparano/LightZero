@@ -52,6 +52,8 @@ class SampledEfficientZeroModel(nn.Module):
             norm_type: str = 'LN',
             discrete_action_encoding_type: str = 'one_hot',
             use_sim_norm: bool = False,
+            embed_actions: bool = False,
+            embedded_action_dim: int = 32,
             *args,
             **kwargs,
     ):
@@ -182,6 +184,8 @@ class SampledEfficientZeroModel(nn.Module):
             downsample,
             norm_type=self.norm_type,
             use_sim_norm=use_sim_norm,
+            # ReLU was previously hard-coded, but I think allowing GELU should be okay for some board games
+            activation=activation,
         )
 
         self.dynamics_network = DynamicsNetwork(
@@ -197,7 +201,9 @@ class SampledEfficientZeroModel(nn.Module):
             lstm_hidden_size=self.lstm_hidden_size,
             last_linear_layer_init_zero=self.last_linear_layer_init_zero,
             activation=activation,
-            norm_type=norm_type
+            norm_type=norm_type,
+            embed_actions=embed_actions,
+            embedded_action_dim=embedded_action_dim,
         )
 
         self.prediction_network = PredictionNetwork(

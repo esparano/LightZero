@@ -89,14 +89,21 @@ class GalconEnv(BaseEnv):
     PLANET_CHANNEL_COUNT = 8
 
     FLEET_FEATURE_COUNT = 5
+    # LANDING_BUCKETS = (
+    #     (0.0, 1.0),
+    #     (1.0, 2.0),
+    #     (2.0, 4.0),
+    #     (4.0, 6.0),
+    #     (6.0, 8.0),
+    #     (8.0, 10.0),
+    #     (10.0, math.inf),
+    # )
+    # TODO: undo for the "real" runs
     LANDING_BUCKETS = (
         (0.0, 1.0),
         (1.0, 2.0),
         (2.0, 4.0),
-        (4.0, 6.0),
-        (6.0, 8.0),
-        (8.0, 10.0),
-        (10.0, math.inf),
+        (4.0, math.inf),
     )
     LANDING_FEATURE_COUNT_PER_BUCKET = 4
 
