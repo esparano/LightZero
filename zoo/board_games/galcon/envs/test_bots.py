@@ -1,5 +1,7 @@
 import pytest
 from easydict import EasyDict
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning) 
 
 from zoo.board_games.galcon.envs.galcon_env import GalconEnv
 
@@ -10,37 +12,12 @@ from zoo.board_games.galcon.envs.galcon_env import GalconEnv
 class TestGalconBots:
 
     def setup_method(self) -> None:
-        self.cfg = EasyDict(
-            battle_mode='self_play_mode',
-            bot_action_type='random',
-            num_planets=8,
-            min_send_ships=1,
-            send_ratio=0.5,
-            tick_seconds=0.25,
-            fleet_speed=40.0,
-            max_episode_steps=20,
-            map_seed=0,
-            grid_square_size=25.0,
-            grid_max_x=200.0,
-            grid_max_y=125.0,
-            home_distance_fraction=0.8,
-            neutral_min_cost = 0,
-            neutral_max_cost = 50,
-            neutral_min_production = 15,
-            neutral_max_production = 100,
-            fleet_top_k=3,
-            channel_last=False,
-            scale=True,
-            agent_vs_human=False,
-            prob_random_agent=0,
-            prob_expert_agent=0,
-            prob_random_action_in_bot=0.,
-            render_mode=None,
-            replay_path=None,
-        )
+        self.cfg = GalconEnv.default_config() 
+        self.cfg.update(dict(
+        ))
 
     def test_random_bot_vs_random_bot(self) -> None:
-        cfg = EasyDict(self.cfg)
+        cfg = self.cfg
         cfg.bot_action_type = 'random'
         env = GalconEnv(cfg)
         env.reset()
@@ -56,7 +33,7 @@ class TestGalconBots:
         assert done
 
     def test_fixed_bot_vs_fixed_bot(self) -> None:
-        cfg = EasyDict(self.cfg)
+        cfg = self.cfg
         cfg.bot_action_type = 'fixed'
         env = GalconEnv(cfg)
         env.reset()

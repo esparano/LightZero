@@ -157,6 +157,11 @@ galcon_sampled_efficientzero_config = dict(
         replay_buffer_size=int(1e5),
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
+        # Whether to reflect games on x and y to augment the game buffer
+        symmetric_augment_x=True,
+        symmetric_augment_y=True,
+        # Use the Galcon obs and action space encoding 
+        symmetric_augment_type='Galcon',
     ),
 )
 
