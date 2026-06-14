@@ -311,6 +311,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         self.reward_inverse_scalar_transform_handle = InverseScalarTransform(self.reward_support, self._cfg.model.categorical_distribution)
 
     def _forward_learn(self, data: torch.Tensor) -> Dict[str, Union[float, int]]:
+        # torch.autograd.set_detect_anomaly(True)
         """
         Overview:
             The forward function for learning policy in learn mode, which is the core of the learning process.
@@ -745,14 +746,23 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
 
         log_prob_sampled_actions = []
         for k in range(self._cfg.model.num_of_sampled_actions):
-            # target_sampled_actions[:,i,:] shape: (batch_size, action_dim) e.g. (4,2)
-            # dist.log_prob(target_sampled_actions[:,i,:]) shape: batch_size e.g. 4
-            # dist is normal distribution, the range of log_prob_sampled_actions is (-inf, inf)
-
-            if len(target_sampled_actions.shape) == 2:
-                target_sampled_actions = target_sampled_actions.unsqueeze(-1)
-
-            log_prob = torch.log(prob.gather(-1, target_sampled_actions[:, k].long()).squeeze(-1) + 1e-6)
+            # 1. Identify which actions are dummy padding (-1)
+            # target_sampled_actions[:, k] shape is (batch_size, )
+            action_indices = target_sampled_actions[:, k].long()
+            is_valid = (action_indices >= 0).float()
+            
+            # 2. Redirect dummy actions to index 0 to avoid CUDA index-out-of-bounds
+            safe_indices = torch.where(action_indices < 0, torch.zeros_like(action_indices), action_indices)
+            
+            # 3. Gather probability from the policy logits
+            # prob shape: (batch_size, action_space_size)
+            # gather result shape: (batch_size, 1)
+            raw_prob = prob.gather(-1, safe_indices.unsqueeze(-1)).squeeze(-1)
+            
+            # 4. Calculate log_prob and mask out the dummy actions
+            # Adding 1e-6 for stability; multiplying by is_valid zeros out the dummy contributions
+            log_prob = torch.log(raw_prob + 1e-6) * is_valid
+            
             log_prob_sampled_actions.append(log_prob)
 
         # (batch_size, num_of_sampled_actions) e.g. (4,20)
@@ -911,10 +921,15 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                     action = roots_sampled_actions[i][action].value
 
                 if not self._cfg.model.continuous_action_space:
-                    if len(action.shape) == 0:
+                    # Check if it's a NumPy array/Tensor with a shape
+                    if hasattr(action, 'shape'):
+                        if len(action.shape) == 0:
+                            action = int(action)
+                        elif len(action.shape) == 1:
+                            action = int(action[0])
+                    else:
+                        # It's already a pure Python int (or float), just cast to be safe
                         action = int(action)
-                    elif len(action.shape) == 1:
-                        action = int(action[0])
 
                 output[env_id] = {
                     'action': action,
@@ -1044,11 +1059,16 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                     action = np.array(roots_sampled_actions[i][action])
 
                 if not self._cfg.model.continuous_action_space:
-                    if len(action.shape) == 0:
+                    # Check if it's a NumPy array/Tensor with a shape
+                    if hasattr(action, 'shape'):
+                        if len(action.shape) == 0:
+                            action = int(action)
+                        elif len(action.shape) == 1:
+                            action = int(action[0])
+                    else:
+                        # It's already a pure Python int (or float), just cast to be safe
                         action = int(action)
-                    elif len(action.shape) == 1:
-                        action = int(action[0])
-
+                        
                 output[env_id] = {
                     'action': action,
                     'visit_count_distributions': distributions,

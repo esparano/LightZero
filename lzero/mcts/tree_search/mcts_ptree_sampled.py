@@ -78,7 +78,7 @@ class SampledEfficientZeroMCTSPtree(object):
 
     @classmethod
     def roots(
-            cls: int, root_num: int, legal_action_lis: List[Any], action_space_size: int, num_of_sampled_actions: int,
+            cls: int, root_num: int, legal_action_list: List[Any], action_space_size: int, num_of_sampled_actions: int,
             continuous_action_space: bool
     ) -> "ptree.Roots":
         """
@@ -95,7 +95,7 @@ class SampledEfficientZeroMCTSPtree(object):
             The initialization is achieved by the ``Roots`` class from the ``ptree_sez`` module.
         """
         return tree_sez.Roots(
-            root_num, legal_action_lis, action_space_size, num_of_sampled_actions, continuous_action_space
+            root_num, legal_action_list, action_space_size, num_of_sampled_actions, continuous_action_space
         )
 
     def search(

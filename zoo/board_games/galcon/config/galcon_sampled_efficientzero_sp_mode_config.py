@@ -45,10 +45,13 @@ update_per_collect = 50
 reanalyze_ratio = 0.
 batch_size = 256
 # Training will halt automatically after this many environment steps (ticks)
-max_env_step = int(1e8)
+max_env_step = int(1e9)
+
 # model_path = './data_sez/galcon_sampled_efficientzero_self-play_seed0_260608_224501/ckpt/iteration_31250.pth.tar'
 model_path = None
-mcts_ctree = True
+
+# TODO: ctree does not have the bug fixes for sampled discrete action spaces yet.
+mcts_ctree = False
 # ==============================================================
 # end of the most frequently changed config specified by the user
 # ==============================================================
@@ -89,7 +92,7 @@ galcon_sampled_efficientzero_config = dict(
         prob_random_agent=0,
         prob_expert_agent=0,
         prob_random_action_in_bot=0.,
-        prob_pass_action_in_bot=0.8,
+        prob_pass_action_in_bot=0.,
         # replay_name_suffix='test',
         render_mode=None,
         # render_mode='state_realtime_mode',
@@ -150,6 +153,7 @@ galcon_sampled_efficientzero_config = dict(
         reanalyze_ratio=reanalyze_ratio,
         td_steps=max_episode_steps,
         discount_factor=1,
+        # Consider increasing this to 8 to allow 2 full seconds of gameplay...
         num_unroll_steps=5,
         lstm_horizon_len=5,
         policy_loss_type='cross_entropy',

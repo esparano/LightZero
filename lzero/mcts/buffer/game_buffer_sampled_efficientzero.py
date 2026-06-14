@@ -151,8 +151,26 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                                                                  self._cfg.num_unroll_steps + 1]
 
             # add mask for invalid actions (out of trajectory), 1 for valid, 0 for invalid
+           
+            # VERSION 1: 
             mask_tmp = [1. for i in range(len(root_sampled_actions_tmp))]
             mask_tmp += [0. for _ in range(self._cfg.num_unroll_steps + 1 - len(mask_tmp))]
+           
+            # VERSION 2
+            # 1. Start with a list of 1s based on the length of actions
+            # sets the mask to 0 if the action is -1 (the "pad" action)
+            # mask_tmp = []
+            # for action in root_sampled_actions_tmp:
+            #     # Check if the action (which is a list or array) contains our padding value
+            #     # We use np.any() to see if ANY of the values in that specific slot are -1
+            #     is_pad_action = np.any(np.array(action) == -1)
+            #     mask_tmp.append(0.0 if is_pad_action else 1.0)
+            
+            # # 2. Pad the mask with 0s for the remaining unroll steps
+            # # This handles both the padding from the end of the trajectory 
+            # # AND any slots that were filled with our dummy -1s
+            # pad_len = self._cfg.num_unroll_steps + 1 - len(mask_tmp)
+            # mask_tmp += [0.0 for _ in range(pad_len)]
 
             # pad random action
             if self._cfg.model.continuous_action_space:
@@ -190,6 +208,29 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                     pos_in_game_segment_list[i], num_unroll_steps=self._cfg.num_unroll_steps, padding=True
                 )
             )
+            # VERSION 3
+            # Zero out pad actions just to not crash GPU - this should not affect training because of the mask.
+            # action_list.append([a if a != -1 else 0 for a in root_sampled_actions_tmp])
+
+            # VERSION 2
+            # Create a new list for the batch
+            # processed_actions = []
+            # for a in root_sampled_actions_tmp:
+            #     # 1. Convert to numpy for easy comparison
+            #     a_arr = np.array(a)
+                
+            #     # 2. Check if the entire list/array is our padding value (-1)
+            #     # Using np.any() or checking the first element is usually sufficient
+            #     if (a_arr == -1).any():
+            #         processed_actions.append(0)  # Convert -1 to 0 for the GPU
+            #     else:
+            #         # If it's a valid action (array or int), extract it
+            #         # If a is a numpy array, take the value; otherwise keep it as is
+            #         processed_actions.append(int(a_arr.item() if a_arr.ndim == 0 else a_arr[0]))
+
+            # action_list.append(processed_actions)
+
+            # VERSION 1
             action_list.append(actions_tmp)
             root_sampled_actions_list.append(root_sampled_actions_tmp)
 
