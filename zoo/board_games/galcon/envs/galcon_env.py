@@ -102,8 +102,7 @@ class GalconEnv(BaseEnv):
     LANDING_BUCKETS = (
         (0.0, 1.0),
         (1.0, 2.0),
-        (2.0, 4.0),
-        (4.0, math.inf),
+        (2.0, math.inf),
     )
     LANDING_FEATURE_COUNT_PER_BUCKET = 4
 
@@ -156,7 +155,8 @@ class GalconEnv(BaseEnv):
         prob_expert_agent=0,
         prob_random_action_in_bot=0.,
         prob_pass_action_in_bot=0.,
-        stop_value=1,
+        # Eval can only output -1 to 1 (i.e. do not stop training)
+        stop_value=1e9,
     )
 
     @classmethod

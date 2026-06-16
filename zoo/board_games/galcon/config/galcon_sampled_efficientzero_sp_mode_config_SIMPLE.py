@@ -36,17 +36,17 @@ neutral_max_production = 100
 fleet_top_k = 1
 grid_width = int(math.ceil((2 * grid_max_x) / grid_square_size))
 grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
+augment_data_with_symmetry=True
 
 # TODO: Optimize all of this.
 collector_env_num = 8
 n_episode = 8
 # The number of parallel environments to evaluate for
 evaluator_env_num = 5
-# Raising number of simulations a bit to better utilize the GPU and the more efficient non-Galcon code...
 num_simulations = 25
 K = 8
-# Increase by 4x because symmetry augmentation is enabled
-update_per_collect = 50 * 4
+# Increase by 4x if reflecting on x and y
+update_per_collect = 50 * (4 if augment_data_with_symmetry else 1)
 reanalyze_ratio = 0.
 # This is recommended for RTX 5080 for network of this size... May need to reduce this if increasing action space size.
 batch_size = 256
@@ -54,7 +54,7 @@ batch_size = 256
 max_env_step = int(1e9)
 
 model_path = None
-# model_path = './data_sez/galcon_sampled_efficientzero_self-play_seed0_260608_224501/ckpt/iteration_31250.pth.tar'
+# model_path = './data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_fixed_augment/ckpt/iteration_160000.pth.tar'
 
 # TODO: ctree does not have the bug fixes for sampled discrete action spaces yet.
 mcts_ctree = False
@@ -63,7 +63,7 @@ mcts_ctree = False
 # ==============================================================
 
 galcon_sampled_efficientzero_config = dict(
-    exp_name='data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_fixed_augment',
+    exp_name=f'data_sez/galcon_sez_sp_8p_fixed_augment',
     # exp_name='data_sez/galcon_sampled_efficientzero_self-play_seed0',
     env=dict(
         # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
@@ -105,8 +105,8 @@ galcon_sampled_efficientzero_config = dict(
         # render_mode='state_realtime_mode',
         # render_mode='image_realtime_mode',
         # render_mode='image_savefile_mode',
-        # replay_path='./video/galcon',
-        replay_path=None,
+        # replay_path='./video/galcon/train',
+        # replay_path=None,
         # options are: {'mp4', 'gif'}. Only relevant for 'image_savefile_mode'
         # replay_format='gif',
         # replay_screen_scaling=9,
@@ -115,8 +115,8 @@ galcon_sampled_efficientzero_config = dict(
         model=dict(
             model_type='conv',
             # There are currently 44 different channels represending planet and fleet info
-            observation_shape=(44, grid_height, grid_width),
-            image_channel=44,
+            observation_shape=(40, grid_height, grid_width),
+            image_channel=40,
             # Only the most recent frame is passed to the NN
             frame_stack_num=1,
             action_space_size=grid_width * grid_height * grid_width * grid_height + 1,
@@ -124,7 +124,7 @@ galcon_sampled_efficientzero_config = dict(
             num_of_sampled_actions=K,
             downsample=False,
             self_supervised_learning_loss=True,
-            num_res_blocks=1,
+            num_res_blocks=3,
             num_channels=16,
             lstm_hidden_size=32,
             reward_head_channels=8,
@@ -164,16 +164,16 @@ galcon_sampled_efficientzero_config = dict(
         policy_loss_type='cross_entropy',
         use_priority=False,
         n_episode=n_episode,
-        eval_freq=int(500),
+        eval_freq=int(1000),
         # Increase replay buffer by 4 because symmetry augmentation is enabled
         # 100k is typical for alphazero / muzero. With update_per_collect = 200 and batch size 256, we train on 51.2k out of 400k samples. 
         # If validation loss is spiking, decrease update_per_collect. If running out of VRAM, decrease batch size.
-        replay_buffer_size=int(1e5 * 4),
+        replay_buffer_size=int(10000 * (4 if augment_data_with_symmetry else 1)),
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
         # Whether to reflect games on x and y to augment the game buffer
-        symmetric_augment_x=True,
-        symmetric_augment_y=True,
+        symmetric_augment_x=augment_data_with_symmetry,
+        symmetric_augment_y=augment_data_with_symmetry,
         # Use the Galcon obs and action space encoding 
         symmetric_augment_type='Galcon',
     ),

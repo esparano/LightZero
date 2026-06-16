@@ -20,8 +20,9 @@ if __name__ == '__main__':
     """
     # model_path = './ckpt/ckpt_best.pth.tar'
     # model_path = './data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_260612_192141/ckpt/ckpt_best.pth.tar'
-    model_path = './data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_symmetry/ckpt/ckpt_best.pth.tar'
+    # model_path = './data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_symmetry/ckpt/ckpt_best.pth.tar'
     # model_path = './data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_symmetry/ckpt/iteration_0.pth.tar'
+    model_path = 'data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_fixed_augment/ckpt/iteration_100000.pth.tar'
     # model_path = None
     seeds = [0]
     num_episodes_each_seed = 1
@@ -30,12 +31,13 @@ if __name__ == '__main__':
     main_config.env.agent_vs_human = False
     # main_config.env.render_mode = 'image_realtime_mode'
     main_config.env.render_mode = 'image_savefile_mode'
-    main_config.env.replay_path = './video'
+    main_config.env.replay_path = './video/galcon/eval'
 
     main_config.env.bot_action_type = 'random'
     # probability of eval bot's action being 
-    main_config.env.prob_pass_action_in_bot = 1
+    main_config.env.prob_pass_action_in_bot = 0
     main_config.env.prob_random_action_in_bot = 0.
+    main_config.env.map_seed = 2
     # ['fixed', 'random', 'pass']
 
 

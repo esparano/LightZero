@@ -25,14 +25,15 @@ neutral_max_production = 100
 fleet_top_k = 1
 grid_width = int(math.ceil((2 * grid_max_x) / grid_square_size))
 grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
-
+augment_data_with_symmetry=False
 
 collector_env_num = 8
 n_episode = 8
 evaluator_env_num = 5
 num_simulations = 50
 K = 16
-update_per_collect = 50
+# Increase by 4x if reflecting on x and y
+update_per_collect = 50 * (4 if augment_data_with_symmetry else 1)
 reanalyze_ratio = 0.
 batch_size = 256
 max_env_step = int(1e9)
@@ -140,13 +141,13 @@ galcon_sampled_efficientzero_config = dict(
         policy_loss_type='cross_entropy',
         use_priority=False,
         n_episode=n_episode,
-        eval_freq=int(2e3),
-        replay_buffer_size=int(1e5),
+        eval_freq=int(2000),
+        replay_buffer_size=int(10000 * (4 if augment_data_with_symmetry else 1)),
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
         # Whether to reflect games on x and y to augment the game buffer
-        symmetric_augment_x=True,
-        symmetric_augment_y=True,
+        symmetric_augment_x=augment_data_with_symmetry,
+        symmetric_augment_y=augment_data_with_symmetry,
         # Use the Galcon obs and action space encoding 
         symmetric_augment_type='Galcon',
     ),
