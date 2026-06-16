@@ -1,5 +1,5 @@
-# from zoo.board_games.galcon.config.galcon_sampled_efficientzero_bot_mode_config import main_config, create_config
-from zoo.board_games.galcon.config.galcon_sampled_efficientzero_sp_mode_config_SIMPLE import main_config, create_config
+# from zoo.board_games.galcon.config.galcon_sez_bot_mode_config import main_config, create_config
+from zoo.board_games.galcon.config.galcon_sez_sp_mode_config_SIMPLE import main_config, create_config
 from lzero.entry import eval_muzero
 import numpy as np
 
@@ -19,10 +19,10 @@ if __name__ == '__main__':
         seeds and the number of episodes per seed.
     """
     # model_path = './ckpt/ckpt_best.pth.tar'
-    # model_path = './data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_260612_192141/ckpt/ckpt_best.pth.tar'
-    # model_path = './data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_symmetry/ckpt/ckpt_best.pth.tar'
-    # model_path = './data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_symmetry/ckpt/iteration_0.pth.tar'
-    model_path = 'data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_fixed_augment/ckpt/iteration_100000.pth.tar'
+    # model_path = './data_sez/galcon_sez_self-play_8-grid_adamw_1e4_260612_192141/ckpt/ckpt_best.pth.tar'
+    # model_path = './data_sez/galcon_sez_self-play_8-grid_adamw_1e4_symmetry/ckpt/ckpt_best.pth.tar'
+    # model_path = './data_sez/galcon_sez_self-play_8-grid_adamw_1e4_symmetry/ckpt/iteration_0.pth.tar'
+    model_path = 'data_sez/galcon_sez_self-play_8-grid_adamw_1e4_fixed_augment/ckpt/iteration_100000.pth.tar'
     # model_path = None
     seeds = [0]
     num_episodes_each_seed = 1

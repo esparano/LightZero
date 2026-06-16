@@ -1,44 +1,34 @@
 import math
 from easydict import EasyDict
 
-# Monitoring: 
-# tensorboard --logdir=./data_sez/galcon_sampled_efficientzero_self-play_seed0_260608_030657/log/serial/ --host 0.0.0.0 --port 6006
-
 # ==============================================================
 # begin of the most frequently changed config specified by the user
 # ==============================================================
-# num_planets = 8
-num_planets = 4
+num_planets = 8
 min_send_ships = 1
 send_ratio = 0.5
 tick_seconds = 0.25
 fleet_speed = 40.0
-# 100 * 0.25 = 25 seconds per game
-max_episode_steps = 100
+max_episode_steps = 200
 map_seed = None
 
-# grid square size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8 while still preventing more than 1 planet per cell
+# Max grid size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8
 grid_square_size = 25.0
-# grid_max_x = 200.0
-# grid_max_y = 125.0
-grid_max_x = 50.0
-grid_max_y = 50.0
+grid_max_x = 200.0
+grid_max_y = 125.0
 # If 1, homes always spawn on an ellipse touching the sides of the box. If in between, the ellipse shrinks proportionally.
 home_distance_fraction = 0.8
 neutral_min_cost = 0
-# neutral_max_cost = 50
-neutral_max_cost = 10
+neutral_max_cost = 50
 neutral_min_production = 15
 neutral_max_production = 100
 fleet_top_k = 1
 grid_width = int(math.ceil((2 * grid_max_x) / grid_square_size))
 grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
-augment_data_with_symmetry=True
+augment_data_with_symmetry=False
 
-# TODO: Optimize all of this.
 collector_env_num = 8
 n_episode = 8
-# The number of parallel environments to evaluate for
 evaluator_env_num = 5
 num_simulations = 50
 K = 16
@@ -46,10 +36,8 @@ K = 16
 update_per_collect = 50 * (4 if augment_data_with_symmetry else 1)
 reanalyze_ratio = 0.
 batch_size = 256
-# Training will halt automatically after this many environment steps (ticks)
 max_env_step = int(1e9)
 
-# model_path = './data_sez/galcon_sampled_efficientzero_self-play_seed0_260608_224501/ckpt/iteration_31250.pth.tar'
 model_path = None
 
 # TODO: ctree does not have the bug fixes for sampled discrete action spaces yet.
@@ -58,11 +46,11 @@ mcts_ctree = False
 # end of the most frequently changed config specified by the user
 # ==============================================================
 
-galcon_sampled_efficientzero_config = dict(
-    exp_name='data_sez/galcon_sampled_efficientzero_self-play_seed0',
+galcon_sez_config = dict(
+    exp_name='data_sez/galcon_sez_bot_seed0',
     env=dict(
         # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
-        battle_mode='self_play_mode',
+        battle_mode='play_with_bot_mode',
         # Which bot plays during eval. Values: ['random', 'pass', 'fixed']
         # "random" bot is actually quite strong on a map with few, inexpensive neutrals. Changing the default to "pass" for now.
         bot_action_type='random',
@@ -95,16 +83,8 @@ galcon_sampled_efficientzero_config = dict(
         prob_expert_agent=0,
         prob_random_action_in_bot=0.,
         prob_pass_action_in_bot=0.,
-        # replay_name_suffix='test',
         render_mode=None,
-        # render_mode='state_realtime_mode',
-        # render_mode='image_realtime_mode',
-        # render_mode='image_savefile_mode',
-        # replay_path='./video/galcon/train',
         replay_path=None,
-        # options are: {'mp4', 'gif'}. Only relevant for 'image_savefile_mode'
-        # replay_format='gif',
-        # replay_screen_scaling=9,
     ),
     policy=dict(
         model=dict(
@@ -133,7 +113,7 @@ galcon_sampled_efficientzero_config = dict(
             reward_support_range=(-10., 11., 1.),
             value_support_range=(-10., 11., 1.),
             discrete_action_encoding_type='one_hot',
-            norm_type='BN',
+            norm_type='BN',            
             # Reduce huge action space into a lower dimensional embedding space
             embed_actions= True,
             embedded_action_dim = 32,
@@ -142,7 +122,7 @@ galcon_sampled_efficientzero_config = dict(
         cuda=True,
         env_type='board_games',
         action_type='varied_action_space',
-        battle_mode='self_play_mode',
+        battle_mode='play_with_bot_mode',
         mcts_ctree=mcts_ctree,
         game_segment_length=max_episode_steps,
         update_per_collect=update_per_collect,
@@ -173,10 +153,10 @@ galcon_sampled_efficientzero_config = dict(
     ),
 )
 
-galcon_sampled_efficientzero_config = EasyDict(galcon_sampled_efficientzero_config)
-main_config = galcon_sampled_efficientzero_config
+galcon_sez_config = EasyDict(galcon_sez_config)
+main_config = galcon_sez_config
 
-galcon_sampled_efficientzero_create_config = dict(
+galcon_sez_create_config = dict(
     env=dict(
         type='galcon',
         import_names=['zoo.board_games.galcon.envs.galcon_env'],
@@ -187,8 +167,8 @@ galcon_sampled_efficientzero_create_config = dict(
         import_names=['lzero.policy.sampled_efficientzero'],
     ),
 )
-galcon_sampled_efficientzero_create_config = EasyDict(galcon_sampled_efficientzero_create_config)
-create_config = galcon_sampled_efficientzero_create_config
+galcon_sez_create_config = EasyDict(galcon_sez_create_config)
+create_config = galcon_sez_create_config
 
 if __name__ == '__main__':
     from lzero.entry import train_muzero

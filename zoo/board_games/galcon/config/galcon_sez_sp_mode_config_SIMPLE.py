@@ -2,10 +2,10 @@ import math
 from easydict import EasyDict
 
 # Monitoring: 
-# tensorboard --logdir=./data_sez/galcon_sampled_efficientzero_self-play_seed0_260608_030657/log/serial/ --host 0.0.0.0 --port 6006
+# tensorboard --logdir=./data_sez/galcon_sez_self-play_seed0_260608_030657/log/serial/ --host 0.0.0.0 --port 6006
 
 # Debug: 
-# python3 /home/evan/.antigravity-ide-server/extensions/ms-python.debugpy-2026.6.0/bundled/libs/debugpy/adapter/../../debugpy/launcher 44683 -- /home/evan/LightZero/zoo/board_games/galcon/config/galcon_sampled_efficientzero_sp_mode_config_SIMPLE.py 
+# python3 /home/evan/.antigravity-ide-server/extensions/ms-python.debugpy-2026.6.0/bundled/libs/debugpy/adapter/../../debugpy/launcher 44683 -- /home/evan/LightZero/zoo/board_games/galcon/config/galcon_sez_sp_mode_config_SIMPLE.py 
 
 # ==============================================================
 # begin of the most frequently changed config specified by the user
@@ -18,7 +18,7 @@ tick_seconds = 0.25
 fleet_speed = 40.0
 # 100 * 0.25 = 25 seconds per game
 max_episode_steps = 100
-map_seed = 2
+map_seed = None
 
 # grid square size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8 while still preventing more than 1 planet per cell
 grid_square_size = 25.0
@@ -36,7 +36,7 @@ neutral_max_production = 100
 fleet_top_k = 1
 grid_width = int(math.ceil((2 * grid_max_x) / grid_square_size))
 grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
-augment_data_with_symmetry=False
+augment_data_with_symmetry=True
 
 # TODO: Optimize all of this.
 collector_env_num = 8
@@ -54,7 +54,7 @@ batch_size = 256
 max_env_step = int(1e9)
 
 model_path = None
-# model_path = './data_sez/galcon_sampled_efficientzero_self-play_seed0_260608_224501/ckpt/iteration_31250.pth.tar'
+# model_path = './data_sez/galcon_sez_self-play_8-grid_adamw_1e4_fixed_augment/ckpt/iteration_160000.pth.tar'
 
 # TODO: ctree does not have the bug fixes for sampled discrete action spaces yet.
 mcts_ctree = False
@@ -62,9 +62,9 @@ mcts_ctree = False
 # end of the most frequently changed config specified by the user
 # ==============================================================
 
-galcon_sampled_efficientzero_config = dict(
-    exp_name=f'data_sez/galcon_sez_sp_8p_fixed_noaugment_map{map_seed}',
-    # exp_name='data_sez/galcon_sampled_efficientzero_self-play_seed0',
+galcon_sez_config = dict(
+    exp_name=f'data_sez/galcon_sez_sp_8p_fixed_augment',
+    # exp_name='data_sez/galcon_sez_self-play_seed0',
     env=dict(
         # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
         battle_mode='self_play_mode',
@@ -179,10 +179,10 @@ galcon_sampled_efficientzero_config = dict(
     ),
 )
 
-galcon_sampled_efficientzero_config = EasyDict(galcon_sampled_efficientzero_config)
-main_config = galcon_sampled_efficientzero_config
+galcon_sez_config = EasyDict(galcon_sez_config)
+main_config = galcon_sez_config
 
-galcon_sampled_efficientzero_create_config = dict(
+galcon_sez_create_config = dict(
     env=dict(
         type='galcon',
         import_names=['zoo.board_games.galcon.envs.galcon_env'],
@@ -193,8 +193,8 @@ galcon_sampled_efficientzero_create_config = dict(
         import_names=['lzero.policy.sampled_efficientzero'],
     ),
 )
-galcon_sampled_efficientzero_create_config = EasyDict(galcon_sampled_efficientzero_create_config)
-create_config = galcon_sampled_efficientzero_create_config
+galcon_sez_create_config = EasyDict(galcon_sez_create_config)
+create_config = galcon_sez_create_config
 
 if __name__ == '__main__':
     from lzero.entry import train_muzero
