@@ -21,6 +21,7 @@ if __name__ == '__main__':
     # model_path = './ckpt/ckpt_best.pth.tar'
     # model_path = './data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_260612_192141/ckpt/ckpt_best.pth.tar'
     model_path = './data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_symmetry/ckpt/ckpt_best.pth.tar'
+    # model_path = './data_sez/galcon_sampled_efficientzero_self-play_8-grid_adamw_1e4_symmetry/ckpt/iteration_0.pth.tar'
     # model_path = None
     seeds = [0]
     num_episodes_each_seed = 1
