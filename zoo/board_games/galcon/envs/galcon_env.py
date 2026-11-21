@@ -157,6 +157,8 @@ class GalconEnv(BaseEnv):
         prob_pass_action_in_bot=0.,
         # Eval can only output -1 to 1 (i.e. do not stop training)
         stop_value=1e9,
+        debug_legal_actions=False,
+        debug_observation=False,
     )
 
     @classmethod
@@ -260,6 +262,9 @@ class GalconEnv(BaseEnv):
             self.bot = GalconPassBot(self)
         else:
             raise ValueError(f'Unsupported Galcon bot_action_type: {self.bot_action_type}')
+
+        self.debug_legal_actions = self.cfg.debug_legal_actions
+        self.debug_observation = self.cfg.debug_observation
 
         self.planets: List[Planet] = []
         self.fleets: List[Fleet] = []
@@ -456,19 +461,21 @@ class GalconEnv(BaseEnv):
     def step(self, action: int) -> BaseEnvTimestep:
         if self.battle_mode == 'self_play_mode':
             return self._player_step(action, flag='agent')
-
         elif self.battle_mode in ['play_with_bot_mode', 'eval_mode']:
             timestep_player1 = self._player_step(action, flag='agent')
             if timestep_player1.done:
-                timestep_player1.obs['to_play'] = -1
+                # # Player 1 has finished, so player 2 will play next
+                # timestep_player1.obs['to_play'] = self.PLAYER_2
                 return timestep_player1
 
             bot_action = self.bot_action()
             timestep_player2 = self._player_step(bot_action, flag='bot')
+            # Player 2 has finished, so player 1 will play next
+            timestep_player2.obs['to_play'] = self.PLAYER_1
 
-            timestep_player2.info['eval_episode_return'] = -timestep_player2.reward
-            timestep_player2 = timestep_player2._replace(reward=-timestep_player2.reward)
-            timestep_player2.obs['to_play'] = -1
+            # # invert rewards
+            # timestep_player2.info['eval_episode_return'] = -timestep_player2.reward
+            # timestep_player2 = timestep_player2._replace(reward=-timestep_player2.reward)
 
             return timestep_player2
 
@@ -747,10 +754,20 @@ class GalconEnv(BaseEnv):
 
         observation = self.current_state()
 
-        if self.battle_mode in ['play_with_bot_mode', 'eval_mode']:
-            to_play = -1
-        else:
-            to_play = self._current_player
+        # if self.battle_mode in ['play_with_bot_mode', 'eval_mode']:
+        #     to_play = -1
+        # else:
+            # to_play = self._current_player
+        to_play = self._current_player
+
+        if self.debug_legal_actions:
+            print(self.legal_actions)
+
+        if self.debug_observation:
+            # Summing the map and flipping it makes it visible as a grid of numbers. You can almost make out what is
+            # happening just by looking at the grid of numbers changing.
+            print("Observation summed across channels:")
+            print(np.flip(np.round(sum(observation), 2), axis=1))
 
         return {
             'observation': observation,

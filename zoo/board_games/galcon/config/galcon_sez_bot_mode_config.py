@@ -83,8 +83,15 @@ galcon_sez_config = dict(
         prob_expert_agent=0,
         prob_random_action_in_bot=0.,
         prob_pass_action_in_bot=0.,
+        # replay_name_suffix='test',
         render_mode=None,
-        replay_path=None,
+        # render_mode='state_realtime_mode',
+        # render_mode='image_realtime_mode',
+        # render_mode='image_savefile_mode',
+        replay_path='./video/galcon/train',
+        # options are: {'mp4', 'gif'}. Only relevant for 'image_savefile_mode'
+        replay_format='gif',
+        replay_screen_scaling=9,
     ),
     policy=dict(
         model=dict(

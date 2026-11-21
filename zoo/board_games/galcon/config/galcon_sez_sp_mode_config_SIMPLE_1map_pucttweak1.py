@@ -1,0 +1,250 @@
+import math
+from easydict import EasyDict
+
+# Monitoring: 
+# tensorboard --logdir=./data_sez/galcon_sez_self-play_seed0_260608_030657/log/serial/ --host 0.0.0.0 --port 6006
+
+# Debug: 
+# python3 /home/evan/.antigravity-ide-server/extensions/ms-python.debugpy-2026.6.0/bundled/libs/debugpy/adapter/../../debugpy/launcher 44683 -- /home/evan/LightZero/zoo/board_games/galcon/config/galcon_sez_sp_mode_config_SIMPLE.py 
+
+# ==============================================================
+# begin of the most frequently changed config specified by the user
+# ==============================================================
+# num_planets = 8
+num_planets = 6
+min_send_ships = 1
+send_ratio = 0.5
+tick_seconds = 0.25
+fleet_speed = 40.0
+# 100 * 0.25 = 25 seconds per game
+max_episode_steps = 100
+map_seed = 2
+
+# grid square size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8 while still preventing more than 1 planet per cell
+grid_square_size = 25.0
+# grid_max_x = 200.0
+# grid_max_y = 125.0
+grid_max_x = 100.0
+grid_max_y = 100.0
+# If 1, homes always spawn on an ellipse touching the sides of the box. If in between, the ellipse shrinks proportionally.
+home_distance_fraction = 0.8
+neutral_min_cost = 0
+# neutral_max_cost = 50
+neutral_max_cost = 10
+neutral_min_production = 15
+neutral_max_production = 100
+fleet_top_k = 1
+grid_width = int(math.ceil((2 * grid_max_x) / grid_square_size))
+grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
+augment_data_with_symmetry=False
+
+# TODO: Optimize all of this.
+collector_env_num = 8
+n_episode = 8
+# The number of parallel environments to evaluate for
+evaluator_env_num = 5
+num_simulations = 50
+# TODO: consider whether to increase this when action space is larger (~3k legal moves)
+K = 10
+# Increase by 4x if reflecting on x and y
+update_per_collect = 50 * (4 if augment_data_with_symmetry else 1)
+reanalyze_ratio = 0.
+# This is recommended for RTX 5080 for network of this size... May need to reduce this if increasing action space size.
+batch_size = 256
+# Training will halt automatically after this many environment steps (ticks)
+max_env_step = int(1e9)
+
+model_path = None
+# model_path = './data_sez/galcon_sez_self-play_seed0_260608_224501/ckpt/iteration_31250.pth.tar'
+
+# TODO: ctree does not have the bug fixes for sampled discrete action spaces yet.
+mcts_ctree = False
+
+# Config for SampledEfficientZeroMCTSPtree
+# the default_config for SampledEfficientZeroMCTSPtree.
+# defaultconfig = dict(
+#     # (float) The alpha value used in the Dirichlet distribution for exploration at the root node of the search tree.
+#     root_dirichlet_alpha=0.3,
+#     # (float) The noise weight at the root node of the search tree.
+#     root_noise_weight=0.25,
+#     # (int) The base constant used in the PUCT formula for balancing exploration and exploitation during tree search.
+#     pb_c_base=19652,
+#     # (float) The initialization constant used in the PUCT formula for balancing exploration and exploitation during tree search.
+#     pb_c_init=1.25,
+#     # (float) The maximum change in value allowed during the backup step of the search tree update.
+#     value_delta_max=0.01,
+# )
+
+# Increased to ensure diverse action sampling at the root for a (potentially) huge action space.
+root_dirichlet_alpha=0.6,
+# Kept at 0.25 to maintain a solid mix of network priors and exploration noise. This means 25% of root node priors come from dirichlet instead of the network.
+root_noise_weight=0.25,
+# Heavily reduced so that the dynamic exploration modifier actively scales down over 50 simulations.
+pb_c_base=200,
+# Adjusted to baseline intercept. Can stay at 1.25 or bump to 1.5 for slightly wider early tree shapes.
+pb_c_init=1.25,
+# Kept at 0.01 unless your environmental rewards feature massive, high-variance spikes.
+value_delta_max=0.01,
+
+
+
+
+
+
+
+
+# ==============================================================
+# end of the most frequently changed config specified by the user
+# ==============================================================
+
+galcon_sez_config = dict(
+    exp_name=f'data_sez/galcon_sez_sp_8p_fixed_noaugment_map{map_seed}_pucttweak',
+    # exp_name='data_sez/galcon_sez_self-play_seed0',
+    env=dict(
+        # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
+        battle_mode='self_play_mode',
+        # Which bot plays during eval. Values: ['random', 'pass', 'fixed']
+        # "random" bot is actually quite strong on a map with few, inexpensive neutrals. Changing the default to "pass" for now.
+        bot_action_type='random',
+        num_planets=num_planets,
+        min_send_ships=min_send_ships,
+        send_ratio=send_ratio,
+        tick_seconds=tick_seconds,
+        fleet_speed=fleet_speed,
+        max_episode_steps=max_episode_steps,
+        map_seed=map_seed,
+        grid_square_size=grid_square_size,
+        # the map extends from -x to +x and -y to +y
+        grid_max_x=grid_max_x,
+        grid_max_y=grid_max_y,
+        # If 1, homes always spawn on an ellipse touching the sides of the box. If in between, the ellipse shrinks proportionally.
+        home_distance_fraction=home_distance_fraction,
+        neutral_min_cost=neutral_min_cost,
+        neutral_max_cost=neutral_max_cost,
+        neutral_min_production=neutral_min_production,
+        neutral_max_production=neutral_max_production,
+        fleet_top_k=fleet_top_k,
+        channel_last=False,
+        scale=True,
+        collector_env_num=collector_env_num,
+        evaluator_env_num=evaluator_env_num,
+        n_evaluator_episode=evaluator_env_num,
+        manager=dict(shared_memory=False),
+        agent_vs_human=False,
+        prob_random_agent=0,
+        prob_expert_agent=0,
+        prob_random_action_in_bot=0.,
+        prob_pass_action_in_bot=0.,
+        # replay_name_suffix='test',
+        render_mode=None,
+        # render_mode='state_realtime_mode',
+        # render_mode='image_realtime_mode',
+        # render_mode='image_savefile_mode',
+        replay_path='./video/galcon/train',
+        # options are: {'mp4', 'gif'}. Only relevant for 'image_savefile_mode'
+        replay_format='gif',
+        replay_screen_scaling=9,
+    ),
+    policy=dict(
+        model=dict(
+            model_type='conv',
+            # There are currently 44 different channels represending planet and fleet info
+            observation_shape=(40, grid_height, grid_width),
+            image_channel=40,
+            # Only the most recent frame is passed to the NN
+            frame_stack_num=1,
+            action_space_size=grid_width * grid_height * grid_width * grid_height + 1,
+            continuous_action_space=False,
+            num_of_sampled_actions=K,
+            downsample=False,
+            self_supervised_learning_loss=True,
+            num_res_blocks=3,
+            num_channels=16,
+            lstm_hidden_size=32,
+            reward_head_channels=8,
+            value_head_channels=8,
+            policy_head_channels=16,
+            reward_head_hidden_channels=[64],
+            value_head_hidden_channels=[64],
+            policy_head_hidden_channels=[128],
+            reward_support_range=(-10., 11., 1.),
+            value_support_range=(-10., 11., 1.),
+            discrete_action_encoding_type='one_hot',
+            norm_type='BN',
+            # Reduce huge action space into a lower dimensional embedding space
+            embed_actions= True,
+            embedded_action_dim = 16,
+        ),
+        model_path=model_path,
+        cuda=True,
+        env_type='board_games',
+        action_type='varied_action_space',
+        battle_mode='self_play_mode',
+        mcts_ctree=mcts_ctree,
+        game_segment_length=max_episode_steps,
+        update_per_collect=update_per_collect,
+        batch_size=batch_size,
+        optim_type='AdamW',
+        piecewise_decay_lr_scheduler=False,
+        learning_rate=0.0001,
+        grad_clip_value=0.5,
+        num_simulations=num_simulations,
+        reanalyze_ratio=reanalyze_ratio,
+        td_steps=max_episode_steps,
+        discount_factor=1,
+        # Consider increasing this to 8 to allow 2 full seconds of gameplay...
+        num_unroll_steps=5,
+        lstm_horizon_len=5,
+        policy_loss_type='cross_entropy',
+        use_priority=False,
+        n_episode=n_episode,
+        eval_freq=int(1000),
+        # Increase replay buffer by 4 because symmetry augmentation is enabled
+        # 100k is typical for alphazero / muzero. With update_per_collect = 200 and batch size 256, we train on 51.2k out of 400k samples. 
+        # If validation loss is spiking, decrease update_per_collect. If running out of VRAM, decrease batch size.
+        replay_buffer_size=int(10000 * (4 if augment_data_with_symmetry else 1)),
+        collector_env_num=collector_env_num,
+        evaluator_env_num=evaluator_env_num,
+        # Whether to reflect games on x and y to augment the game buffer
+        symmetric_augment_x=augment_data_with_symmetry,
+        symmetric_augment_y=augment_data_with_symmetry,
+        # Use the Galcon obs and action space encoding 
+        symmetric_augment_type='Galcon',# Increased to ensure diverse action sampling at the root for a (potentially) huge action space.
+        root_dirichlet_alpha=0.6,
+        # Kept at 0.25 to maintain a solid mix of network priors and exploration noise. This means 25% of root node priors come from dirichlet instead of the network.
+        root_noise_weight=0.25,
+        # Heavily reduced so that the dynamic exploration modifier actively scales down over 50 simulations.
+        pb_c_base=200,
+        # Adjusted to baseline intercept. Can stay at 1.25 or bump to 1.5 for slightly wider early tree shapes.
+        pb_c_init=1.25,
+        # Kept at 0.01 unless your environmental rewards feature massive, high-variance spikes.
+        value_delta_max=0.01,
+    ),
+)
+
+galcon_sez_config = EasyDict(galcon_sez_config)
+main_config = galcon_sez_config
+
+galcon_sez_create_config = dict(
+    env=dict(
+        type='galcon',
+        import_names=['zoo.board_games.galcon.envs.galcon_env'],
+    ),
+    env_manager=dict(type='subprocess'),
+    policy=dict(
+        type='sampled_efficientzero',
+        import_names=['lzero.policy.sampled_efficientzero'],
+    ),
+)
+galcon_sez_create_config = EasyDict(galcon_sez_create_config)
+create_config = galcon_sez_create_config
+
+if __name__ == '__main__':
+    from lzero.entry import train_muzero
+
+    train_muzero(
+        [main_config, create_config],
+        seed=0,
+        model_path=main_config.policy.model_path,
+        max_env_step=max_env_step,
+    )

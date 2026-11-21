@@ -1,0 +1,766 @@
+// MCTS Tree
+digraph {
+	rankdir=TB size="10,10"
+	134457148791040 [label="ROOT
+Visits: 16
+Value: 0.451
+Sum: 7.21
+Prior: 0
+To Play: 1" fillcolor=lightblue shape=box style=filled]
+	134457148791424 [label="Visits: 8
+Value: -0.443
+Sum: -3.545
+Prior: 0.44145530462265015
+To Play: 2" shape=box]
+	134457148793056 [label="Visits: 3
+Value: 0.292
+Sum: 0.876
+Prior: 0.7207610607147217
+To Play: 1" shape=box]
+	134457148833744 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.17698074877262115
+To Play: -1" shape=box]
+	134457148793056 -> 134457148833744 [label="Action: 2635"]
+	134457148828752 [label="Visits: 2
+Value: -0.158
+Sum: -0.317
+Prior: 0.5232775807380676
+To Play: 2" shape=box]
+	134457148833504 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.12246228009462357
+To Play: -1" shape=box]
+	134457148828752 -> 134457148833504 [label="Action: 1462"]
+	134457148825776 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.17296594381332397
+To Play: -1" shape=box]
+	134457148828752 -> 134457148825776 [label="Action: 1450"]
+	134457148822704 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0927649438381195
+To Play: -1" shape=box]
+	134457148828752 -> 134457148822704 [label="Action: 1448"]
+	134457148820208 [label="Visits: 1
+Value: -0.054
+Sum: -0.054
+Prior: 0.4857594966888428
+To Play: 1" shape=box]
+	134457148825200 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.7221064567565918
+To Play: -1" shape=box]
+	134457148820208 -> 134457148825200 [label="Action: 0"]
+	134457148826160 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.08344763517379761
+To Play: -1" shape=box]
+	134457148820208 -> 134457148826160 [label="Action: 2664"]
+	134457148827216 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.1160140112042427
+To Play: -1" shape=box]
+	134457148820208 -> 134457148827216 [label="Action: 2635"]
+	134457148825248 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.04226839914917946
+To Play: -1" shape=box]
+	134457148820208 -> 134457148825248 [label="Action: 2647"]
+	134457148827024 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.021076643839478493
+To Play: -1" shape=box]
+	134457148820208 -> 134457148827024 [label="Action: 2678"]
+	134457148820592 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0004893495934084058
+To Play: -1" shape=box]
+	134457148820208 -> 134457148820592 [label="Action: 1448"]
+	134457148829856 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0003156864258926362
+To Play: -1" shape=box]
+	134457148820208 -> 134457148829856 [label="Action: 1433"]
+	134457148827504 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0001098902866942808
+To Play: -1" shape=box]
+	134457148820208 -> 134457148827504 [label="Action: 1578"]
+	134457148828752 -> 134457148820208 [label="Action: 0"]
+	134457148824960 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.06433797627687454
+To Play: -1" shape=box]
+	134457148828752 -> 134457148824960 [label="Action: 1419"]
+	134457148827264 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.061663489788770676
+To Play: -1" shape=box]
+	134457148828752 -> 134457148827264 [label="Action: 1433"]
+	134457148828608 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 1.030023668135982e-05
+To Play: -1" shape=box]
+	134457148828752 -> 134457148828608 [label="Action: 2664"]
+	134457148818144 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 1.555998642288614e-05
+To Play: -1" shape=box]
+	134457148828752 -> 134457148818144 [label="Action: 2635"]
+	134457148793056 -> 134457148828752 [label="Action: 0"]
+	134457148828512 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.051855962723493576
+To Play: -1" shape=box]
+	134457148793056 -> 134457148828512 [label="Action: 2678"]
+	134457148829088 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.025463638827204704
+To Play: -1" shape=box]
+	134457148793056 -> 134457148829088 [label="Action: 2649"]
+	134457148827360 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.06786396354436874
+To Play: -1" shape=box]
+	134457148793056 -> 134457148827360 [label="Action: 2647"]
+	134457148828416 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.13824433088302612
+To Play: -1" shape=box]
+	134457148793056 -> 134457148828416 [label="Action: 2664"]
+	134457148829664 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.004828153643757105
+To Play: -1" shape=box]
+	134457148793056 -> 134457148829664 [label="Action: 1448"]
+	134457148821984 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0017235977575182915
+To Play: -1" shape=box]
+	134457148793056 -> 134457148821984 [label="Action: 1419"]
+	134457148791424 -> 134457148793056 [label="Action: 0"]
+	134457148792672 [label="Visits: 1
+Value: 0.531
+Sum: 0.531
+Prior: 0.041550908237695694
+To Play: 1" shape=box]
+	134457148678752 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.4375569820404053
+To Play: -1" shape=box]
+	134457148792672 -> 134457148678752 [label="Action: 0"]
+	134457148683312 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.006529933772981167
+To Play: -1" shape=box]
+	134457148792672 -> 134457148683312 [label="Action: 1448"]
+	134457148674096 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.1496899425983429
+To Play: -1" shape=box]
+	134457148792672 -> 134457148674096 [label="Action: 2664"]
+	134457148676736 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0759182944893837
+To Play: -1" shape=box]
+	134457148792672 -> 134457148676736 [label="Action: 2647"]
+	134457148676832 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.14432883262634277
+To Play: -1" shape=box]
+	134457148792672 -> 134457148676832 [label="Action: 2635"]
+	134457148680480 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.08041365444660187
+To Play: -1" shape=box]
+	134457148792672 -> 134457148680480 [label="Action: 2678"]
+	134457148685088 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0545777902007103
+To Play: -1" shape=box]
+	134457148792672 -> 134457148685088 [label="Action: 2649"]
+	134457148675392 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.004898585844784975
+To Play: -1" shape=box]
+	134457148792672 -> 134457148675392 [label="Action: 1590"]
+	134457148791424 -> 134457148792672 [label="Action: 1433"]
+	134457148784992 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.02703765407204628
+To Play: -1" shape=box]
+	134457148791424 -> 134457148784992 [label="Action: 1419"]
+	134457148784704 [label="Visits: 1
+Value: 0.54
+Sum: 0.54
+Prior: 0.0656919777393341
+To Play: 1" shape=box]
+	134457148678272 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.16369834542274475
+To Play: -1" shape=box]
+	134457148784704 -> 134457148678272 [label="Action: 2664"]
+	134457148674480 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.40517139434814453
+To Play: -1" shape=box]
+	134457148784704 -> 134457148674480 [label="Action: 0"]
+	134457148673760 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.06225688010454178
+To Play: -1" shape=box]
+	134457148784704 -> 134457148673760 [label="Action: 2678"]
+	134457148681200 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.04424528032541275
+To Play: -1" shape=box]
+	134457148784704 -> 134457148681200 [label="Action: 2649"]
+	134457148684560 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0019218905363231897
+To Play: -1" shape=box]
+	134457148784704 -> 134457148684560 [label="Action: 1419"]
+	134457148677456 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.22262941300868988
+To Play: -1" shape=box]
+	134457148784704 -> 134457148677456 [label="Action: 2635"]
+	134457148679664 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.002478851703926921
+To Play: -1" shape=box]
+	134457148784704 -> 134457148679664 [label="Action: 1450"]
+	134457148678176 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.08090084791183472
+To Play: -1" shape=box]
+	134457148784704 -> 134457148678176 [label="Action: 2647"]
+	134457148791424 -> 134457148784704 [label="Action: 1450"]
+	134457148822176 [label="Visits: 1
+Value: 0.683
+Sum: 0.683
+Prior: 0.06004501134157181
+To Play: 1" shape=box]
+	134457148786624 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.4937019348144531
+To Play: -1" shape=box]
+	134457148822176 -> 134457148786624 [label="Action: 0"]
+	134457148821936 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.15073645114898682
+To Play: -1" shape=box]
+	134457148822176 -> 134457148821936 [label="Action: 2635"]
+	134457148829760 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0679188221693039
+To Play: -1" shape=box]
+	134457148822176 -> 134457148829760 [label="Action: 2678"]
+	134457148825680 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.13285070657730103
+To Play: -1" shape=box]
+	134457148822176 -> 134457148825680 [label="Action: 2664"]
+	134457148821552 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.04928632825613022
+To Play: -1" shape=box]
+	134457148822176 -> 134457148821552 [label="Action: 2649"]
+	134457148820400 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.08364798873662949
+To Play: -1" shape=box]
+	134457148822176 -> 134457148820400 [label="Action: 2647"]
+	134457148820160 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0037157004699110985
+To Play: -1" shape=box]
+	134457148822176 -> 134457148820160 [label="Action: 1559"]
+	134457148819632 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0021216466557234526
+To Play: -1" shape=box]
+	134457148822176 -> 134457148819632 [label="Action: 1578"]
+	134457148791424 -> 134457148822176 [label="Action: 1448"]
+	134457148824096 [label="Visits: 1
+Value: 0.639
+Sum: 0.639
+Prior: 0.08213623613119125
+To Play: 1" shape=box]
+	134457148823616 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.19488456845283508
+To Play: -1" shape=box]
+	134457148824096 -> 134457148823616 [label="Action: 2635"]
+	134457148818288 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.4561065137386322
+To Play: -1" shape=box]
+	134457148824096 -> 134457148818288 [label="Action: 0"]
+	134457148818720 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0024433464277535677
+To Play: -1" shape=box]
+	134457148824096 -> 134457148818720 [label="Action: 1547"]
+	134457148827888 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.13863202929496765
+To Play: -1" shape=box]
+	134457148824096 -> 134457148827888 [label="Action: 2664"]
+	134457148818096 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.07630927115678787
+To Play: -1" shape=box]
+	134457148824096 -> 134457148818096 [label="Action: 2678"]
+	134457148819200 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.07531899958848953
+To Play: -1" shape=box]
+	134457148824096 -> 134457148819200 [label="Action: 2647"]
+	134457148827552 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.041680771857500076
+To Play: -1" shape=box]
+	134457148824096 -> 134457148827552 [label="Action: 2649"]
+	134457148823760 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0010414158459752798
+To Play: -1" shape=box]
+	134457148824096 -> 134457148823760 [label="Action: 1433"]
+	134457148791424 -> 134457148824096 [label="Action: 1462"]
+	134457148824720 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.001188562368042767
+To Play: -1" shape=box]
+	134457148791424 -> 134457148824720 [label="Action: 2635"]
+	134457148822512 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0004760975716635585
+To Play: -1" shape=box]
+	134457148791424 -> 134457148822512 [label="Action: 2647"]
+	134457148791040 -> 134457148791424 [label="Action: 0"]
+	134457148791232 [label="Visits: 7
+Value: -0.523
+Sum: -3.664
+Prior: 0.26475435495376587
+To Play: 2" shape=box]
+	134457148686192 [label="Visits: 2
+Value: 0.439
+Sum: 0.879
+Prior: 0.7088846564292908
+To Play: 1" shape=box]
+	134457148826592 [label="Visits: 1
+Value: -0.391
+Sum: -0.391
+Prior: 0.6947839260101318
+To Play: 2" shape=box]
+	134457155775376 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.07542558014392853
+To Play: -1" shape=box]
+	134457148826592 -> 134457155775376 [label="Action: 1448"]
+	134457155771920 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.5782299637794495
+To Play: -1" shape=box]
+	134457148826592 -> 134457155771920 [label="Action: 0"]
+	134457155776672 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.044197436422109604
+To Play: -1" shape=box]
+	134457148826592 -> 134457155776672 [label="Action: 1433"]
+	134457155777056 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.11730560660362244
+To Play: -1" shape=box]
+	134457148826592 -> 134457155777056 [label="Action: 1450"]
+	134457155775328 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.04964746907353401
+To Play: -1" shape=box]
+	134457148826592 -> 134457155775328 [label="Action: 1419"]
+	134457155768128 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.13515564799308777
+To Play: -1" shape=box]
+	134457148826592 -> 134457155768128 [label="Action: 1462"]
+	134457155776528 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 1.2067878742527682e-05
+To Play: -1" shape=box]
+	134457148826592 -> 134457155776528 [label="Action: 2635"]
+	134457155776480 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 1.041833183990093e-05
+To Play: -1" shape=box]
+	134457148826592 -> 134457155776480 [label="Action: 2664"]
+	134457148686192 -> 134457148826592 [label="Action: 0"]
+	134457148825728 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.07696646451950073
+To Play: -1" shape=box]
+	134457148686192 -> 134457148825728 [label="Action: 2664"]
+	134457148817520 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.015303353779017925
+To Play: -1" shape=box]
+	134457148686192 -> 134457148817520 [label="Action: 2649"]
+	134457148830144 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.05843512713909149
+To Play: -1" shape=box]
+	134457148686192 -> 134457148830144 [label="Action: 2635"]
+	134457148825536 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.02145652286708355
+To Play: -1" shape=box]
+	134457148686192 -> 134457148825536 [label="Action: 1462"]
+	134457148828176 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.008858405984938145
+To Play: -1" shape=box]
+	134457148686192 -> 134457148828176 [label="Action: 1419"]
+	134457148819920 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0441945381462574
+To Play: -1" shape=box]
+	134457148686192 -> 134457148819920 [label="Action: 2647"]
+	134457148827408 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.011186173185706139
+To Play: -1" shape=box]
+	134457148686192 -> 134457148827408 [label="Action: 1450"]
+	134457148791232 -> 134457148686192 [label="Action: 0"]
+	134457148676592 [label="Visits: 1
+Value: 0.66
+Sum: 0.66
+Prior: 0.09464725106954575
+To Play: 1" shape=box]
+	134457148675584 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.01452670432627201
+To Play: -1" shape=box]
+	134457148676592 -> 134457148675584 [label="Action: 1462"]
+	134457148684896 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.6051919460296631
+To Play: -1" shape=box]
+	134457148676592 -> 134457148684896 [label="Action: 0"]
+	134457148671600 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.034114375710487366
+To Play: -1" shape=box]
+	134457148676592 -> 134457148671600 [label="Action: 2649"]
+	134457148676016 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.09862828999757767
+To Play: -1" shape=box]
+	134457148676592 -> 134457148676016 [label="Action: 2635"]
+	134457148677552 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.061530180275440216
+To Play: -1" shape=box]
+	134457148676592 -> 134457148677552 [label="Action: 2678"]
+	134457148684080 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0896645113825798
+To Play: -1" shape=box]
+	134457148676592 -> 134457148684080 [label="Action: 2664"]
+	134457148672944 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.006619538180530071
+To Play: -1" shape=box]
+	134457148676592 -> 134457148672944 [label="Action: 1433"]
+	134457148681584 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0015546608483418822
+To Play: -1" shape=box]
+	134457148676592 -> 134457148681584 [label="Action: 1559"]
+	134457148791232 -> 134457148676592 [label="Action: 1462"]
+	134457148685136 [label="Visits: 1
+Value: 0.551
+Sum: 0.551
+Prior: 0.03688560053706169
+To Play: 1" shape=box]
+	134457148682208 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.5730376243591309
+To Play: -1" shape=box]
+	134457148685136 -> 134457148682208 [label="Action: 0"]
+	134457148673472 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.05286732688546181
+To Play: -1" shape=box]
+	134457148685136 -> 134457148673472 [label="Action: 2647"]
+	134457148681632 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.06281868368387222
+To Play: -1" shape=box]
+	134457148685136 -> 134457148681632 [label="Action: 2678"]
+	134457148671408 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.06352431327104568
+To Play: -1" shape=box]
+	134457148685136 -> 134457148671408 [label="Action: 2635"]
+	134457148672464 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.10308130085468292
+To Play: -1" shape=box]
+	134457148685136 -> 134457148672464 [label="Action: 2664"]
+	134457148682016 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.031881824135780334
+To Play: -1" shape=box]
+	134457148685136 -> 134457148682016 [label="Action: 2649"]
+	134457148683360 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.01150007639080286
+To Play: -1" shape=box]
+	134457148685136 -> 134457148683360 [label="Action: 1450"]
+	134457148682784 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.01800672523677349
+To Play: -1" shape=box]
+	134457148685136 -> 134457148682784 [label="Action: 1448"]
+	134457148791232 -> 134457148685136 [label="Action: 1433"]
+	134457148685664 [label="Visits: 1
+Value: 0.491
+Sum: 0.491
+Prior: 0.06410116702318192
+To Play: 1" shape=box]
+	134457155776912 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.49319061636924744
+To Play: -1" shape=box]
+	134457148685664 -> 134457155776912 [label="Action: 0"]
+	134457155779600 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.12877178192138672
+To Play: -1" shape=box]
+	134457148685664 -> 134457155779600 [label="Action: 2635"]
+	134457155770528 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.06962668150663376
+To Play: -1" shape=box]
+	134457148685664 -> 134457155770528 [label="Action: 2678"]
+	134457155766496 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.14280405640602112
+To Play: -1" shape=box]
+	134457148685664 -> 134457155766496 [label="Action: 2664"]
+	134457155772544 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.07767876982688904
+To Play: -1" shape=box]
+	134457148685664 -> 134457155772544 [label="Action: 2647"]
+	134457155765920 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.04106355831027031
+To Play: -1" shape=box]
+	134457148685664 -> 134457155765920 [label="Action: 2649"]
+	134457155766256 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.005702685564756393
+To Play: -1" shape=box]
+	134457148685664 -> 134457155766256 [label="Action: 1419"]
+	134457155764576 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0116273770108819
+To Play: -1" shape=box]
+	134457148685664 -> 134457155764576 [label="Action: 1462"]
+	134457148791232 -> 134457148685664 [label="Action: 1450"]
+	134457148672608 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.028644807636737823
+To Play: -1" shape=box]
+	134457148791232 -> 134457148672608 [label="Action: 1419"]
+	134457148671456 [label="Visits: 1
+Value: 0.759
+Sum: 0.759
+Prior: 0.06604567915201187
+To Play: 1" shape=box]
+	134457148820352 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.5692697763442993
+To Play: -1" shape=box]
+	134457148671456 -> 134457148820352 [label="Action: 0"]
+	134457148829616 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.10538815706968307
+To Play: -1" shape=box]
+	134457148671456 -> 134457148829616 [label="Action: 2664"]
+	134457148826496 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.08909580856561661
+To Play: -1" shape=box]
+	134457148671456 -> 134457148826496 [label="Action: 2635"]
+	134457148823952 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.03952903300523758
+To Play: -1" shape=box]
+	134457148671456 -> 134457148823952 [label="Action: 2649"]
+	134457155775952 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.07212603092193604
+To Play: -1" shape=box]
+	134457148671456 -> 134457155775952 [label="Action: 2647"]
+	134457155779552 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.0028251733165234327
+To Play: -1" shape=box]
+	134457148671456 -> 134457155779552 [label="Action: 1578"]
+	134457155777584 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.06940436363220215
+To Play: -1" shape=box]
+	134457148671456 -> 134457155777584 [label="Action: 2678"]
+	134457155765536 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.01415284350514412
+To Play: -1" shape=box]
+	134457148671456 -> 134457155765536 [label="Action: 1462"]
+	134457148791232 -> 134457148671456 [label="Action: 1448"]
+	134457148684272 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 3.597622344386764e-05
+To Play: -1" shape=box]
+	134457148791232 -> 134457148684272 [label="Action: 2649"]
+	134457148671024 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.00028925453079864383
+To Play: -1" shape=box]
+	134457148791232 -> 134457148671024 [label="Action: 2635"]
+	134457148791040 -> 134457148791232 [label="Action: 2635"]
+	134457148786720 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.19387611746788025
+To Play: -1" shape=box]
+	134457148791040 -> 134457148786720 [label="Action: 2664"]
+	134457148791904 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.05705790966749191
+To Play: -1" shape=box]
+	134457148791040 -> 134457148791904 [label="Action: 2647"]
+	134457148792336 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.013031951151788235
+To Play: -1" shape=box]
+	134457148791040 -> 134457148792336 [label="Action: 2649"]
+	134457148792384 [label="Visits: 0
+Value: 0
+Sum: 0
+Prior: 0.029824333265423775
+To Play: -1" shape=box]
+	134457148791040 -> 134457148792384 [label="Action: 2678"]
+}

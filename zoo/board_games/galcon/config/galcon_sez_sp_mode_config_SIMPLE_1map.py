@@ -42,7 +42,7 @@ augment_data_with_symmetry=False
 collector_env_num = 8
 n_episode = 8
 # The number of parallel environments to evaluate for
-evaluator_env_num = 5
+evaluator_env_num = 1
 num_simulations = 25
 K = 8
 # Increase by 4x if reflecting on x and y
@@ -63,7 +63,7 @@ mcts_ctree = False
 # ==============================================================
 
 galcon_sez_config = dict(
-    exp_name=f'data_sez/galcon_sez_sp_8p_fixed_noaugment_map{map_seed}',
+    exp_name=f'data_sez/galcon_sez_sp_8p_fixed_noaugment_map{map_seed}_rewardrange',
     # exp_name='data_sez/galcon_sez_self-play_seed0',
     env=dict(
         # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
@@ -105,11 +105,10 @@ galcon_sez_config = dict(
         # render_mode='state_realtime_mode',
         # render_mode='image_realtime_mode',
         # render_mode='image_savefile_mode',
-        # replay_path='./video/galcon/train',
-        # replay_path=None,
+        replay_path='./video/galcon/train',
         # options are: {'mp4', 'gif'}. Only relevant for 'image_savefile_mode'
-        # replay_format='gif',
-        # replay_screen_scaling=9,
+        replay_format='gif',
+        replay_screen_scaling=9,
     ),
     policy=dict(
         model=dict(
@@ -133,8 +132,15 @@ galcon_sez_config = dict(
             reward_head_hidden_channels=[64],
             value_head_hidden_channels=[64],
             policy_head_hidden_channels=[128],
-            reward_support_range=(-10., 11., 1.),
-            value_support_range=(-10., 11., 1.),
+            # TODO: Try modifying this 
+            # categorical distribution instead of reward support range (rather than outputting a probability that the state is
+            # in one of these buckets, output the raw expected value of the position)
+            categorical_distribution=True,
+            # "start, stop, step" format, where "stop" is EXCLUSIVE
+            # reward_support_range=(-10., 11., 1.),
+            # value_support_range=(-10., 11., 1.),
+            reward_support_range=(-1., 2., 1.),
+            value_support_range=(-1., 2., 1.),
             discrete_action_encoding_type='one_hot',
             norm_type='BN',
             # Reduce huge action space into a lower dimensional embedding space

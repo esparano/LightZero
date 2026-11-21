@@ -100,11 +100,10 @@ galcon_sez_config = dict(
         # render_mode='state_realtime_mode',
         # render_mode='image_realtime_mode',
         # render_mode='image_savefile_mode',
-        # replay_path='./video/galcon/train',
-        replay_path=None,
+        replay_path='./video/galcon/train',
         # options are: {'mp4', 'gif'}. Only relevant for 'image_savefile_mode'
-        # replay_format='gif',
-        # replay_screen_scaling=9,
+        replay_format='gif',
+        replay_screen_scaling=9,
     ),
     policy=dict(
         model=dict(

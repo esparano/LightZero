@@ -1,5 +1,6 @@
 import copy
 from typing import TYPE_CHECKING, List, Any, Union
+from graphviz import Digraph
 
 import numpy as np
 import torch
@@ -239,3 +240,67 @@ class SampledEfficientZeroMCTSPtree(object):
                     current_latent_state_index, discount_factor, value_prefix_batch, value_batch, policy_logits_batch,
                     min_max_stats_lst, results, is_reset_list, virtual_to_play_batch
                 )
+
+
+from graphviz import Digraph
+
+def visualize_mcts(root_node, max_depth=3, filename="mcts_tree"):
+    """
+    Generates a PDF/PNG visualization of the MCTS tree.
+    """
+    dot = Digraph(comment='MCTS Tree')
+    dot.attr(rankdir='TB', size='10,10')
+    
+    # Track nodes to avoid infinite loops and assign unique string IDs
+    visited = set()
+    
+    def add_node_to_graph(node, depth=0):
+        if depth > max_depth:
+            return
+            
+        node_id = str(id(node))
+        if node_id in visited:
+            return
+        visited.add(node_id)
+        
+        # Format the metrics safely inside the node box
+        # Using getattr as a fallback in case some nodes don't have all attributes
+        v_count = getattr(node, 'visit_count', 'N/A')
+        val_sum = getattr(node, 'value_sum', 'N/A')
+        val = getattr(node, 'value', 'N/A')
+        prior = getattr(node, 'prior', 'N/A')
+        to_play = getattr(node, 'to_play', 'N/A')
+        
+        # Round floats for clean viewing
+        if isinstance(val, float): val = round(val, 3)
+        if isinstance(val_sum, float): val_sum = round(val_sum, 3)
+        
+        label = f"Visits: {v_count}\nValue: {val}\nSum: {val_sum}\nPrior: {prior}\nTo Play: {to_play}"
+        
+        # Make the root node stand out visually
+        if depth == 0:
+            dot.node(node_id, f"ROOT\n{label}", shape='box', style='filled', fillcolor='lightblue')
+        else:
+            dot.node(node_id, label, shape='box')
+            
+        # Safely traverse children bypassing the subscript dictionary error
+        # We iterate over values directly to get child node objects
+        if hasattr(node, 'children') and node.children:
+            # We iterate over items to optionally get the action/key used to reach the child
+            for action_key, child_node in node.children.items():
+                if child_node is not None:
+                    child_id = str(id(child_node))
+                    
+                    # Process child node details
+                    add_node_to_graph(child_node, depth + 1)
+                    
+                    # Represent the action/key safely as a string for the arrow label
+                    edge_label = f"Action: {str(action_key)}"
+                    dot.edge(node_id, child_id, label=edge_label)
+
+    # Begin building from your root node
+    add_node_to_graph(root_node)
+    
+    # Save and view the output file (creates mcts_tree.gv and mcts_tree.gv.pdf)
+    dot.render(filename, view=True, format='pdf')
+    print(f"Tree visualization saved to {filename}.gv.pdf")

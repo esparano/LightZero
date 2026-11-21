@@ -2,6 +2,7 @@
 from zoo.board_games.galcon.config.galcon_sez_sp_mode_config_SIMPLE import main_config, create_config
 from lzero.entry import eval_muzero
 import numpy as np
+import re
 
 if __name__ == '__main__':
     """
@@ -16,15 +17,22 @@ if __name__ == '__main__':
         - seeds (:obj:`List[int]`): List of seeds for the environment.
         - num_episodes_each_seed (:obj:`int`): Number of episodes to run for each seed.
         - total_test_episodes (:obj:`int`): Total number of test episodes, computed as the product of the number of 
-        seeds and the number of episodes per seed.
+        seeds and the number of episodes per seed. 
     """
     # model_path = './ckpt/ckpt_best.pth.tar'
     # model_path = './data_sez/galcon_sez_self-play_8-grid_adamw_1e4_260612_192141/ckpt/ckpt_best.pth.tar'
     # model_path = './data_sez/galcon_sez_self-play_8-grid_adamw_1e4_symmetry/ckpt/ckpt_best.pth.tar'
     # model_path = './data_sez/galcon_sez_self-play_8-grid_adamw_1e4_symmetry/ckpt/iteration_0.pth.tar'
-    model_path = 'data_sez/galcon_sez_self-play_8-grid_adamw_1e4_fixed_augment/ckpt/iteration_100000.pth.tar'
+    # model_path = 'data_sez/galcon_sez_self-play_8-grid_adamw_1e4_fixed_augment/ckpt/iteration_100000.pth.tar'
+    # model_path = 'data_sez/galcon_sez_sp_8p_fixed_augment/ckpt/iteration_600000.pth.tar'
+    # model_path = 'data_sez/galcon_sez_sp_8p_fixed_noaugment_map2/ckpt/iteration_130000.pth.tar'
+    # model_path = 'data_sez/galcon_sez_sp_8p_fixed_noaugment_map2_pucttweak/ckpt/iteration_20000.pth.tar'
+    # model_path = 'data_sez/galcon_sez_sp_8p_fixed_noaugment_map2_pucttweak_losstweak/ckpt/iteration_120000.pth.tar'
+    model_path = 'data_sez/galcon_sez_sp_8p_fixed_noaugment_map2_rewardrange/ckpt/iteration_30000.pth.tar'
     # model_path = None
-    seeds = [0]
+    # seeds = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+    seeds = [2]
+    main_config.env.map_seed = 2
     num_episodes_each_seed = 1
     # If True, you can play with the agent.
     # main_config.env.agent_vs_human = True
@@ -33,17 +41,24 @@ if __name__ == '__main__':
     main_config.env.render_mode = 'image_savefile_mode'
     main_config.env.replay_path = './video/galcon/eval'
 
+    # Set video name based on model path and extension
+    if model_path != None:
+        exp_name_extracted = re.search(r'[^/]+/(.*?)/', model_path)
+        if exp_name_extracted:
+            model_version_extracted = re.search(r'([^/]+)\.pth\.tar$', model_path)
+            if model_version_extracted:
+                main_config.env.replay_name_suffix = f'_{exp_name_extracted.group(1)}_{model_version_extracted.group(1)}_'
+
     main_config.env.bot_action_type = 'random'
     # probability of eval bot's action being 
     main_config.env.prob_pass_action_in_bot = 0
     main_config.env.prob_random_action_in_bot = 0.
-    main_config.env.map_seed = 2
+
     # ['fixed', 'random', 'pass']
-
-
     create_config.env_manager.type = 'base'
     main_config.env.evaluator_env_num = 1
     main_config.env.n_evaluator_episode = 1
+
     total_test_episodes = num_episodes_each_seed * len(seeds)
     returns_mean_seeds = []
     returns_seeds = []
