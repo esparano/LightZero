@@ -158,7 +158,7 @@ class SampledEfficientZeroModel(nn.Module):
             elif observation_shape[1] == 64:
                 latent_size = math.ceil(observation_shape[1] / 8) * math.ceil(observation_shape[2] / 8)
             else:
-                raise ValueError("Invalid observation shape, only support 64, 84, 96 when downsample=True.")
+                raise ValueError(f"Invalid observation shape {observation_shape}, only support 64, 84, 96 when downsample=True.")
         else:
             latent_size = observation_shape[1] * observation_shape[2]
 
