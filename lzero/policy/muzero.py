@@ -1058,7 +1058,9 @@ class MuZeroPolicy(Policy):
         self._optimizer.load_state_dict(state_dict['optimizer'])
 
     def __del__(self):
-        if self._cfg.model.analysis_sim_norm:
+        # Defensive: destructors must never raise. analysis_sim_norm defaults to
+        # False in all production configs; use getattr for stripped-down test configs.
+        if getattr(self._cfg.model, 'analysis_sim_norm', False):
             # Remove hooks after training.
             self._collect_model.encoder_hook.remove_hooks()
             self._target_model.encoder_hook.remove_hooks()

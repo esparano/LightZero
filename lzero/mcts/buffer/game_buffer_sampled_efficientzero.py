@@ -143,8 +143,9 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             # ==============================================================
             # sampled related core code
             # ==============================================================
-            actions_tmp = game.action_segment[pos_in_game_segment:pos_in_game_segment +
-                                              self._cfg.num_unroll_steps].tolist()
+            actions_slice = game.action_segment[pos_in_game_segment:pos_in_game_segment +
+                                              self._cfg.num_unroll_steps]
+            actions_tmp = actions_slice.tolist() if hasattr(actions_slice, 'tolist') else list(actions_slice)
 
             # NOTE: self._cfg.num_unroll_steps + 1
             root_sampled_actions_tmp = game.root_sampled_actions[pos_in_game_segment:pos_in_game_segment +
@@ -442,10 +443,10 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                     horizon_id += 1
 
                     if current_index < game_segment_len_non_re:
-                        target_values.append(value_list[value_index].item())
+                        target_values.append(float(value_list[value_index]))
                         # Since the horizon is small and the discount_factor is close to 1.
                         # Compute the reward sum to approximate the value prefix for simplification
-                        value_prefix += reward_list[current_index].item()  # * config.discount_factor ** (current_index - base_index)
+                        value_prefix += float(reward_list[current_index])  # * config.discount_factor ** (current_index - base_index)
                         target_value_prefixs.append(value_prefix.item())
                     else:
                         target_values.append(0.)
