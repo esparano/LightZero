@@ -55,6 +55,7 @@ class Node:
         self.value_prefix = 0.0
         self.children = {}
         self.children_index = []
+        self.sampled_actions = []
         self.simulation_index = 0
         self.batch_index = 0
 
@@ -113,65 +114,56 @@ class Node:
             log_prob = dist.log_prob(sampled_actions_before_tanh).unsqueeze(-1)
             log_prob = log_prob - torch.log(y).sum(-1, keepdim=True)
             self.legal_actions = []
+            self.sampled_actions = []
 
             for action_index in range(self.num_of_sampled_actions):
-                self.children[Action(sampled_actions[action_index].detach().cpu().numpy())] = Node(
+                action = Action(sampled_actions[action_index].detach().cpu().numpy())
+                self.children[action] = Node(
                     log_prob[action_index],
                     action_space_size=self.action_space_size,
                     num_of_sampled_actions=self.num_of_sampled_actions,
                     continuous_action_space=self.continuous_action_space
                 )
-                self.legal_actions.append(Action(sampled_actions[action_index].detach().cpu().numpy()))
+                self.legal_actions.append(action)
+                self.sampled_actions.append(action)
         else:
-            if self.legal_actions is not None and len(self.legal_actions) > 0:
-                # 1. Extract ONLY the logits for the truly legal actions
-                legal_logits = [policy_logits[a] for a in self.legal_actions]
-                prob = torch.softmax(torch.tensor(legal_logits), dim=-1)
-                
-                # Prevent sampling more actions than are actually legal
-                num_to_sample = min(self.num_of_sampled_actions, len(self.legal_actions))
-                sampled_indices = torch.multinomial(prob, num_to_sample, replacement=False)
-                
-                # 3. Create a temporary list to hold the sampled subset
-                sampled_legal_actions = [] 
-                
-                for idx in sampled_indices:
-                    global_action = self.legal_actions[idx]
-                    action_obj = Action(global_action)
-                    
-                    self.children[action_obj] = Node(
-                        prob[idx].item(),  
-                        action_space_size=self.action_space_size,
-                        num_of_sampled_actions=self.num_of_sampled_actions,
-                        continuous_action_space=self.continuous_action_space
-                    )
-                    sampled_legal_actions.append(action_obj)
-                
-                # 4. Overwrite legal_actions so the MCTS tree and get_sampled_actions() 
-                # only see the sampled subset!
-                self.legal_actions = sampled_legal_actions
-            
-            # TODO: I AM NOT confident that this is right. It seems like the TODO above, combined with the code, means that 
-            # expanded leaf nodes never actually get any legal actions and thus no children of leaf nodes are ever added during expansion
-            # We can simply let all non-root nodes allow all legal actions and let the network predict the legal actions... It should learn over time... I think...
-            # TODO: After training, set a breakpoint in SampledEfficientZeroMCTSPtree.search() and in ptree_sez batch_traverse() and monitor the policy
-            # (checking whether the policy is recommending illegal moves) for leaf nodes.
-            # TODO: alternatively, monitor the rate of illegal actions somehow, ideally in Tensorboard. Would be extremely useful... break down by root note vs. leaf nodes?
-            else:
-                # Fallback logic
-                self.legal_actions = []
-                prob = torch.softmax(torch.tensor(policy_logits), dim=-1)
-                sampled_actions = torch.multinomial(prob, self.num_of_sampled_actions, replacement=False)
+            candidate_actions = list(range(self.action_space_size)) if self.legal_actions is None else list(self.legal_actions)
+            if len(candidate_actions) == 0:
+                raise ValueError("legal_actions must not be empty when expanding a discrete Sampled EfficientZero node")
 
-                for action_index in range(self.num_of_sampled_actions):
-                    action_obj = Action(sampled_actions[action_index].detach().cpu().numpy())
-                    self.children[action_obj] = Node(
-                        prob[sampled_actions[action_index]].item(),
-                        action_space_size=self.action_space_size,
-                        num_of_sampled_actions=self.num_of_sampled_actions,
-                        continuous_action_space=self.continuous_action_space
-                    )
-                    self.legal_actions.append(action_obj)
+            policy_logits = torch.as_tensor(policy_logits, dtype=torch.float32)
+            candidate_actions_tensor = torch.as_tensor(candidate_actions, dtype=torch.long)
+            if policy_logits.numel() == self.action_space_size:
+                candidate_logits = policy_logits[candidate_actions_tensor]
+            elif policy_logits.numel() == len(candidate_actions):
+                candidate_logits = policy_logits
+            else:
+                raise ValueError(
+                    f"policy_logits length {policy_logits.numel()} does not match action_space_size "
+                    f"{self.action_space_size} or legal action count {len(candidate_actions)}"
+                )
+
+            prob = torch.softmax(candidate_logits, dim=-1)
+            num_sampled = min(self.num_of_sampled_actions, len(candidate_actions))
+            sampled_action_indices = torch.multinomial(prob, num_sampled, replacement=False)
+            sampled_actions = candidate_actions_tensor[sampled_action_indices]
+
+            self.legal_actions = []
+            self.sampled_actions = []
+
+            for action_index in range(num_sampled):
+                action = Action(sampled_actions[action_index].detach().cpu().numpy())
+                self.children[action] = Node(
+                    prob[sampled_action_indices[action_index]],
+                    action_space_size=self.action_space_size,
+                    num_of_sampled_actions=self.num_of_sampled_actions,
+                    continuous_action_space=self.continuous_action_space
+                )
+                self.legal_actions.append(action)
+                self.sampled_actions.append(action)
+
+            if self.sampled_actions:
+                self.sampled_actions.extend([self.sampled_actions[-1]] * (self.num_of_sampled_actions - num_sampled))
 
     def add_exploration_noise_to_sample_distribution(
             self, exploration_fraction: float, noises: List[float], policy_logits: List[float]
@@ -285,6 +277,7 @@ class Node:
                 distribution[a] = child.visit_count
             # only take the visit counts
             distribution = [v for k, v in distribution.items()]
+            distribution.extend([0] * (len(self.sampled_actions) - len(distribution)))
         return distribution
 
     def get_child(self, action: Union[int, float]) -> "Node":
@@ -469,26 +462,9 @@ class Roots:
         Returns:
             - distribution (:obj:`List[List[Union[int, float]]]`): a vector of distribution of child nodes in the format of visit count (i.e. [1,3,0,2,5]).
         """
-        # PREVIOUS VERSION:
-        # distributions = []
-        # for i in range(self.root_num):
-        #     distributions.append(self.roots[i].get_children_distribution())
-
-        # return distributions
         distributions = []
         for i in range(self.root_num):
-            dist = self.roots[i].get_children_distribution()
-            
-            if dist is not None:
-                dist = list(dist)
-                pad_len = self.num_of_sampled_actions - len(dist)
-                
-                if pad_len > 0:
-                    # 4. Pad the visit counts with 0. 
-                    # This guarantees the target policy probability for the dummy actions is 0.0!
-                    dist = dist + [0] * pad_len
-                    
-            distributions.append(dist)
+            distributions.append(self.roots[i].get_children_distribution())
 
         return distributions
 
@@ -498,56 +474,15 @@ class Roots:
     def get_sampled_actions(self) -> List[List[Union[int, float]]]:
         """
         Overview:
-            Get the sampled_actions of each root, padded to a uniform length
+            Get the sampled_actions of each root.
         Returns:
             - sampled_actions (:obj:`List[List[Union[int, float]]]`): a vector of sampled_actions for each root, \
                 e.g. the size of original action space is 6, K=3, sampled_actions = [[1,3,0], [2,4,0], [5,4,1]].
         """
-        # PREVIOUS VERSION:
         # TODO(pu): root_sampled_actions bug in discere action space?
-        # sampled_actions = []
-        # for i in range(self.root_num):
-        #     sampled_actions.append(self.roots[i].legal_actions)
-
-        # return sampled_actions
-
-        # ALTERNATE VERSION 1
-        # sampled_actions = []
-        # for i in range(self.root_num):
-        #     # 1. Get the list of Actions (using the objects)
-        #     actions = [action.value for action in self.roots[i].legal_actions]
-            
-        #     # 2. Calculate the required padding
-        #     pad_len = self.num_of_sampled_actions - len(actions)
-            
-        #     if pad_len > 0:
-        #         # 3. Assumption: -1 is not a legal action ID, so we pad with this value
-        #         # This ensures the list is always self.num_of_sampled_actions long
-        #         actions = actions + [-1] * pad_len
-            
-        #     # 4. Truncate in case something went wrong and we have too many
-        #     actions = actions[:self.num_of_sampled_actions]
-            
-        #     sampled_actions.append(actions)
-
-        # return sampled_actions
-
-        # ALTERNATE VERSION 2
         sampled_actions = []
         for i in range(self.root_num):
-            # 1. Copy the list so we don't accidentally mutate the actual MCTS nodes!
-            actions = list(self.roots[i].legal_actions)
-            
-            # 2. Calculate how much padding we need to reach K
-            pad_len = self.num_of_sampled_actions - len(actions)
-            
-            if pad_len > 0:
-                # 3. Pad with a dummy action (e.g., Action(0)).
-                # (This is safe because its corresponding visit count will be padded to 0 below)
-                dummy_action = Action(-1)
-                actions = actions + [dummy_action] * pad_len
-                
-            sampled_actions.append(actions)
+            sampled_actions.append(self.roots[i].sampled_actions)
 
         return sampled_actions
 
