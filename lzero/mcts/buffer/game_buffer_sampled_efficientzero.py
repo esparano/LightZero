@@ -421,14 +421,16 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                 target_value_prefixs = []
 
                 value_prefix = np.array(0.)
-                base_index = state_index
                 for current_index in range(state_index, state_index + self._cfg.num_unroll_steps + 1):
                     bootstrap_index = current_index + td_steps_list[value_index]
                     # for i, reward in enumerate(game.rewards[current_index:bootstrap_index]):
                     for i, reward in enumerate(reward_list[current_index:bootstrap_index]):
                         if self._cfg.env_type == 'board_games' and to_play_segment[0][0] in [1, 2]:
-                            # TODO(pu): for board_games, very important, to check
-                            if to_play_list[base_index] == to_play_list[i]:
+                            # The reward of transition ``current_index + i`` is from the perspective of the
+                            # player to play at that transition, while the value target is from the perspective
+                            # of the player to play at the current state. Flip the sign when they differ
+                            # (players alternate, e.g. tictactoe self-play).
+                            if to_play_list[current_index + i] == to_play_list[current_index]:
                                 value_list[value_index] += reward * self._cfg.discount_factor ** i
                             else:
                                 value_list[value_index] += -reward * self._cfg.discount_factor ** i
@@ -439,7 +441,6 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                     # reset every lstm_horizon_len
                     if horizon_id % self._cfg.lstm_horizon_len == 0:
                         value_prefix = np.array(0.)
-                        base_index = current_index
                     horizon_id += 1
 
                     if current_index < game_segment_len_non_re:
