@@ -154,6 +154,10 @@ class GameBuffer(ABC, object):
         mini_infer_size=10240,
         # (str) The type of sampled data. The default is 'transition'. Options: 'transition', 'episode'.
         sample_type='transition',
+        # (float) Priority exponent alpha for prioritized experience replay.
+        priority_prob_alpha=0.6,
+        # (float) Importance sampling exponent beta for prioritized experience replay.
+        priority_prob_beta=0.4,
     )
 
     def __init__(self, cfg: dict):
@@ -167,7 +171,6 @@ class GameBuffer(ABC, object):
         default_config = self.default_config()
         default_config.update(cfg)
         self._cfg = default_config
-        self._cfg = cfg
         assert self._cfg.env_type in ['not_board_games', 'board_games']
         assert self._cfg.action_type in ['fixed_action_space', 'varied_action_space']
 
