@@ -56,8 +56,10 @@ max_env_step = int(1e9)
 model_path = None
 # model_path = './data_sez/galcon_sez_self-play_seed0_260608_224501/ckpt/iteration_31250.pth.tar'
 
-# TODO: ctree does not have the bug fixes for sampled discrete action spaces yet.
-mcts_ctree = False
+# CTree (Cython) now includes the sampled discrete-action-space bug fixes; the .so modules
+# have been recompiled and verified against legal-action masking
+# (see lzero/mcts/tests/test_ptree_sez_discrete_sampling.py).
+mcts_ctree = True
 # ==============================================================
 # end of the most frequently changed config specified by the user
 # ==============================================================
