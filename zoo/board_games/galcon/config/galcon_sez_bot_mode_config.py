@@ -25,7 +25,7 @@ neutral_max_production = 100
 fleet_top_k = 1
 grid_width = int(math.ceil((2 * grid_max_x) / grid_square_size))
 grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
-augment_data_with_symmetry=False
+augment_data_with_symmetry=True
 
 collector_env_num = 8
 n_episode = 8
@@ -40,8 +40,8 @@ max_env_step = int(1e9)
 
 model_path = None
 
-# TODO: ctree does not have the bug fixes for sampled discrete action spaces yet.
-mcts_ctree = False
+# CTree (Cython) now includes the sampled discrete-action-space bug fixes and has been recompiled.
+mcts_ctree = True
 # ==============================================================
 # end of the most frequently changed config specified by the user
 # ==============================================================
@@ -77,6 +77,7 @@ galcon_sez_config = dict(
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
         n_evaluator_episode=evaluator_env_num,
+        stop_value=2,
         manager=dict(shared_memory=False),
         agent_vs_human=False,
         prob_random_agent=0,
@@ -96,9 +97,9 @@ galcon_sez_config = dict(
     policy=dict(
         model=dict(
             model_type='conv',
-            # There are currently 76 different channels represending planet and fleet info
-            observation_shape=(76, grid_height, grid_width),
-            image_channel=76,
+            # Currently 40 channels (fleet_top_k=1 with fleet redirecting temporarily disabled)
+            observation_shape=(40, grid_height, grid_width),
+            image_channel=40,
             # Only the most recent frame is passed to the NN
             frame_stack_num=1,
             action_space_size=grid_width * grid_height * grid_width * grid_height + 1,
@@ -117,8 +118,9 @@ galcon_sez_config = dict(
             reward_head_hidden_channels=[256],
             value_head_hidden_channels=[256],
             policy_head_hidden_channels=[512],
-            reward_support_range=(-10., 11., 1.),
-            value_support_range=(-10., 11., 1.),
+            # "start, stop, step" format where stop is EXCLUSIVE -> bins [-1, 0, +1]
+            reward_support_range=(-1., 2., 1.),
+            value_support_range=(-1., 2., 1.),
             discrete_action_encoding_type='one_hot',
             norm_type='BN',            
             # Reduce huge action space into a lower dimensional embedding space
@@ -139,9 +141,11 @@ galcon_sez_config = dict(
         learning_rate=0.0003,
         grad_clip_value=0.5,
         num_simulations=num_simulations,
+        manual_temperature_decay=False,
+        fixed_temperature_value=1.0,
         reanalyze_ratio=reanalyze_ratio,
         td_steps=max_episode_steps,
-        discount_factor=1,
+        discount_factor=0.99,
         # Consider increasing this to 8 to allow 2 full seconds of gameplay...
         num_unroll_steps=5,
         lstm_horizon_len=5,

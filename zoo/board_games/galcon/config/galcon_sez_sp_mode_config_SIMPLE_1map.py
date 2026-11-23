@@ -97,6 +97,7 @@ galcon_sez_config = dict(
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
         n_evaluator_episode=n_evaluator_episode,
+        stop_value=2,
         manager=dict(shared_memory=False),
         agent_vs_human=False,
         prob_random_agent=0,
