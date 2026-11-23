@@ -158,7 +158,7 @@ galcon_sez_config = dict(
         fixed_temperature_value=1.0,
         reanalyze_ratio=reanalyze_ratio,
         td_steps=max_episode_steps,
-        discount_factor=1,
+        discount_factor=0.99,
         # Consider increasing this to 8 to allow 2 full seconds of gameplay...
         num_unroll_steps=5,
         lstm_horizon_len=5,
