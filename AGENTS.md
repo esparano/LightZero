@@ -52,3 +52,5 @@ Keep these subtle invariants in mind when touching `lzero/mcts/`, `lzero/policy/
    - `timestep.reward` is what gets stored in `GameSegment.reward_segment` and trained on:
      - In `self_play_mode`: from the **acting player's perspective** (buffer flips signs via `to_play_list[current_index + i] == to_play_list[current_index]`).
      - In `eval_mode` and `play_with_bot_mode`: from **Player 1's (the agent's) perspective** (if the episode terminates on Player 2's/bot's step, negate `timestep_player2.reward` and `eval_episode_return`).
+3. **Do NOT Mask Illegal Actions in Policy Loss Softmax (MuZero / SEZ):**
+   - Unlike AlphaZero, non-root MCTS child nodes (depth $\ge 1$) have **no simulator `action_mask`** and sample children directly from `softmax(policy_logits)`. Keeping the policy loss softmax unmasked is required so the network learns to suppress illegal action logits for deep tree search.
