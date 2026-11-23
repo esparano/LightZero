@@ -410,6 +410,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             )
         else:
             """discrete action space"""
+            root_policy_action0_prob = torch.softmax(policy_logits.detach(), dim=-1)[:, 0].mean().item()
             policy_loss, policy_entropy, policy_entropy_loss, target_policy_entropy, target_sampled_actions = self._calculate_policy_loss_disc(
                 policy_loss, policy_logits, target_policy, mask_batch, child_sampled_actions_batch, unroll_step=0
             )
@@ -582,6 +583,8 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                 'target_sampled_actions_max': target_sampled_actions[:, :].float().max().item(),
                 'target_sampled_actions_min': target_sampled_actions[:, :].float().min().item(),
                 'target_sampled_actions_mean': target_sampled_actions[:, :].float().mean().item(),
+                'action0_taken_rate': (action_batch[:, 0] == 0).float().mean().item(),
+                'policy_action0_prob': root_policy_action0_prob,
                 'total_grad_norm_before_clip': total_grad_norm_before_clip.item()
             })
 
@@ -1160,6 +1163,8 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                 'target_sampled_actions_max',
                 'target_sampled_actions_min',
                 'target_sampled_actions_mean',
+                'action0_taken_rate',
+                'policy_action0_prob',
                 'total_grad_norm_before_clip',
             ]
 

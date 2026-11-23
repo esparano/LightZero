@@ -164,6 +164,13 @@ class TestSampledEfficientZeroPolicyLearn:
             assert not np.isnan(val), f"{key} is NaN!"
             assert not np.isinf(val), f"{key} is Inf!"
 
+        # Action-0 (Pass in Galcon) TensorBoard diagnostics
+        monitor_vars = policy._monitor_vars_learn()
+        for key in ['action0_taken_rate', 'policy_action0_prob']:
+            assert key in log_vars
+            assert key in monitor_vars
+            assert 0.0 <= float(log_vars[key]) <= 1.0
+
     def test_calculate_policy_loss_disc_handles_2d_and_3d_ctree_sampled_actions(self):
         """ptree produces (B, U, K) sampled actions while ctree produces (B, U, K, 1).
         Verify _calculate_policy_loss_disc handles both identically, including -1 dummy padding.
