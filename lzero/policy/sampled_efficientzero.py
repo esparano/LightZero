@@ -1023,6 +1023,12 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                     self._cfg.model.num_of_sampled_actions, self._cfg.model.continuous_action_space
                 )
 
+            # In self_play_mode board games, the dynamics/value model is trained on alternating
+            # two-player perspectives. Some board-game envs (e.g. TicTacToe in eval_mode) emit
+            # to_play=-1, which would disable minimax negation in MCTS during evaluation.
+            if self._cfg.env_type == 'board_games' and self._cfg.battle_mode == 'self_play_mode':
+                to_play = [1 if int(tp) == -1 else int(tp) for tp in to_play]
+
             roots.prepare_no_noise(value_prefix_roots, policy_logits, to_play)
             self._mcts_eval.search(roots, self._eval_model, latent_state_roots, reward_hidden_state_roots, to_play)
 

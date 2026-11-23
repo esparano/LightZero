@@ -201,3 +201,33 @@ class TestSampledEfficientZeroPolicyLearn:
         assert loss_3d.shape == (B,)
         assert torch.isfinite(loss_3d).all()
         assert torch.allclose(loss_2d, loss_3d, atol=1e-6)
+
+    def test_forward_eval_maps_minus_one_to_play_for_self_play_board_games(self):
+        """In self_play_mode board games, eval envs may emit to_play=-1.
+        Verify _forward_eval remaps -1 -> 1 so MCTS keeps two-player minimax negation,
+        while play_with_bot_mode leaves to_play=-1 untouched.
+        """
+        for battle_mode, expected_to_play in [('self_play_mode', [1]), ('play_with_bot_mode', [-1])]:
+            cfg = _make_test_policy_and_buffer_cfg(grid_h=2, grid_w=2, channels=4, num_sampled_actions=4)
+            cfg.battle_mode = battle_mode
+            cfg.num_simulations = 2
+            policy = SampledEfficientZeroPolicy(cfg)
+            policy._init_eval()
+
+            recorded_to_play = []
+            orig_search = policy._mcts_eval.search
+
+            def _spy_search(roots, model, latent_state_roots, reward_hidden_state_roots, to_play):
+                recorded_to_play.append(list(to_play))
+                return orig_search(roots, model, latent_state_roots, reward_hidden_state_roots, to_play)
+
+            policy._mcts_eval.search = _spy_search
+
+            obs = torch.zeros((1, 4, 2, 2), dtype=torch.float32)
+            action_mask = [np.ones(cfg.model.action_space_size, dtype=np.int8)]
+            out = policy._forward_eval(obs, action_mask=action_mask, to_play=[-1])
+
+            assert 0 in out and 'action' in out[0]
+            assert recorded_to_play == [expected_to_play], (
+                f"battle_mode={battle_mode}: expected to_play={expected_to_play}, got {recorded_to_play}"
+            )
