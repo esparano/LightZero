@@ -554,3 +554,31 @@ class TestGalconEnv:
                 assert float(ts.reward) == pytest.approx(expected_reward)
                 assert float(ts.info['eval_episode_return']) == pytest.approx(expected_reward)
                 break
+
+    @pytest.mark.parametrize('replay_format', ['gif', 'mp4'])
+    def test_save_render_output_gif_and_mp4(self, tmp_path, replay_format):
+        """Verify image_savefile_mode produces a non-empty replay file for both GIF and H.264 MP4."""
+        cfg = GalconEnv.default_config()
+        cfg.update(dict(
+            battle_mode='eval_mode',
+            bot_action_type='pass',
+            max_episode_steps=4,
+            num_planets=4,
+            map_seed=2,
+            grid_square_size=25.0,
+            grid_max_x=50.0,
+            grid_max_y=50.0,
+            render_mode='image_savefile_mode',
+            replay_path=str(tmp_path),
+            replay_format=replay_format,
+            replay_name_suffix=f'unit_{replay_format}',
+        ))
+        env = GalconEnv(cfg)
+        env.reset()
+        while True:
+            ts = env.step(env.pass_action)
+            if ts.done:
+                break
+        files = list(tmp_path.glob(f'*.{replay_format}'))
+        assert len(files) == 1
+        assert files[0].stat().st_size > 0

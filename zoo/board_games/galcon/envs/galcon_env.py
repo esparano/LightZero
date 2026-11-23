@@ -1293,9 +1293,21 @@ class GalconEnv(BaseEnv):
                 filename = os.path.join(replay_path, f'galcon_{replay_name_suffix}_{os.getpid()}_{timestamp}.{format}')
 
         if format == 'gif':
-            imageio.mimsave(filename, self.frames, format='GIF', duration=self.tick_seconds)
+            imageio.mimsave(
+                filename,
+                self.frames,
+                format='GIF',
+                duration=int(round(self.tick_seconds * 1000)),
+                loop=0,
+            )
         elif format == 'mp4':
-            imageio.mimsave(filename, self.frames, fps=int(round(1.0 / self.tick_seconds)), codec='mpeg4')
+            imageio.mimsave(
+                filename,
+                self.frames,
+                fps=int(round(1.0 / self.tick_seconds)),
+                codec='libx264',
+                pixelformat='yuv420p',
+            )
         else:
             raise ValueError(f'Unsupported format: {format}')
 
