@@ -377,6 +377,14 @@ class MuZeroCollector(ISerialCollector):
         end_index_val = beg_index_val + self.unroll_plus_td_steps
         pad_root_values_lst = game_segments[i].root_value_segment[beg_index_val:end_index_val]
 
+        # Board-game / sampled-action metadata for padding across segment boundaries.
+        pad_to_play_lst = game_segments[i].to_play_segment[beg_index_val:end_index_val]
+        pad_action_mask_lst = game_segments[i].action_mask_segment[beg_index_val:end_index_val]
+        pad_root_sampled_actions_lst = (
+            game_segments[i].root_sampled_actions[beg_index_val:end_index_val]
+            if self.policy_config.sampled_algo else None
+        )
+
         if self.policy_config.use_ture_chance_label_in_chance_encoder:
             chance_lst = game_segments[i].chance_segment[beg_index_rew:end_index_rew]
         
@@ -387,20 +395,28 @@ class MuZeroCollector(ISerialCollector):
         last_game_segments[i].valid_transition_count = min(
             len(last_game_segments[i].action_segment), self.policy_config.game_segment_length
         )
+        pad_extra_kwargs = dict(
+            next_segment_to_play=pad_to_play_lst,
+            next_segment_action_masks=pad_action_mask_lst,
+            next_segment_root_sampled_actions=pad_root_sampled_actions_lst,
+        )
         if self.policy_config.gumbel_algo:
             last_game_segments[i].pad_over(
                 pad_obs_lst, pad_reward_lst, pad_action_lst, pad_root_values_lst,
-                pad_child_visits_lst, next_segment_improved_policy=pad_improved_policy_prob
+                pad_child_visits_lst, next_segment_improved_policy=pad_improved_policy_prob,
+                **pad_extra_kwargs
             )
         else:
             if self.policy_config.use_ture_chance_label_in_chance_encoder:
                 last_game_segments[i].pad_over(
                     pad_obs_lst, pad_reward_lst, pad_action_lst, pad_root_values_lst,
-                    pad_child_visits_lst, next_chances=chance_lst
+                    pad_child_visits_lst, next_chances=chance_lst,
+                    **pad_extra_kwargs
                 )
             else:
                 last_game_segments[i].pad_over(
-                    pad_obs_lst, pad_reward_lst, pad_action_lst, pad_root_values_lst, pad_child_visits_lst
+                    pad_obs_lst, pad_reward_lst, pad_action_lst, pad_root_values_lst, pad_child_visits_lst,
+                    **pad_extra_kwargs
                 )
         
         # Convert the segment's lists to NumPy arrays for efficient storage.

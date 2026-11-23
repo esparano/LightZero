@@ -250,6 +250,8 @@ class GameSegment:
     def pad_over(
             self, next_segment_observations: List, next_segment_rewards: List, next_segment_actions: List, next_segment_root_values: List,
             next_segment_child_visits: List, next_segment_improved_policy: List = None, next_chances: List = None,
+            next_segment_to_play: List = None, next_segment_action_masks: List = None,
+            next_segment_root_sampled_actions: List = None,
     ) -> None:
         """
         Overview:
@@ -297,6 +299,18 @@ class GameSegment:
         if self.use_ture_chance_label_in_chance_encoder:
             for chances in next_chances:
                 self.chance_segment.append(chances)
+        if next_segment_to_play is not None:
+            assert len(next_segment_to_play) <= self.num_unroll_steps + self.td_steps
+            for to_play in next_segment_to_play:
+                self.to_play_segment.append(to_play)
+        if next_segment_action_masks is not None:
+            assert len(next_segment_action_masks) <= self.num_unroll_steps + self.td_steps
+            for action_mask in next_segment_action_masks:
+                self.action_mask_segment.append(copy.deepcopy(action_mask))
+        if self.sampled_algo and next_segment_root_sampled_actions is not None:
+            assert len(next_segment_root_sampled_actions) <= self.num_unroll_steps + self.td_steps
+            for sampled_actions in next_segment_root_sampled_actions:
+                self.root_sampled_actions.append(copy.deepcopy(sampled_actions))
 
     def get_targets(self, timestep: int) -> Tuple:
         """
