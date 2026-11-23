@@ -8,6 +8,8 @@
   - TensorBoard: `/home/evan/miniconda3/envs/lightzero/bin/tensorboard`
 - **Running TensorBoard on WSL:**
   Always pass `--load_fast=false --host 0.0.0.0` (the default Rust data server can hang in WSL), and verify the port is listening (`ss -tlnp | grep 6006` or the `TensorBoard ... at http://` log line) **before** giving the user the URL.
+  Always link the pre-filtered Time Series URL so key metrics open directly without manual pinning:
+  `http://localhost:6006/#timeseries&tagFilter=_step/(eval_episode_return_mean|eval/episode_length|value_loss_avg|policy_loss_avg|consistency_loss_avg|policy_entropy_avg|action0_taken_rate_avg|policy_action0_prob_avg)$`
 - **Rebuilding C++ / Cython MCTS (`ctree`) extensions:**
   Whenever you edit any `.cpp`, `.h`, or `.pyx` file under `lzero/mcts/ctree/`, you **must** recompile before running tests or training:
   ```bash
