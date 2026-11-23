@@ -473,9 +473,11 @@ class GalconEnv(BaseEnv):
             # Player 2 has finished, so player 1 will play next
             timestep_player2.obs['to_play'] = self.PLAYER_1
 
-            # # invert rewards
-            # timestep_player2.info['eval_episode_return'] = -timestep_player2.reward
-            # timestep_player2 = timestep_player2._replace(reward=-timestep_player2.reward)
+            # Invert reward from Player 2's (bot's) perspective to Player 1's (agent's) perspective.
+            neg_reward = -timestep_player2.reward
+            if timestep_player2.done:
+                timestep_player2.info['eval_episode_return'] = neg_reward
+            timestep_player2 = timestep_player2._replace(reward=neg_reward)
 
             return timestep_player2
 

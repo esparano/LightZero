@@ -512,3 +512,45 @@ class TestGalconEnv:
         env._legal_actions = None  # Invalidate cached legal actions
         assert p1_to_p2_action not in env.legal_actions
         assert env.observe()['action_mask'][p1_to_p2_action] == 0
+
+    @pytest.mark.parametrize('battle_mode', ['eval_mode', 'play_with_bot_mode'])
+    @pytest.mark.parametrize('max_steps,p1_ships,p2_ships,expected_winner,expected_reward', [
+        (4, 1000.0, 1.0, 1, 1.0),   # Agent wins on EVEN step (bot's turn)
+        (4, 1.0, 1000.0, 2, -1.0),  # Bot wins on EVEN step (bot's turn)
+        (3, 1000.0, 1.0, 1, 1.0),   # Agent wins on ODD step (agent's turn)
+        (3, 1.0, 1000.0, 2, -1.0),  # Bot wins on ODD step (agent's turn)
+    ])
+    def test_eval_and_bot_mode_reward_perspective_odd_and_even_steps(
+        self, battle_mode, max_steps, p1_ships, p2_ships, expected_winner, expected_reward
+    ):
+        """In eval_mode and play_with_bot_mode, reward and eval_episode_return must always
+        be from Player 1's (agent's) perspective, even when the game terminates on Player 2's
+        (even) step such as max_episode_steps=100.
+        """
+        cfg = GalconEnv.default_config()
+        cfg.update(dict(
+            battle_mode=battle_mode,
+            bot_action_type='pass',
+            max_episode_steps=max_steps,
+            num_planets=2,
+            map_seed=2,
+            grid_square_size=25.0,
+            grid_max_x=50.0,
+            grid_max_y=50.0,
+        ))
+        env = GalconEnv(cfg)
+        env.reset()
+        for p in env.planets:
+            if p.owner == env.PLAYER_1:
+                p.ships = p1_ships
+            elif p.owner == env.PLAYER_2:
+                p.ships = p2_ships
+
+        while True:
+            ts = env.step(env.pass_action)
+            if ts.done:
+                assert ts.info['step_count'] == max_steps
+                assert ts.info['winner'] == expected_winner
+                assert float(ts.reward) == pytest.approx(expected_reward)
+                assert float(ts.info['eval_episode_return']) == pytest.approx(expected_reward)
+                break
