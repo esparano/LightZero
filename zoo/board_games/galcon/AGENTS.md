@@ -31,3 +31,4 @@ Scoped rules for work inside `zoo/board_games/galcon/`.
 
 - **Passing (`action 0`) is generally VERY BAD in Galcon:** A strong Galcon bot should have a **low pass rate**, actively expanding and contesting planets.
 - **Exception on tiny maps (`grid_max = 50`):** Only when planets are packed unnaturally close together (e.g. enemy home is ~1 tick away) can passing temporarily look viable because spending ships on a neutral leaves the home planet vulnerable to an immediate rush. Do **not** mistake an 80–95% pass rate for good Galcon play—treat high `action0_taken_rate_avg` as a red flag for either overly cramped map geometry or MCTS/policy collapse onto Pass.
+- **Collect MCTS temperature:** Always use `manual_temperature_decay = False` and `fixed_temperature_value = 1.0` during Galcon self-play (default `0.25` causes early entropy collapse and dynamics-model starvation).
