@@ -36,13 +36,14 @@ neutral_max_production = 100
 fleet_top_k = 1
 grid_width = int(math.ceil((2 * grid_max_x) / grid_square_size))
 grid_height = int(math.ceil((2 * grid_max_y) / grid_square_size))
-augment_data_with_symmetry=False
+augment_data_with_symmetry=True
 
 # TODO: Optimize all of this.
 collector_env_num = 8
 n_episode = 8
 # The number of parallel environments to evaluate for
-evaluator_env_num = 1
+evaluator_env_num = 5
+n_evaluator_episode = 5
 num_simulations = 25
 K = 8
 # Increase by 4x if reflecting on x and y
@@ -65,7 +66,7 @@ mcts_ctree = True
 # ==============================================================
 
 galcon_sez_config = dict(
-    exp_name=f'data_sez/galcon_sez_sp_8p_fixed_noaugment_map{map_seed}_rewardrange',
+    exp_name=f'data_sez/galcon_sez_sp_{num_planets}p_fixed_augment_map{map_seed}_rewardrange',
     # exp_name='data_sez/galcon_sez_self-play_seed0',
     env=dict(
         # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
@@ -95,7 +96,7 @@ galcon_sez_config = dict(
         scale=True,
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
-        n_evaluator_episode=evaluator_env_num,
+        n_evaluator_episode=n_evaluator_episode,
         manager=dict(shared_memory=False),
         agent_vs_human=False,
         prob_random_agent=0,
