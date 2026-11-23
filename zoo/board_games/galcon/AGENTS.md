@@ -26,3 +26,8 @@ Scoped rules for work inside `zoo/board_games/galcon/`.
 - Geometric X, Y, and XY reflections for Galcon live in `reflect_game_segment()` (`lzero/mcts/buffer/game_buffer.py`), enabled via `symmetric_augment_x`, `symmetric_augment_y`, and `symmetric_augment_type = 'Galcon'`.
 - Reflections must flip spatial grids, invert relative cell coordinates (`1.0 - x` / `1.0 - y`) on occupied planet/fleet cells, and remap `action_segment`, `action_mask_segment`, and `root_sampled_actions` consistently.
 - Always run `test_galcon_env.py` and `test_galcon_buffer_symmetry.py` after any observation-channel or action-encoding change.
+
+## 4. Galcon Strategy & Training Diagnostics
+
+- **Passing (`action 0`) is generally VERY BAD in Galcon:** A strong Galcon bot should have a **low pass rate**, actively expanding and contesting planets.
+- **Exception on tiny maps (`grid_max = 50`):** Only when planets are packed unnaturally close together (e.g. enemy home is ~1 tick away) can passing temporarily look viable because spending ships on a neutral leaves the home planet vulnerable to an immediate rush. Do **not** mistake an 80–95% pass rate for good Galcon play—treat high `action0_taken_rate_avg` as a red flag for either overly cramped map geometry or MCTS/policy collapse onto Pass.
