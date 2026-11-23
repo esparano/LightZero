@@ -5,6 +5,9 @@
 - **Always use the `lightzero` conda environment** (system `python3` lacks `numpy`, `torch`, etc.):
   - Python: `/home/evan/miniconda3/envs/lightzero/bin/python3`
   - Pytest: `/home/evan/miniconda3/envs/lightzero/bin/pytest`
+  - TensorBoard: `/home/evan/miniconda3/envs/lightzero/bin/tensorboard`
+- **Running TensorBoard on WSL:**
+  Always pass `--load_fast=false --host 0.0.0.0` (the default Rust data server can hang in WSL), and verify the port is listening (`ss -tlnp | grep 6006` or the `TensorBoard ... at http://` log line) **before** giving the user the URL.
 - **Rebuilding C++ / Cython MCTS (`ctree`) extensions:**
   Whenever you edit any `.cpp`, `.h`, or `.pyx` file under `lzero/mcts/ctree/`, you **must** recompile before running tests or training:
   ```bash
