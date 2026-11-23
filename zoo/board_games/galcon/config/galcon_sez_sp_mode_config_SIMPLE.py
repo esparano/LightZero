@@ -46,7 +46,7 @@ evaluator_env_num = 5
 num_simulations = 25
 K = 8
 # Increase by 4x if reflecting on x and y
-update_per_collect = 50 * (4 if augment_data_with_symmetry else 1)
+update_per_collect = 25 * (4 if augment_data_with_symmetry else 1)
 reanalyze_ratio = 0.
 # This is recommended for RTX 5080 for network of this size... May need to reduce this if increasing action space size.
 batch_size = 256
