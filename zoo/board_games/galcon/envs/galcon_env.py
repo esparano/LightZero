@@ -3,7 +3,7 @@ import math
 import os
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import logging
 
 import imageio
@@ -1415,3 +1415,120 @@ class GalconEnv(BaseEnv):
         cfg = copy.deepcopy(cfg)
         cfg.battle_mode = 'eval_mode'
         return [cfg for _ in range(evaluator_env_num)]
+
+    @classmethod
+    def reflect_game_segment(cls, game_segment: Any, reflect_x: bool, reflect_y: bool) -> Any:
+        """
+        Overview:
+            Return a deep-copied GameSegment reflected across the x-axis (left-right),
+            y-axis (top-bottom), or both. Updates spatial grids, relative cell/world
+            coordinate channels for planets and fleets, actions, action masks, and
+            Sampled EfficientZero root_sampled_actions.
+        """
+        reflected = copy.deepcopy(game_segment)
+
+        obs_segment = np.asarray(reflected.obs_segment)
+        # obs_segment shape: (T, C, H, W)
+        T, C, H, W = obs_segment.shape
+
+        planet_channels = cls.PLANET_CHANNEL_COUNT
+        landing_channels = len(cls.LANDING_BUCKETS) * cls.LANDING_FEATURE_COUNT_PER_BUCKET
+        fleet_features = cls.FLEET_FEATURE_COUNT
+        fleet_channels = C - planet_channels - landing_channels
+        if fleet_channels < 0 or fleet_channels % (2 * fleet_features) != 0:
+            raise ValueError(
+                f"Unexpected Galcon observation channel count C={C} "
+                f"(planet={planet_channels}, landing={landing_channels}, "
+                f"fleet_features={fleet_features})"
+            )
+        slot_count_per_side = fleet_channels // (2 * fleet_features)
+
+        # A. Flip spatial grids (copy to ensure contiguous positive-stride array)
+        if reflect_x:
+            obs_segment = np.flip(obs_segment, axis=3)
+        if reflect_y:
+            obs_segment = np.flip(obs_segment, axis=2)
+        obs_segment = np.ascontiguousarray(obs_segment)
+
+        # B. Invert x/y coordinate channels on occupied cells
+        # Planet channels: local x/y offsets within cell if any planet info exists in channels 2..7
+        planet_mask = np.sum(obs_segment[:, 2:planet_channels], axis=1) > 0  # (T, H, W)
+        if reflect_x:
+            obs_segment[:, cls.PLANET_LOCAL_X_CHANNEL] = np.where(
+                planet_mask, 1.0 - obs_segment[:, cls.PLANET_LOCAL_X_CHANNEL], 0.0
+            )
+        if reflect_y:
+            obs_segment[:, cls.PLANET_LOCAL_Y_CHANNEL] = np.where(
+                planet_mask, 1.0 - obs_segment[:, cls.PLANET_LOCAL_Y_CHANNEL], 0.0
+            )
+
+        # Fleet channels (both friendly and enemy slots): target world x/y normalized in [0, 1]
+        for slot in range(2 * slot_count_per_side):
+            base_ch = planet_channels + slot * fleet_features
+            # Channel offset +3 is ships (> 0 iff a fleet is present in this slot)
+            fleet_mask = obs_segment[:, base_ch + 3] > 0
+            if reflect_x:
+                obs_segment[:, base_ch + 0] = np.where(fleet_mask, 1.0 - obs_segment[:, base_ch + 0], 0.0)
+            if reflect_y:
+                obs_segment[:, base_ch + 1] = np.where(fleet_mask, 1.0 - obs_segment[:, base_ch + 1], 0.0)
+
+        reflected.obs_segment = obs_segment
+
+        # C. Reflect actions, action masks, and root_sampled_actions
+        # Supports both planet-only (N + 1) and planet+redirect (2N + 1) action spaces
+        grid_cell_count = W * H
+        pair_action_count = grid_cell_count * grid_cell_count
+        mask_len = None
+        if (
+            hasattr(reflected, 'action_mask_segment')
+            and reflected.action_mask_segment is not None
+            and len(reflected.action_mask_segment) > 0
+        ):
+            mask_len = len(reflected.action_mask_segment[0])
+        elif getattr(reflected, 'action_space_size', None) is not None:
+            mask_len = int(reflected.action_space_size)
+        has_redirect_layer = (mask_len == 2 * pair_action_count + 1)
+        num_actions = (2 * pair_action_count + 1) if has_redirect_layer else (pair_action_count + 1)
+
+        shifted = np.arange(pair_action_count, dtype=np.int64)
+        source_cell = shifted // grid_cell_count
+        target_cell = shifted % grid_cell_count
+
+        source_y = source_cell // W
+        source_x = source_cell % W
+        target_y = target_cell // W
+        target_x = target_cell % W
+
+        if reflect_x:
+            source_x = W - 1 - source_x
+            target_x = W - 1 - target_x
+        if reflect_y:
+            source_y = H - 1 - source_y
+            target_y = H - 1 - target_y
+
+        new_source_cell = source_y * W + source_x
+        new_target_cell = target_y * W + target_x
+        perm = np.zeros(num_actions, dtype=np.int64)
+        base_perm = new_source_cell * grid_cell_count + new_target_cell + 1
+        perm[1:pair_action_count + 1] = base_perm
+        if has_redirect_layer:
+            perm[pair_action_count + 1:] = base_perm + pair_action_count
+
+        if hasattr(reflected, 'action_segment') and reflected.action_segment is not None:
+            reflected.action_segment = perm[np.asarray(reflected.action_segment, dtype=np.int64)]
+
+        if hasattr(reflected, 'action_mask_segment') and reflected.action_mask_segment is not None:
+            if isinstance(reflected.action_mask_segment, np.ndarray):
+                reflected.action_mask_segment = reflected.action_mask_segment[:, perm]
+            else:
+                reflected.action_mask_segment = [mask[perm] for mask in reflected.action_mask_segment]
+
+        if hasattr(reflected, 'root_sampled_actions') and reflected.root_sampled_actions is not None:
+            if isinstance(reflected.root_sampled_actions, np.ndarray):
+                reflected.root_sampled_actions = perm[reflected.root_sampled_actions.astype(np.int64)]
+            else:
+                reflected.root_sampled_actions = [
+                    perm[np.asarray(actions, dtype=np.int64)] for actions in reflected.root_sampled_actions
+                ]
+
+        return reflected

@@ -6,8 +6,8 @@ Scoped rules for work inside `zoo/board_games/galcon/`.
 
 - **Primary env:** `zoo/board_games/galcon/envs/galcon_env.py` (`GalconEnv`, registered as `'galcon'`).
 - **Active training config:** `zoo/board_games/galcon/config/galcon_sez_sp_mode_config_SIMPLE_1map.py`.
-- **Observation shape:** `(C, H, W)` where `C = 8 (planets) + 2 * (fleet_top_k + 1) * 5 (friendly/enemy fleets) + 16 (landings)`.
-  - Currently `C = 40` for `fleet_top_k = 1` (`(40, 8, 8)` on `SIMPLE_1map`) only because fleet redirecting is temporarily disabled; expect `C` (and `reflect_game_segment` channel math) to change once fleet redirecting is re-enabled.
+- **Observation shape:** `(C, H, W)` where `C = 8 (planets) + 2 * (fleet_top_k + 1) * 5 (friendly/enemy fleets) + len(LANDING_BUCKETS) * 4 (landings)`.
+  - Currently `C = 40` for `fleet_top_k = 1` with 3 landing buckets (`(40, 8, 8)` on `SIMPLE_1map`).
   - `frame_stack_num = 1` (the observation is already Markov).
 - **Action encoding:**
   - `0` = Pass (always legal).
@@ -23,7 +23,7 @@ Scoped rules for work inside `zoo/board_games/galcon/`.
 
 ## 3. Symmetry Augmentation
 
-- Geometric X, Y, and XY reflections for Galcon live in `reflect_game_segment()` (`lzero/mcts/buffer/game_buffer.py`), enabled via `symmetric_augment_x`, `symmetric_augment_y`, and `symmetric_augment_type = 'Galcon'`.
+- Geometric X, Y, and XY reflections for Galcon live in `GalconEnv.reflect_game_segment()` (`zoo/board_games/galcon/envs/galcon_env.py`), invoked by `GameBuffer.push_game_segments()` via `buffer.reflect_fn` (wired from `env_fn` in `train_muzero.py`) or `ENV_REGISTRY` lookup via `symmetric_augment_type`, when `symmetric_augment_x` / `symmetric_augment_y` are enabled.
 - Reflections must flip spatial grids, invert relative cell coordinates (`1.0 - x` / `1.0 - y`) on occupied planet/fleet cells, and remap `action_segment`, `action_mask_segment`, and `root_sampled_actions` consistently.
 - Always run `test_galcon_env.py` and `test_galcon_buffer_symmetry.py` after any observation-channel or action-encoding change.
 

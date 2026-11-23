@@ -108,6 +108,8 @@ def train_muzero(
     batch_size = policy_config.batch_size
     # specific game buffer for MCTS+RL algorithms
     replay_buffer = GameBuffer(policy_config)
+    if hasattr(env_fn, 'reflect_game_segment'):
+        replay_buffer.reflect_fn = env_fn.reflect_game_segment
     collector = Collector(
         env=collector_env,
         policy=policy.collect_mode,

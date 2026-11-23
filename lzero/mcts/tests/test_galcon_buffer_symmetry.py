@@ -4,6 +4,7 @@ from easydict import EasyDict
 
 from lzero.mcts.buffer.game_buffer_sampled_efficientzero import SampledEfficientZeroGameBuffer
 from lzero.mcts.buffer.game_segment import GameSegment
+from zoo.board_games.galcon.envs.galcon_env import GalconEnv
 
 
 def _create_mock_galcon_segment(grid_h=4, grid_w=4, channels=60, num_steps=5):
@@ -92,3 +93,15 @@ class TestGalconBufferSymmetry:
         buffer.push_game_segments(([segment], [meta]))
 
         assert len(buffer.game_segment_buffer) == expected_count
+
+    def test_game_buffer_push_with_explicit_reflect_fn(self):
+        buffer = _make_buffer(sym_x=True, sym_y=True)
+        buffer._cfg.pop('symmetric_augment_type', None)
+        buffer.reflect_fn = GalconEnv.reflect_game_segment
+
+        segment, _ = _create_mock_galcon_segment()
+        meta = {'done': True, 'unroll_plus_td_steps': 4, 'priorities': np.ones(5)}
+
+        buffer.push_game_segments(([segment], [meta]))
+
+        assert len(buffer.game_segment_buffer) == 4

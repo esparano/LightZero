@@ -8,7 +8,6 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 from zoo.board_games.galcon.envs.galcon_env import GalconEnv, Fleet, Planet
-from lzero.mcts.buffer.game_buffer import reflect_game_segment
 
 # Run all tests: 
 # pytest zoo/board_games/galcon/envs/
@@ -169,7 +168,15 @@ class TestGalconEnv:
                     min_dist = p_i.radius + p_j.radius + min_gap
                     assert dist >= min_dist - 1e-5, f"Planets {i} and {j} overlap or are too close! dist={dist}, min_dist={min_dist}"
 
-    def _create_dummy_symmetry_segment(self):
+    def _create_dummy_symmetry_segment(self, enable_fleet_redirection: bool = False):
+        # fleet_top_k=1 -> C = 8 (planets) + 2*(1+1)*5 (fleets) + len(LANDING_BUCKETS)*4 (landings) = 40
+        C = (
+            GalconEnv.PLANET_CHANNEL_COUNT
+            + 2 * (1 + 1) * GalconEnv.FLEET_FEATURE_COUNT
+            + len(GalconEnv.LANDING_BUCKETS) * GalconEnv.LANDING_FEATURE_COUNT_PER_BUCKET
+        )
+        pair_action_count = 4 * 4 * 4 * 4
+        action_space_size = (2 * pair_action_count + 1) if enable_fleet_redirection else (pair_action_count + 1)
         game_segment_config = EasyDict(dict(
             num_unroll_steps=5,
             td_steps=5,
@@ -181,30 +188,35 @@ class TestGalconEnv:
             use_ture_chance_label_in_chance_encoder=False,
             model=dict(
                 frame_stack_num=1,
-                observation_shape=(76, 4, 4),
-                image_channel=76,
-                action_space_size=4 * 4 * 4 * 4 + 1,
+                observation_shape=(C, 4, 4),
+                image_channel=C,
+                action_space_size=action_space_size,
             ),
         ))
         segment = GameSegment(action_space=None, game_segment_length=20, config=game_segment_config)
-        obs = np.zeros((76, 4, 4), dtype=np.float32)
+        obs = np.zeros((C, 4, 4), dtype=np.float32)
         # Planet in cell (x=1, y=2)
         obs[0, 2, 1] = 0.2  # local_x
         obs[1, 2, 1] = 0.3  # local_y
         obs[2, 2, 1] = 0.5  # friendly ships
         obs[5, 2, 1] = 0.5  # friendly production
 
-        # Fleet in cell (x=0, y=1), pointing to target at world (x, y) normalized to (0.1, 0.9)
+        # Friendly fleet in cell (x=0, y=1), slot 0 (base_ch=8), target normalized to (0.1, 0.9)
         obs[8, 1, 0] = 0.1  # target x
         obs[9, 1, 0] = 0.9  # target y
         obs[11, 1, 0] = 10  # fleet ships
+
+        # Enemy fleet in cell (x=2, y=0), slot 0 (base_ch=8 + 2*5 = 18), target normalized to (0.25, 0.75)
+        obs[18, 0, 2] = 0.25  # target x
+        obs[19, 0, 2] = 0.75  # target y
+        obs[21, 0, 2] = 5     # fleet ships
         segment.obs_segment = [obs]
 
         # Action: source (0, 1) -> cell 1*4+0 = 4; target (1, 2) -> cell 2*4+1 = 9
-        # action = 4 * 16 + 9 + 1 = 74
-        action = 74
+        # send action = 4 * 16 + 9 + 1 = 74; redirect action = 74 + 256 = 330
+        action = 74 + (pair_action_count if enable_fleet_redirection else 0)
         segment.action_segment = [action]
-        action_mask = np.zeros(4 * 4 * 4 * 4 + 1)
+        action_mask = np.zeros(action_space_size)
         action_mask[0] = 1
         action_mask[action] = 1
         segment.action_mask_segment = [action_mask]
@@ -213,10 +225,9 @@ class TestGalconEnv:
 
     def test_reflect_game_segment_x_flip(self) -> None:
         segment = self._create_dummy_symmetry_segment()
-        policy_config = EasyDict(dict(symmetric_augment_type='Galcon'))
-        reflected = reflect_game_segment(policy_config, segment, reflect_x=True, reflect_y=False)
+        reflected = GalconEnv.reflect_game_segment(segment, reflect_x=True, reflect_y=False)
 
-        assert reflected.obs_segment.shape == (1, 76, 4, 4)
+        assert reflected.obs_segment.shape == (1, 40, 4, 4)
         ref_obs = reflected.obs_segment[0]
         # Planet (x=1, y=2) -> X-flip: x' = 4-1-1 = 2, y' = 2
         assert ref_obs[2, 2, 2] == 0.5
@@ -224,10 +235,15 @@ class TestGalconEnv:
         assert np.isclose(ref_obs[0, 2, 2], 1.0 - 0.2)  # local_x inverted
         assert np.isclose(ref_obs[1, 2, 2], 0.3)        # local_y unchanged
 
-        # Fleet (x=0, y=1) -> X-flip: x' = 4-1-0 = 3, y' = 1
+        # Friendly fleet (x=0, y=1) -> X-flip: x' = 4-1-0 = 3, y' = 1
         assert ref_obs[11, 1, 3] == 10
         assert np.isclose(ref_obs[8, 1, 3], 1.0 - 0.1)  # target_x inverted
         assert np.isclose(ref_obs[9, 1, 3], 0.9)        # target_y unchanged
+
+        # Enemy fleet (x=2, y=0) -> X-flip: x' = 4-1-2 = 1, y' = 0
+        assert ref_obs[21, 0, 1] == 5
+        assert np.isclose(ref_obs[18, 0, 1], 1.0 - 0.25)  # target_x inverted
+        assert np.isclose(ref_obs[19, 0, 1], 0.75)        # target_y unchanged
 
         # Action: source (3, 1) -> cell 1*4+3 = 7; target (2, 2) -> cell 2*4+2 = 10
         # action = 7 * 16 + 10 + 1 = 123
@@ -239,10 +255,9 @@ class TestGalconEnv:
 
     def test_reflect_game_segment_y_flip(self) -> None:
         segment = self._create_dummy_symmetry_segment()
-        policy_config = EasyDict(dict(symmetric_augment_type='Galcon'))
-        reflected = reflect_game_segment(policy_config, segment, reflect_x=False, reflect_y=True)
+        reflected = GalconEnv.reflect_game_segment(segment, reflect_x=False, reflect_y=True)
 
-        assert reflected.obs_segment.shape == (1, 76, 4, 4)
+        assert reflected.obs_segment.shape == (1, 40, 4, 4)
         ref_obs = reflected.obs_segment[0]
         # Planet (x=1, y=2) -> Y-flip: x' = 1, y' = 4-1-2 = 1
         assert ref_obs[2, 1, 1] == 0.5
@@ -250,10 +265,15 @@ class TestGalconEnv:
         assert np.isclose(ref_obs[0, 1, 1], 0.2)        # local_x unchanged
         assert np.isclose(ref_obs[1, 1, 1], 1.0 - 0.3)  # local_y inverted
 
-        # Fleet (x=0, y=1) -> Y-flip: x' = 0, y' = 4-1-1 = 2
+        # Friendly fleet (x=0, y=1) -> Y-flip: x' = 0, y' = 4-1-1 = 2
         assert ref_obs[11, 2, 0] == 10
         assert np.isclose(ref_obs[8, 2, 0], 0.1)        # target_x unchanged
         assert np.isclose(ref_obs[9, 2, 0], 1.0 - 0.9)  # target_y inverted
+
+        # Enemy fleet (x=2, y=0) -> Y-flip: x' = 2, y' = 4-1-0 = 3
+        assert ref_obs[21, 3, 2] == 5
+        assert np.isclose(ref_obs[18, 3, 2], 0.25)        # target_x unchanged
+        assert np.isclose(ref_obs[19, 3, 2], 1.0 - 0.75)  # target_y inverted
 
         # Action: source (0, 2) -> cell 2*4+0 = 8; target (1, 1) -> cell 1*4+1 = 5
         # action = 8 * 16 + 5 + 1 = 134
@@ -265,10 +285,9 @@ class TestGalconEnv:
 
     def test_reflect_game_segment_xy_flip(self) -> None:
         segment = self._create_dummy_symmetry_segment()
-        policy_config = EasyDict(dict(symmetric_augment_type='Galcon'))
-        reflected = reflect_game_segment(policy_config, segment, reflect_x=True, reflect_y=True)
+        reflected = GalconEnv.reflect_game_segment(segment, reflect_x=True, reflect_y=True)
 
-        assert reflected.obs_segment.shape == (1, 76, 4, 4)
+        assert reflected.obs_segment.shape == (1, 40, 4, 4)
         ref_obs = reflected.obs_segment[0]
         # Planet (x=1, y=2) -> XY-flip: x' = 2, y' = 1
         assert ref_obs[2, 1, 2] == 0.5
@@ -276,10 +295,15 @@ class TestGalconEnv:
         assert np.isclose(ref_obs[0, 1, 2], 1.0 - 0.2)  # local_x inverted
         assert np.isclose(ref_obs[1, 1, 2], 1.0 - 0.3)  # local_y inverted
 
-        # Fleet (x=0, y=1) -> XY-flip: x' = 3, y' = 2
+        # Friendly fleet (x=0, y=1) -> XY-flip: x' = 3, y' = 2
         assert ref_obs[11, 2, 3] == 10
         assert np.isclose(ref_obs[8, 2, 3], 1.0 - 0.1)  # target_x inverted
         assert np.isclose(ref_obs[9, 2, 3], 1.0 - 0.9)  # target_y inverted
+
+        # Enemy fleet (x=2, y=0) -> XY-flip: x' = 1, y' = 3
+        assert ref_obs[21, 3, 1] == 5
+        assert np.isclose(ref_obs[18, 3, 1], 1.0 - 0.25)  # target_x inverted
+        assert np.isclose(ref_obs[19, 3, 1], 1.0 - 0.75)  # target_y inverted
 
         # Action: source (3, 2) -> cell 2*4+3 = 11; target (2, 1) -> cell 1*4+2 = 6
         # action = 11 * 16 + 6 + 1 = 183
@@ -288,6 +312,17 @@ class TestGalconEnv:
         assert reflected.action_mask_segment[0][0] == 1
         assert reflected.root_sampled_actions[0][0] == 0
         assert reflected.root_sampled_actions[0][1] == 183
+
+    def test_reflect_game_segment_redirect_action_layer(self) -> None:
+        segment = self._create_dummy_symmetry_segment(enable_fleet_redirection=True)
+        reflected = GalconEnv.reflect_game_segment(segment, reflect_x=True, reflect_y=True)
+
+        # Base XY-reflected send action is 183 -> redirect layer adds pair_action_count (256)
+        expected_redirect_action = 183 + 256
+        assert reflected.action_segment[0] == expected_redirect_action
+        assert reflected.action_mask_segment[0][expected_redirect_action] == 1
+        assert reflected.action_mask_segment[0][0] == 1
+        assert reflected.root_sampled_actions[0][1] == expected_redirect_action
 
     def test_friendly_fleet_landing(self) -> None:
         env = GalconEnv(self.cfg)
