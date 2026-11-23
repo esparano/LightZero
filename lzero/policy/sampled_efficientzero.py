@@ -746,9 +746,10 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
 
         log_prob_sampled_actions = []
         for k in range(self._cfg.model.num_of_sampled_actions):
-            # 1. Identify which actions are dummy padding (-1)
-            # target_sampled_actions[:, k] shape is (batch_size, )
-            action_indices = target_sampled_actions[:, k].long()
+            # 1. Identify which actions are dummy padding (-1).
+            # ptree produces (batch_size, K) while ctree produces (batch_size, K, 1);
+            # reshape(-1) normalizes both to (batch_size,).
+            action_indices = target_sampled_actions[:, k].reshape(-1).long()
             is_valid = (action_indices >= 0).float()
             
             # 2. Redirect dummy actions to index 0 to avoid CUDA index-out-of-bounds

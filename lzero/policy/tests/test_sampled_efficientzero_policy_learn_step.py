@@ -163,3 +163,41 @@ class TestSampledEfficientZeroPolicyLearn:
             val = float(log_vars[key])
             assert not np.isnan(val), f"{key} is NaN!"
             assert not np.isinf(val), f"{key} is Inf!"
+
+    def test_calculate_policy_loss_disc_handles_2d_and_3d_ctree_sampled_actions(self):
+        """ptree produces (B, U, K) sampled actions while ctree produces (B, U, K, 1).
+        Verify _calculate_policy_loss_disc handles both identically, including -1 dummy padding.
+        """
+        cfg = _make_test_policy_and_buffer_cfg(grid_h=2, grid_w=2, channels=4, num_sampled_actions=4)
+        policy = SampledEfficientZeroPolicy(cfg)
+        policy._init_learn()
+
+        B, U, K = 2, 2, 4
+        A = cfg.model.action_space_size
+        torch.manual_seed(0)
+        policy_logits = torch.randn(B, A)
+        target_policy = torch.tensor(
+            [[[0.5, 0.3, 0.2, 0.0], [0.4, 0.4, 0.2, 0.0]],
+             [[0.7, 0.2, 0.1, 0.0], [0.6, 0.3, 0.1, 0.0]]],
+            dtype=torch.float32,
+        )
+        mask_batch = torch.ones(B, U, dtype=torch.float32)
+
+        # Include -1 dummy padding in the last slot to also exercise dummy-action masking
+        actions_2d = torch.tensor(
+            [[[0, 1, 2, -1], [3, 4, 5, -1]],
+             [[1, 2, 3, -1], [0, 2, 4, -1]]],
+            dtype=torch.long,
+        )
+        actions_3d = actions_2d.unsqueeze(-1)  # (B, U, K, 1), as produced by ctree
+
+        loss_2d, *_ = policy._calculate_policy_loss_disc(
+            torch.zeros(B), policy_logits, target_policy, mask_batch, actions_2d, unroll_step=0
+        )
+        loss_3d, *_ = policy._calculate_policy_loss_disc(
+            torch.zeros(B), policy_logits, target_policy, mask_batch, actions_3d, unroll_step=0
+        )
+
+        assert loss_3d.shape == (B,)
+        assert torch.isfinite(loss_3d).all()
+        assert torch.allclose(loss_2d, loss_3d, atol=1e-6)
