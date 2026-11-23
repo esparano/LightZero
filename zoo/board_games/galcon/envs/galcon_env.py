@@ -116,6 +116,7 @@ class GalconEnv(BaseEnv):
         tick_seconds=0.25,
         fleet_speed=40.0,
         max_episode_steps=200,
+        timeout_reward_scale=1.0,
         map_seed=None,
         # Max grid size could be as large as (12 + 12 + 6 + 6 + 0.5) / sqrt(2) = 25.8
         grid_square_size=25.0,
@@ -181,6 +182,7 @@ class GalconEnv(BaseEnv):
         self.tick_seconds = float(self.cfg.tick_seconds)
         self.fleet_speed = float(self.cfg.fleet_speed)
         self.max_episode_steps = int(self.cfg.max_episode_steps)
+        self.timeout_reward_scale = float(self.cfg.get('timeout_reward_scale', 1.0))
         self.map_seed = self.cfg.get('map_seed', None)
 
         self.grid_square_size = float(self.cfg.grid_square_size)
@@ -481,7 +483,7 @@ class GalconEnv(BaseEnv):
             # Invert reward from Player 2's (bot's) perspective to Player 1's (agent's) perspective.
             neg_reward = -timestep_player2.reward
             if timestep_player2.done:
-                timestep_player2.info['eval_episode_return'] = neg_reward
+                timestep_player2.info['eval_episode_return'] = -timestep_player2.info['eval_episode_return']
             timestep_player2 = timestep_player2._replace(reward=neg_reward)
 
             return timestep_player2
@@ -497,17 +499,24 @@ class GalconEnv(BaseEnv):
         self._advance_one_tick()
         self._step_count += 1
 
+        winner_by_elimination = self._winner_by_elimination()
         done, winner = self.get_done_winner()
 
         if done:
+            ended_by_timeout = (winner_by_elimination == -1 and self._step_count >= self.max_episode_steps)
+            reward_mag = self.timeout_reward_scale if ended_by_timeout else 1.0
             if winner == -1:
-                reward = np.array(0).astype(np.float32)
+                reward = np.array(0, dtype=np.float32)
+                eval_return = np.array(0, dtype=np.float32)
             elif winner == self._current_player:
-                reward = np.array(1).astype(np.float32)
+                reward = np.array(reward_mag, dtype=np.float32)
+                eval_return = np.array(1, dtype=np.float32)
             else:
-                reward = np.array(-1).astype(np.float32)
+                reward = np.array(-reward_mag, dtype=np.float32)
+                eval_return = np.array(-1, dtype=np.float32)
         else:
-            reward = np.array(0).astype(np.float32)
+            reward = np.array(0, dtype=np.float32)
+            eval_return = None
 
         info = self._get_state_info(winner if done else -1)
 
@@ -519,7 +528,7 @@ class GalconEnv(BaseEnv):
         if self.render_mode is not None:
             self.render(self.render_mode)
         if done:
-            info['eval_episode_return'] = reward
+            info['eval_episode_return'] = eval_return
             if self.render_mode == 'image_savefile_mode':
                 self.save_render_output(replay_name_suffix=self.replay_name_suffix, replay_path=self.replay_path,
                                         format=self.replay_format)            

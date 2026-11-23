@@ -768,3 +768,59 @@ class TestGalconEnv:
         assert f2.target == q1.id    # Flying fleet redirected
         assert q0.ships == 20.0      # Planet did NOT launch
         assert len(env2.fleets) == 1
+
+    def test_timeout_reward_scale_self_play_and_eval_and_elimination(self):
+        """timeout_reward_scale discounts timestep.reward on timeout wins/losses while keeping:
+        - full +-1.0 reward on elimination wins, and
+        - full +-1.0 info['eval_episode_return'] for apples-to-apples eval win-rate logging.
+        """
+        # 1. Self-play timeout: P1 has higher production, terminates on P2's step (step 2)
+        cfg_sp = EasyDict(GalconEnv.default_config())
+        cfg_sp.update(dict(
+            battle_mode='self_play_mode',
+            num_planets=4,
+            max_episode_steps=2,
+            timeout_reward_scale=0.5,
+            map_seed=2,
+        ))
+        env_sp = GalconEnv(cfg_sp)
+        env_sp.reset()
+        # Give P1 an extra planet so P1 wins on timeout production
+        env_sp.planets[2].owner = env_sp.PLAYER_1
+        ts1 = env_sp.step(env_sp.pass_action)  # P1 step 1
+        assert not ts1.done
+        ts2 = env_sp.step(env_sp.pass_action)  # P2 step 2 -> timeout, P1 wins, acting player is P2
+        assert ts2.done
+        assert np.isclose(float(ts2.reward), -0.5)
+        assert np.isclose(float(ts2.info['eval_episode_return']), -1.0)
+
+        # 2. Eval mode timeout: terminates on P2 (bot) step -> negated to P1 perspective
+        cfg_ev = EasyDict(GalconEnv.default_config())
+        cfg_ev.update(dict(
+            battle_mode='eval_mode',
+            bot_action_type='pass',
+            num_planets=4,
+            max_episode_steps=2,
+            timeout_reward_scale=0.5,
+            map_seed=2,
+        ))
+        env_ev = GalconEnv(cfg_ev)
+        env_ev.reset()
+        env_ev.planets[2].owner = env_ev.PLAYER_1
+        ts_ev = env_ev.step(env_ev.pass_action)  # P1 step 1 + bot step 2 -> timeout, P1 wins
+        assert ts_ev.done
+        assert np.isclose(float(ts_ev.reward), 0.5)
+        assert np.isclose(float(ts_ev.info['eval_episode_return']), 1.0)
+
+        # 3. Elimination win with timeout_reward_scale=0.5 still pays full +1.0
+        env_elim = GalconEnv(cfg_sp)
+        env_elim.reset()
+        # Remove all P2 planets/fleets so P1 wins by elimination on step 1
+        for p in env_elim.planets:
+            if p.owner == env_elim.PLAYER_2:
+                p.owner = env_elim.PLAYER_1
+        env_elim.fleets.clear()
+        ts_elim = env_elim.step(env_elim.pass_action)
+        assert ts_elim.done
+        assert np.isclose(float(ts_elim.reward), 1.0)
+        assert np.isclose(float(ts_elim.info['eval_episode_return']), 1.0)
