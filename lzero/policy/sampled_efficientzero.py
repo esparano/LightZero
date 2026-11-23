@@ -993,7 +993,9 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                 # if not in training, obtain the scalars of the value/reward
                 pred_values = self.value_inverse_scalar_transform_handle(pred_values).detach().cpu().numpy()  # shape（B, 1）
                 latent_state_roots = latent_state_roots.detach().cpu().numpy()
-                reward_hidden_state_roots = ( # TODO: check these are not all zeroes
+                # Intentionally all zeros at root (depth 0): the value-prefix LSTM has no unrolled steps yet
+                # and is populated during recurrent_inference (resetting every lstm_horizon_len steps).
+                reward_hidden_state_roots = (
                     reward_hidden_state_roots[0].detach().cpu().numpy(),
                     reward_hidden_state_roots[1].detach().cpu().numpy()
                 )
