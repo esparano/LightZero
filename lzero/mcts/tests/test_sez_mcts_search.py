@@ -248,6 +248,21 @@ class TestSEZMCTSSearch:
         assert by_depth[2] == (0.0, 0.0), f"Depth 2 should reset hidden state at horizon=2, got {by_depth[2]}"
         assert by_depth[3][0] > 0.0 and by_depth[3][1] > 0.0, f"Depth 3 should carry hidden state, got {by_depth[3]}"
 
+    def test_search_respects_policy_priors_when_values_equal(self, mcts_cls):
+        """When all leaf values are 0.0 and root logit for action 1 is much larger
+        than action 0 (+5.0 vs -5.0), PUCT must concentrate visits on action 1.
+        Catches the C++ cnode.cpp std::string::compare('density') bug that forced uniform priors.
+        """
+        torch.manual_seed(0)
+        cfg = _make_mcts_cfg(action_space_size=2, num_of_sampled_actions=2, num_simulations=20)
+        model = _DepthTrackingStubModel(action_space_size=2, value_fn=lambda d, a1, a2: 0.0)
+        roots = _run_search(
+            mcts_cls, cfg, model, legal_actions=[0, 1], root_policy_logits=[-5.0, 5.0], to_play_batch=[1]
+        )
+        best_act, totals = _best_action_from_roots(roots)
+        assert best_act == 1, f"Expected prior-favored action 1, got {best_act} with visits {totals}"
+        assert totals[1] >= 15, f"Expected >= 15/20 visits on high-prior action 1, got {totals}"
+
 
 @pytest.mark.unittest
 def test_ptree_and_ctree_parity_on_two_player_board_game():

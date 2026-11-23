@@ -1069,7 +1069,7 @@ namespace tree
         // sampled related core code
         // TODO(pu): empirical distribution
         std::string empirical_distribution_type = "density";
-        if (empirical_distribution_type.compare("density"))
+        if (empirical_distribution_type == "density")
         {
             if (continuous_action_space == true)
             {
@@ -1090,7 +1090,7 @@ namespace tree
                 prior_score = pb_c * child->prior / (empirical_prob_sum + 1e-6);
             }
         }
-        else if (empirical_distribution_type.compare("uniform"))
+        else if (empirical_distribution_type == "uniform")
         {
             prior_score = pb_c * 1 / parent->children.size();
         }
