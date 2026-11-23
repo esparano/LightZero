@@ -77,12 +77,16 @@ def reflect_game_segment(cfg: Any, game_segment: Any, reflect_x: bool, reflect_y
             
     reflected.obs_segment = obs_segment
     
-    # 5. Reflect actions and action masks
-    num_actions = W * H * W * H + 1
-    actions_arr = np.arange(num_actions)
-    # All non-pass actions (by excluding index 0)
-    shifted = actions_arr[1:] - 1
+    # 5. Reflect actions and action masks (supports both planet-only N+1 and planet+redirect 2N+1 action spaces)
     grid_cell_count = W * H
+    pair_action_count = grid_cell_count * grid_cell_count
+    mask_len = None
+    if hasattr(reflected, 'action_mask_segment') and reflected.action_mask_segment is not None and len(reflected.action_mask_segment) > 0:
+        mask_len = len(reflected.action_mask_segment[0])
+    has_redirect_layer = (mask_len == 2 * pair_action_count + 1)
+    num_actions = (2 * pair_action_count + 1) if has_redirect_layer else (pair_action_count + 1)
+
+    shifted = np.arange(pair_action_count, dtype=np.int64)
     source_cell = shifted // grid_cell_count
     target_cell = shifted % grid_cell_count
     
@@ -101,7 +105,10 @@ def reflect_game_segment(cfg: Any, game_segment: Any, reflect_x: bool, reflect_y
     new_source_cell = source_y * W + source_x
     new_target_cell = target_y * W + target_x
     perm = np.zeros(num_actions, dtype=np.int64)
-    perm[1:] = new_source_cell * grid_cell_count + new_target_cell + 1
+    base_perm = new_source_cell * grid_cell_count + new_target_cell + 1
+    perm[1:pair_action_count + 1] = base_perm
+    if has_redirect_layer:
+        perm[pair_action_count + 1:] = base_perm + pair_action_count
     
     # Apply action permutation
     if hasattr(reflected, 'action_segment') and reflected.action_segment is not None:

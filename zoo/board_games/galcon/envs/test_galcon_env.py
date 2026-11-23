@@ -582,3 +582,154 @@ class TestGalconEnv:
         files = list(tmp_path.glob(f'*.{replay_format}'))
         assert len(files) == 1
         assert files[0].stat().st_size > 0
+
+    def _make_redirect_env(self, enable_fleet_redirection: bool) -> GalconEnv:
+        cfg = GalconEnv.default_config()
+        cfg.update(dict(
+            battle_mode='self_play_mode',
+            num_planets=4,
+            map_seed=2,
+            grid_square_size=25.0,
+            grid_max_x=50.0,
+            grid_max_y=50.0,
+            max_episode_steps=20,
+            enable_fleet_redirection=enable_fleet_redirection,
+        ))
+        env = GalconEnv(cfg)
+        env.reset()
+        return env
+
+    def _find_empty_cell(self, env: GalconEnv):
+        occupied = {env._world_to_grid(p.x, p.y) for p in env.planets}
+        for gy in range(env.grid_height):
+            for gx in range(env.grid_width):
+                if (gx, gy) not in occupied:
+                    # Return (gx, gy, world_x, world_y) at center of cell
+                    wx = -env.grid_max_x + (gx + 0.5) * env.grid_square_size
+                    wy = -env.grid_max_y + (gy + 0.5) * env.grid_square_size
+                    return gx, gy, wx, wy
+        raise AssertionError("No empty cell found on 4x4 grid with 4 planets")
+
+    def test_fleet_redirection_disabled_by_default(self):
+        """By default (enable_fleet_redirection=False), action space is N+1 (no redirect layer),
+        cells with only friendly fleets are NOT legal sources, and _apply_action does not redirect.
+        """
+        env = self._make_redirect_env(enable_fleet_redirection=False)
+        assert env.enable_fleet_redirection is False
+        assert env.total_num_actions == env.pair_action_count + 1
+
+        gx, gy, wx, wy = self._find_empty_cell(env)
+        p0, p1 = env.planets[0], env.planets[1]
+        fleet = Fleet(id=99, owner=env.PLAYER_1, ships=10.0, x=wx, y=wy, source=p0.id, target=p0.id, radius=1.0)
+        env.fleets.append(fleet)
+
+        t_gx, t_gy = env._world_to_grid(p1.x, p1.y)
+        send_act = env.encode_action(gx, gy, t_gx, t_gy, is_redirect=False)
+        redirect_act = env.encode_action(gx, gy, t_gx, t_gy, is_redirect=True)
+        assert send_act not in env.legal_actions
+        assert redirect_act not in env.legal_actions
+        assert env.observe()['action_mask'][send_act] == 0
+
+        env._apply_action(send_act)
+        env._apply_action(redirect_act)
+        assert fleet.target == p0.id
+
+    def test_fleet_redirection_legal_actions_and_masking(self):
+        """With enable_fleet_redirection=True:
+        - Action space is 2*N + 1 (separate planet-send and fleet-redirect layers).
+        - Friendly fleet in empty cell unlocks redirect actions (is_redirect=True) to any
+          planet != current target, while planet-send (is_redirect=False) stays masked out.
+        - Redirecting to its already-current target is masked out (no-op).
+        - Enemy fleet in empty cell does NOT unlock redirects for Player 1.
+        """
+        env = self._make_redirect_env(enable_fleet_redirection=True)
+        assert env.total_num_actions == 2 * env.pair_action_count + 1
+
+        gx, gy, wx, wy = self._find_empty_cell(env)
+        p0, p1 = env.planets[0], env.planets[1]
+        t0_gx, t0_gy = env._world_to_grid(p0.x, p0.y)
+        t1_gx, t1_gy = env._world_to_grid(p1.x, p1.y)
+
+        # Enemy fleet alone should not make cell legal for Player 1
+        env.fleets.append(Fleet(id=10, owner=env.PLAYER_2, ships=10.0, x=wx, y=wy, source=p1.id, target=p0.id, radius=1.0))
+        redirect_to_p1 = env.encode_action(gx, gy, t1_gx, t1_gy, is_redirect=True)
+        assert redirect_to_p1 not in env.legal_actions
+
+        # Add friendly fleet targeting p0 -> redirect to p1 is legal, send to p1 & redirect to p0 are NOT legal
+        env.fleets.append(Fleet(id=11, owner=env.PLAYER_1, ships=10.0, x=wx, y=wy, source=p0.id, target=p0.id, radius=1.0))
+        send_to_p1 = env.encode_action(gx, gy, t1_gx, t1_gy, is_redirect=False)
+        redirect_to_p0 = env.encode_action(gx, gy, t0_gx, t0_gy, is_redirect=True)
+        assert env.decode_action_with_type(redirect_to_p1) == ('redirect', gx, gy, t1_gx, t1_gy)
+        assert env.decode_action_with_type(send_to_p1) == ('send', gx, gy, t1_gx, t1_gy)
+
+        mask = env.observe()['action_mask']
+        assert redirect_to_p1 in env.legal_actions and mask[redirect_to_p1] == 1
+        assert send_to_p1 not in env.legal_actions and mask[send_to_p1] == 0
+        assert redirect_to_p0 not in env.legal_actions and mask[redirect_to_p0] == 0
+
+    def test_fleet_redirection_redirects_all_friendly_fleets_and_moves_toward_new_target(self):
+        """Selecting a redirect action on a cell with multiple friendly fleets + 1 enemy fleet
+        redirects ALL friendly fleets to the new target (leaving enemy fleet untouched), and on
+        the next tick the redirected fleets move closer to the new target.
+        """
+        env = self._make_redirect_env(enable_fleet_redirection=True)
+        gx, gy, wx, wy = self._find_empty_cell(env)
+        p0, p1 = env.planets[0], env.planets[1]
+        t1_gx, t1_gy = env._world_to_grid(p1.x, p1.y)
+
+        f1 = Fleet(id=1, owner=env.PLAYER_1, ships=12.0, x=wx, y=wy, source=p0.id, target=p0.id, radius=1.0)
+        f2 = Fleet(id=2, owner=env.PLAYER_1, ships=8.0, x=wx, y=wy, source=p0.id, target=p0.id, radius=1.0)
+        f_enemy = Fleet(id=3, owner=env.PLAYER_2, ships=15.0, x=wx, y=wy, source=p1.id, target=p0.id, radius=1.0)
+        env.fleets.extend([f1, f2, f_enemy])
+
+        dist_before = np.hypot(f1.x - p1.x, f1.y - p1.y)
+        redirect_act = env.encode_action(gx, gy, t1_gx, t1_gy, is_redirect=True)
+        env.step(redirect_act)
+
+        assert f1.target == p1.id
+        assert f2.target == p1.id
+        assert f_enemy.target == p0.id  # Enemy fleet untouched
+        if f1 in env.fleets:
+            dist_after = np.hypot(f1.x - p1.x, f1.y - p1.y)
+            assert dist_after < dist_before
+
+    def test_fleet_redirection_and_planet_launch_are_mutually_exclusive_actions(self):
+        """When a cell contains both a friendly planet and a friendly fleet, the bot has TWO
+        separate legal actions:
+        1. Planet launch (is_redirect=False): launches from planet ONLY, leaving flying fleet's target untouched.
+        2. Fleet redirect (is_redirect=True): redirects flying fleet(s) ONLY, leaving planet ships untouched.
+        """
+        # Case 1: Choose planet launch -> planet launches, flying fleet NOT redirected
+        env1 = self._make_redirect_env(enable_fleet_redirection=True)
+        p0, p1, p2 = env1.planets[0], env1.planets[1], env1.planets[2]
+        p0.ships = 20.0
+        p0_gx, p0_gy = env1._world_to_grid(p0.x, p0.y)
+        p1_gx, p1_gy = env1._world_to_grid(p1.x, p1.y)
+
+        f1 = Fleet(id=50, owner=env1.PLAYER_1, ships=5.0, x=p0.x, y=p0.y, source=p0.id, target=p2.id, radius=1.0)
+        env1.fleets.append(f1)
+
+        send_act = env1.encode_action(p0_gx, p0_gy, p1_gx, p1_gy, is_redirect=False)
+        redirect_act = env1.encode_action(p0_gx, p0_gy, p1_gx, p1_gy, is_redirect=True)
+        assert send_act != redirect_act
+        assert send_act in env1.legal_actions and redirect_act in env1.legal_actions
+
+        env1._apply_action(send_act)
+        assert p0.ships < 20.0       # Planet launched
+        assert f1.target == p2.id    # Flying fleet was NOT redirected
+        assert len(env1.fleets) == 2
+
+        # Case 2: Choose fleet redirect -> flying fleet redirected, planet NOT launched
+        env2 = self._make_redirect_env(enable_fleet_redirection=True)
+        q0, q1, q2 = env2.planets[0], env2.planets[1], env2.planets[2]
+        q0.ships = 20.0
+        q0_gx, q0_gy = env2._world_to_grid(q0.x, q0.y)
+        q1_gx, q1_gy = env2._world_to_grid(q1.x, q1.y)
+
+        f2 = Fleet(id=51, owner=env2.PLAYER_1, ships=5.0, x=q0.x, y=q0.y, source=q0.id, target=q2.id, radius=1.0)
+        env2.fleets.append(f2)
+
+        env2._apply_action(env2.encode_action(q0_gx, q0_gy, q1_gx, q1_gy, is_redirect=True))
+        assert f2.target == q1.id    # Flying fleet redirected
+        assert q0.ships == 20.0      # Planet did NOT launch
+        assert len(env2.fleets) == 1

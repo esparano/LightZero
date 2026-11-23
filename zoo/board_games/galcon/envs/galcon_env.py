@@ -128,6 +128,7 @@ class GalconEnv(BaseEnv):
         neutral_min_production = 15,
         neutral_max_production = 100,
         fleet_top_k=3,
+        enable_fleet_redirection=False,
         # TODO: settings for home ships, home prod, etc.
         # TODO: Base some of these settings (max_expected_ships, max_expected_production, etc. on these other settings)
         # Used for normalizing ship counts, the largest "blob" of ships we are likely to see (on any planet, grid cell, or fleet)
@@ -188,7 +189,11 @@ class GalconEnv(BaseEnv):
         self.grid_width = int(math.ceil((2 * self.grid_max_x) / self.grid_square_size))
         self.grid_height = int(math.ceil((2 * self.grid_max_y) / self.grid_square_size))
         self.grid_cell_count = self.grid_width * self.grid_height
-        self.total_num_actions = self.grid_cell_count * self.grid_cell_count + 1
+        self.pair_action_count = self.grid_cell_count * self.grid_cell_count
+        self.enable_fleet_redirection = bool(self.cfg.get('enable_fleet_redirection', False))
+        self.total_num_actions = (
+            2 * self.pair_action_count + 1 if self.enable_fleet_redirection else self.pair_action_count + 1
+        )
 
         self.home_distance_fraction = float(self.cfg.home_distance_fraction)
 
@@ -521,16 +526,34 @@ class GalconEnv(BaseEnv):
 
         return BaseEnvTimestep(obs, reward, done, info)
 
+    def _fleets_at_cell(self, grid_x: int, grid_y: int, owner: Optional[int] = None) -> List[Fleet]:
+        matched = []
+        for fleet in self.fleets:
+            if owner is not None and fleet.owner != owner:
+                continue
+            if self._world_to_grid(fleet.x, fleet.y) == (grid_x, grid_y):
+                matched.append(fleet)
+        return matched
+
     def _apply_action(self, action: int) -> None:
-        decoded_action = self.decode_action(action)
-        if decoded_action == (None, None, None, None):
+        action_type, source_x, source_y, target_x, target_y = self.decode_action_with_type(action)
+        if action_type == 'pass':
             return
 
-        source_x, source_y, target_x, target_y = decoded_action
-        source = self._planet_at_cell(source_x, source_y, owner=self._current_player)
         target = self._planet_at_cell(target_x, target_y)
+        if target is None:
+            return
 
-        if source is None or target is None:
+        if action_type == 'redirect':
+            if not self.enable_fleet_redirection:
+                return
+            for fleet in self._fleets_at_cell(source_x, source_y, owner=self._current_player):
+                fleet.target = target.id
+            return
+
+        # action_type == 'send': planet launch only (does not redirect flying fleets in this cell)
+        source = self._planet_at_cell(source_x, source_y, owner=self._current_player)
+        if source is None:
             return
         if source.id == target.id:
             return
@@ -701,27 +724,43 @@ class GalconEnv(BaseEnv):
         matching_planets.sort(key=lambda p: p.id)
         return matching_planets[0]
 
-    def encode_action(self, source_x: int, source_y: int, target_x: int, target_y: int) -> int:
+    def encode_action(
+        self, source_x: int, source_y: int, target_x: int, target_y: int, is_redirect: bool = False
+    ) -> int:
         source_cell = self._grid_to_cell_index(source_x, source_y)
         target_cell = self._grid_to_cell_index(target_x, target_y)
-        return source_cell * self.grid_cell_count + target_cell + 1
+        base_action = source_cell * self.grid_cell_count + target_cell + 1
+        return base_action + self.pair_action_count if is_redirect else base_action
 
-    def decode_action(self, action: int) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    def decode_action_with_type(
+        self, action: int
+    ) -> Tuple[str, Optional[int], Optional[int], Optional[int], Optional[int]]:
         if action == self.pass_action:
-            return None, None, None, None
+            return 'pass', None, None, None, None
 
         shifted_action = int(action) - 1
+        if shifted_action >= self.pair_action_count:
+            action_type = 'redirect'
+            shifted_action -= self.pair_action_count
+        else:
+            action_type = 'send'
+
         source_cell = shifted_action // self.grid_cell_count
         target_cell = shifted_action % self.grid_cell_count
 
         source_x, source_y = self._cell_index_to_grid(source_cell)
         target_x, target_y = self._cell_index_to_grid(target_cell)
+        return action_type, source_x, source_y, target_x, target_y
+
+    def decode_action(self, action: int) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+        _, source_x, source_y, target_x, target_y = self.decode_action_with_type(action)
         return source_x, source_y, target_x, target_y
 
     # TODO: This is expensive and may be called more than once. Good candidate for optimization.
     @property
     def legal_actions(self) -> List[int]:
         legal = [self.pass_action]
+        legal_set = {self.pass_action}
 
         friendly_source_cells = set()
         target_cells = set()
@@ -745,7 +784,30 @@ class GalconEnv(BaseEnv):
                 if source.id == target.id:
                     continue
 
-                legal.append(self.encode_action(source_x, source_y, target_x, target_y))
+                act = self.encode_action(source_x, source_y, target_x, target_y)
+                if act not in legal_set:
+                    legal_set.add(act)
+                    legal.append(act)
+
+        if self.enable_fleet_redirection:
+            friendly_fleet_cells = {}
+            for fleet in self.fleets:
+                if fleet.owner == self._current_player:
+                    cell = self._world_to_grid(fleet.x, fleet.y)
+                    friendly_fleet_cells.setdefault(cell, []).append(fleet)
+
+            for (source_x, source_y), cell_fleets in sorted(friendly_fleet_cells.items()):
+                for target_x, target_y in sorted(target_cells):
+                    target = self._planet_at_cell(target_x, target_y)
+                    if target is None:
+                        continue
+                    # Only legal if at least one friendly fleet in this cell isn't already heading to target
+                    if not any(f.target != target.id for f in cell_fleets):
+                        continue
+                    act = self.encode_action(source_x, source_y, target_x, target_y, is_redirect=True)
+                    if act not in legal_set:
+                        legal_set.add(act)
+                        legal.append(act)
 
         return legal
 
