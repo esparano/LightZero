@@ -63,7 +63,7 @@ mcts_ctree = True
 # ==============================================================
 
 galcon_sez_config = dict(
-    exp_name=f'data_sez/galcon_sez_sp_8p_fixed_augment',
+    exp_name=f'data_sez/galcon_sez_sp_{num_planets}p_fixed_augment',
     # exp_name='data_sez/galcon_sez_self-play_seed0',
     env=dict(
         # TODO: Reorganize parameters (grouping map gen parameters separately, etc.)
