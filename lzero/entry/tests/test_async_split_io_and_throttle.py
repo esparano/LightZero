@@ -167,3 +167,29 @@ def test_load_config_from_py_galcon_simple():
     main_cfg.policy.batch_size = 7
     main_cfg2, _ = load_config_from_py(cfg_path)
     assert main_cfg2.policy.batch_size != 7
+
+
+@pytest.mark.unittest
+def test_compute_actor_learner_balance():
+    from lzero.entry.async_split.replay_throttle import compute_actor_learner_balance
+
+    # Learner starved (frequently throttled, empty queue, ratio at cap) -> negative
+    bal, status = compute_actor_learner_balance(
+        throttle_rate=0.85, pending_files=0, current_replay_ratio=0.5, max_replay_ratio=0.5
+    )
+    assert bal <= -0.5
+    assert status == 'need_more_actors'
+
+    # Sweet spot (rarely throttled, empty queue, ratio just under cap) -> near 0
+    bal, status = compute_actor_learner_balance(
+        throttle_rate=0.1, pending_files=0, current_replay_ratio=0.45, max_replay_ratio=0.5
+    )
+    assert -0.5 < bal < 0.5
+    assert status == 'balanced'
+
+    # Actors outpacing learner (backlog piling up + low replay ratio) -> positive
+    bal, status = compute_actor_learner_balance(
+        throttle_rate=0.0, pending_files=6, current_replay_ratio=0.1, max_replay_ratio=0.5
+    )
+    assert bal >= 0.5
+    assert status == 'learner_bottleneck'

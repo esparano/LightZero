@@ -73,3 +73,36 @@ class ReplayRatioThrottler:
             if remaining is not None and remaining <= 0:
                 return False, 'throttled'
         return True, 'ok'
+
+
+def compute_actor_learner_balance(
+    throttle_rate: float,
+    pending_files: int,
+    current_replay_ratio: float,
+    max_replay_ratio: Optional[float],
+    queue_saturation: int = 8,
+) -> Tuple[float, str]:
+    """Compute a single signed actor-learner balance score in ``[-1.0, +1.0]``.
+
+    - ``[-1.0, -0.5]`` (``'need_more_actors'``): Learner is frequently throttled / starved for games.
+    - ``(-0.5, +0.5)`` (``'balanced'``): Sweet spot; learner stays busy without a growing backlog.
+    - ``[+0.5, +1.0]`` (``'learner_bottleneck'``): Actors are outpacing the learner (backlog or low replay ratio).
+    """
+    neg = max(0.0, min(1.0, float(throttle_rate)))
+    q_sat = max(1, int(queue_saturation))
+    queue_pressure = max(0.0, min(1.0, float(max(0, int(pending_files))) / float(q_sat)))
+
+    if max_replay_ratio is not None and max_replay_ratio > 0:
+        ratio_headroom = max(0.0, min(1.0, 1.0 - float(current_replay_ratio) / float(max_replay_ratio)))
+        pos = max(queue_pressure, ratio_headroom * 0.8)
+    else:
+        pos = queue_pressure
+
+    balance = max(-1.0, min(1.0, pos * (1.0 - neg) - neg))
+    if balance <= -0.5:
+        status = 'need_more_actors'
+    elif balance >= 0.5:
+        status = 'learner_bottleneck'
+    else:
+        status = 'balanced'
+    return balance, status

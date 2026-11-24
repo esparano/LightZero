@@ -37,7 +37,7 @@ from .io_utils import (
     publish_weights,
     read_segment_batch,
 )
-from .replay_throttle import ReplayRatioThrottler
+from .replay_throttle import ReplayRatioThrottler, compute_actor_learner_balance
 
 
 def _ding_exp_name(root_dir: Path) -> str:
@@ -229,6 +229,8 @@ class AsyncLearner:
         self._last_published_iter = -1
         self._last_saved_ckpt_iter = 0
         self._recent_weight_lags: List[int] = []
+        self._recent_throttled: List[float] = []
+        self._last_balance_warn_time = 0.0
         self._bg_reader: Optional[_BackgroundSegmentReader] = None
 
         self.learner.call_hook('before_run')
@@ -352,11 +354,48 @@ class AsyncLearner:
 
         return log_vars[0] if log_vars else {}
 
+    def _count_pending_segment_files(self) -> int:
+        disk_count = len(list_incoming_segment_files(self.dirs.incoming_dir))
+        bg_count = self._bg_reader.queue.qsize() if self._bg_reader is not None else 0
+        return max(disk_count, bg_count)
+
     def _log_async_metrics(self, throttled: float) -> None:
+        self._recent_throttled.append(float(throttled))
+        if len(self._recent_throttled) > 50:
+            self._recent_throttled = self._recent_throttled[-50:]
+        throttle_rate = sum(self._recent_throttled) / len(self._recent_throttled)
+        pending_files = self._count_pending_segment_files()
+        balance, status = compute_actor_learner_balance(
+            throttle_rate=throttle_rate,
+            pending_files=pending_files,
+            current_replay_ratio=self.throttler.current_replay_ratio,
+            max_replay_ratio=self.throttler.max_replay_ratio,
+        )
+
+        now = time.time()
+        if status != 'balanced' and (now - self._last_balance_warn_time) >= 60.0:
+            self._last_balance_warn_time = now
+            if status == 'need_more_actors':
+                logging.warning(
+                    f'[AsyncLearner] BOTTLENECK=ACTORS (balance={balance:+.2f}, '
+                    f'throttle_rate={throttle_rate:.0%}, incoming_queue={pending_files}): '
+                    'Learner is starved for games — add more self-play actors.'
+                )
+            else:
+                logging.warning(
+                    f'[AsyncLearner] BOTTLENECK=LEARNER (balance={balance:+.2f}, '
+                    f'incoming_queue={pending_files}, replay_ratio={self.throttler.current_replay_ratio:.3f}'
+                    f'/{self.throttler.max_replay_ratio}): '
+                    'Actors are outpacing the learner — reduce actors or use a faster learner device.'
+                )
+
         if self.tb_logger is None:
             return
         step = self.total_ingested_envsteps
         cur_iter = int(self.learner.train_iter)
+        self.tb_logger.add_scalar('async_learner/actor_learner_balance', balance, cur_iter)
+        self.tb_logger.add_scalar('async_learner/throttle_rate', throttle_rate, cur_iter)
+        self.tb_logger.add_scalar('async_learner/incoming_queue_files', pending_files, cur_iter)
         self.tb_logger.add_scalar('async_learner/ingested_envsteps', step, cur_iter)
         self.tb_logger.add_scalar('async_learner/ingested_episodes', self.total_ingested_episodes, cur_iter)
         self.tb_logger.add_scalar('async_learner/replay_ratio', self.throttler.current_replay_ratio, cur_iter)
