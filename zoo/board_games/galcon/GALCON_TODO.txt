@@ -281,11 +281,21 @@ SampledEfficientZero config TODOs
 [ ] Set model_type='conv' and downsample=False for grid.
 [ ] Confirm SampledEfficientZeroModel supports chosen grid shape.
 [ ] Decide model channels/resblocks after observation shape is known.
+    - When enabling larger maps/grids, ensure there are enough ResBlocks (or global pooling / attention) for the receptive field to reach the full extent of the board (1 stem 3x3 conv + R ResBlocks of two 3x3 convs gives receptive field 3 + 4*R; e.g., R=3 covers 8x8 end-to-end, whereas a 16x10 or 20x12 grid needs larger R or global context so corner planets can see across the entire map).
 [ ] Decide game_segment_length:
     - self_play_mode likely max_episode_steps
     - bot mode may need care because one env.step may include two internal ticks
-[ ] Decide td_steps:
-    - likely max_episode_steps for sparse terminal reward
+[x] Decide td_steps:
+    - Keep td_steps = max_episode_steps (disables n-step value bootstrapping; uses Monte Carlo game outcomes).
+    - Rationale: For short sparse-reward two-player zero-sum games (<=100 ticks, terminal +/-1/0 reward),
+      unbiased end-of-game outcomes average out to true win probability across games (same as AlphaZero/MuZero
+      in Chess/Go), early production captures strongly impact outcomes, and discount_factor=0.99 already softens
+      early-turn targets (~0.37 at t=0 vs ~0.90 at t=90). Small td_steps (5-10) forces multi-hop bootstrapping
+      through immature ~0 value predictions early in training and slows credit propagation.
+    - Revisit lowering td_steps (e.g., 20-30) only if episodes become much longer (500-2000+ ticks) or if
+      off-policy outcome variance holds back an already-strong value network.
+    - Note: Disabling value bootstrapping does NOT disable policy reanalysis — reanalyze_ratio > 0 still
+      refreshes stale MCTS policy targets in the replay buffer using the latest network.
 [ ] Keep discount_factor=1 initially.
 [ ] Decide if shaped rewards are needed later.
 [ ] Decide whether mcts_ctree=False remains safer initially.
@@ -334,4 +344,29 @@ Experiment Backlog / TODOs
 [ ] Lower update_per_collect / replay ratio (e.g., 25 or 50 instead of 25 * 4 = 100 when symmetric_augment is enabled):
     - Current 100 * 256 = 25,600 samples/collect reuses each real env step ~32x as a root (192x across 6 unroll steps) with reanalyze_ratio=0.0.
     - Test after isolating state_norm=True to reduce overfitting to stale MCTS targets and early primacy bias.
-[ ] Try UniZero
+[ ] Try Sampled UniZero (cautions before porting from SEZ):
+    - CTree backend uses ctree_sampled_muzero (smz_tree), not ezs_tree — port/verify discrete-sampling CTree fixes.
+    - Built mainly for continuous control — verify discrete K-sampled policy loss/targets in WorldModel and game_buffer_sampled_unizero.
+    - Two-player self_play_mode is untested (to_play sign-flipping TODOs in game_buffer_unizero; missing eval to_play=-1->1 remap and 4x symmetry augmentation).
+    - Tradeoff: slower MCTS sims (Transformer KV-cache) and less 2D spatial inductive bias than SEZ conv dynamics.
+[ ] Try reanalyze
+[ ] [Low Priority] Bump grad_clip_value from 0.5 to 2.0 (so typical batches aren't clipped):
+    - Typical pre-clip total_grad_norm_before_clip_avg sits around ~0.9-1.1, so 0.5 clips almost every batch into per-batch gradient normalization.
+    - Under AdamW, steady ~2x scaling largely cancels out via the running RMS denominator, so expected impact is small — best rolled into a future fresh config series rather than spending a standalone A/B run.
+[ ] A/B test completed_q policy target vs. visit_count in SampledEfficientZero (with num_simulations=50):
+    - Motivation: On true random 6p maps (rand_NEW iter 50k), MCTS Q(best_send) beat Q(pass) on 85-87% of unseen maps, yet PUCT visit counts still put 58-64% on PASS due to the strong PASS prior — trapping visit-count policy targets.
+    - Policy config flags (defaults in SampledEfficientZeroPolicy):
+      - policy_target_type='visit_count'      # baseline default; set to 'completed_q' to enable
+      - completed_q_c_visit=50.0              # Gumbel MuZero default; keep at 50.0
+      - completed_q_c_scale=1.0               # Gumbel MuZero default (W = (c_visit + max_visit) * c_scale)
+    - Recommended Galcon sweep at num_simulations=50 (max_visit ~ 20-25, so c_visit + max_visit ~ 70-75):
+      - Start with completed_q_c_scale=0.25 (W ~ 18: +0.10 Q advantage -> +1.8 logits; breaks PASS trap without chasing early value noise).
+      - Also compare completed_q_c_scale=0.5 (W ~ 36) and 1.0 (W ~ 72, paper default / near-argmax Q) against policy_target_type='visit_count'.
+    - Tuning signals on TensorBoard:
+      - If policy_entropy_avg collapses near 0 early -> lower completed_q_c_scale.
+      - If action0_taken_rate_avg stays stuck >60% despite Q(send) > Q(pass) -> raise completed_q_c_scale.
+[ ] Implement and test a factored spatial (src, dst) policy head in SampledEfficientZeroModel:
+    - Motivation: The flat 128 -> 4,097 linear head has zero spatial weight sharing across (src_cell, dst_cell) pairs and builds a huge +7.5-logit bias gap favoring PASS on true random maps (since each individual send index is illegal ~99.9% of the time).
+    - Design: Use shared conv projections on the (H, W) latent grid to produce per-cell source query vectors u_i and target key vectors v_j (dim d=16 or 32, NOT rank-1 scalar), score every send (i -> j) via dot product u_i . v_j (optionally + a small relative-distance/dx/dy bias), and output 1 scalar logit for PASS (from global pooled features).
+    - Keeps exact action indexing 0..H*W*H*W (fully compatible with existing 4x symmetry reflection, action_mask, and ctree/ptree MCTS), cuts policy-head params dramatically, and enables immediate generalization across unseen random map layouts.
+    - Note: Relies on the ResNet trunk having full-board receptive field (or global context) so source u_i can decide whether to reserve ships for higher-priority targets elsewhere on the map.
