@@ -1557,3 +1557,67 @@ class GalconEnv(BaseEnv):
                 ]
 
         return reflected
+
+    @staticmethod
+    def validate_config(cfg: dict) -> None:
+        """
+        Overview:
+            Validate Galcon training config invariants at startup.
+
+            Guards against accidental desync between ``env.max_episode_steps`` and
+            ``policy.td_steps`` / ``policy.game_segment_length`` (e.g. when a wrapper
+            script overrides ``env.max_episode_steps`` without updating the policy
+            fields, which would silently enable n-step bootstrapping and/or split
+            episodes across segments).
+
+            Set ``cfg.policy.allow_episode_horizon_mismatch = True`` to opt into
+            intentional bootstrapping or multi-segment experiments.
+        """
+        env_cfg = cfg.get('env', {}) if hasattr(cfg, 'get') else getattr(cfg, 'env', {})
+        policy_cfg = cfg.get('policy', {}) if hasattr(cfg, 'get') else getattr(cfg, 'policy', {})
+
+        max_episode_steps = (
+            env_cfg.get('max_episode_steps')
+            if hasattr(env_cfg, 'get')
+            else getattr(env_cfg, 'max_episode_steps', None)
+        )
+        if max_episode_steps is None:
+            return
+        max_episode_steps = int(max_episode_steps)
+
+        td_steps = policy_cfg.get('td_steps') if hasattr(policy_cfg, 'get') else getattr(policy_cfg, 'td_steps', None)
+        seg_len = (
+            policy_cfg.get('game_segment_length')
+            if hasattr(policy_cfg, 'get')
+            else getattr(policy_cfg, 'game_segment_length', None)
+        )
+
+        mismatches = []
+        if td_steps is not None and int(td_steps) != max_episode_steps:
+            mismatches.append(f'policy.td_steps={td_steps} != env.max_episode_steps={max_episode_steps}')
+        if seg_len is not None and int(seg_len) != max_episode_steps:
+            mismatches.append(f'policy.game_segment_length={seg_len} != env.max_episode_steps={max_episode_steps}')
+
+        if not mismatches:
+            return
+
+        allow_mismatch = bool(
+            policy_cfg.get('allow_episode_horizon_mismatch', False)
+            if hasattr(policy_cfg, 'get')
+            else getattr(policy_cfg, 'allow_episode_horizon_mismatch', False)
+        )
+        detail = '; '.join(mismatches)
+        if allow_mismatch:
+            logging.info(
+                f'[Galcon] Proceeding with intentional episode-horizon mismatch '
+                f'(allow_episode_horizon_mismatch=True): {detail}'
+            )
+            return
+
+        raise ValueError(
+            f'Galcon episode-horizon mismatch detected ({detail}). '
+            f'Update policy.td_steps and policy.game_segment_length to match env.max_episode_steps '
+            f'({max_episode_steps}) to keep single-segment Monte Carlo outcomes, or set '
+            f'policy.allow_episode_horizon_mismatch=True if this mismatch is intentional '
+            f'(e.g., for an n-step bootstrapping or multi-segment experiment).'
+        )

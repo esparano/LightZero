@@ -636,10 +636,10 @@ def train_muzero_segment_async(
         ) from exc
 
     from ding.config import compile_config
+    from ding.envs import get_vec_env_setting
     from ding.policy import create_policy
     from ding.utils import get_rank, set_pkg_seed
     from ding.worker import BaseLearner
-    from lzero.entry.utils import validate_galcon_episode_horizon
     from tensorboardX import SummaryWriter
     import torch
 
@@ -652,7 +652,9 @@ def train_muzero_segment_async(
     cfg = compile_config(
         cfg, seed=seed, env=None, auto=True, create_cfg=create_cfg, save_cfg=True, renew_dir=False
     )
-    validate_galcon_episode_horizon(cfg, create_cfg)
+    env_fn, _, _ = get_vec_env_setting(cfg.env)
+    if hasattr(env_fn, 'validate_config'):
+        env_fn.validate_config(cfg)
     set_pkg_seed(cfg.seed, use_cuda=cfg.policy.cuda)
 
     policy = create_policy(cfg.policy, model=model, enable_field=['learn', 'collect', 'eval'])
