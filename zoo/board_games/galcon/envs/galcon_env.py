@@ -105,9 +105,10 @@ class GalconEnv(BaseEnv):
         (2.0, math.inf),
     )
     LANDING_FEATURE_COUNT_PER_BUCKET = 4
-    # Lower bound for dynamically sampled map seeds when map_seed=None and dynamic_seed=True,
-    # keeping collector maps strictly disjoint from low static evaluator seeds (e.g. 0..N).
-    DYNAMIC_MAP_SEED_MIN = 1000
+    # Offset applied to the map RNG seed when dynamic_seed=False (evaluator envs) so that
+    # collector and evaluator workers seeded with the same base seed (e.g. 0..N in train_muzero)
+    # draw independent random map sequences when map_seed=None.
+    EVAL_MAP_RNG_SEED_OFFSET = 1_000_000
 
     config = dict(
         env_id='Galcon',
@@ -297,15 +298,17 @@ class GalconEnv(BaseEnv):
 
         return self.observe()
 
+    def _init_map_rng(self, seed: int, dynamic_seed: bool) -> np.random.RandomState:
+        map_rng_seed = int(seed) if dynamic_seed else (int(seed) + self.EVAL_MAP_RNG_SEED_OFFSET) % (2**31 - 1)
+        return np.random.RandomState(map_rng_seed)
+
     def _resolve_map_seed(self) -> int:
         if self.map_seed is not None:
             return int(self.map_seed)
         if hasattr(self, '_seed'):
-            if getattr(self, '_dynamic_seed', True):
-                if not hasattr(self, '_map_rng') or self._map_rng is None:
-                    self._map_rng = np.random.RandomState(self._seed)
-                return int(self._map_rng.randint(self.DYNAMIC_MAP_SEED_MIN, 2**31 - 1))
-            return int(self._seed)
+            if not hasattr(self, '_map_rng') or self._map_rng is None:
+                self._map_rng = self._init_map_rng(self._seed, getattr(self, '_dynamic_seed', True))
+            return int(self._map_rng.randint(0, 2**31 - 1))
         return int(np.random.RandomState().randint(0, 2**31 - 1))
 
     def _generate_map(self, map_seed: Optional[int] = None) -> None:
@@ -1163,7 +1166,7 @@ class GalconEnv(BaseEnv):
     def seed(self, seed: int, dynamic_seed: bool = True) -> None:
         self._seed = seed
         self._dynamic_seed = dynamic_seed
-        self._map_rng = np.random.RandomState(seed)
+        self._map_rng = self._init_map_rng(seed, dynamic_seed)
         np.random.seed(seed)
 
     def close(self) -> None:
