@@ -39,7 +39,7 @@ class SampledEfficientZeroModel(nn.Module):
             categorical_distribution: bool = True,
             activation: Optional[nn.Module] = nn.GELU(approximate='tanh'),
             last_linear_layer_init_zero: bool = True,
-            state_norm: bool = False,
+            state_norm: bool = True,
             downsample: bool = False,
             # ==============================================================
             # specific sampled related config

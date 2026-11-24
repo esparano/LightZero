@@ -4,7 +4,12 @@ import pytest
 import torch
 from ding.torch_utils import is_differentiable
 
-from lzero.model.sampled_efficientzero_model import PredictionNetwork, DynamicsNetwork
+from lzero.model.sampled_efficientzero_model import (
+    DynamicsNetwork,
+    PredictionNetwork,
+    SampledEfficientZeroModel,
+)
+from lzero.model.sampled_efficientzero_model_mlp import SampledEfficientZeroModelMLP
 
 batch_size = [100, 10]
 num_res_blocks = [3, 4, 5]
@@ -125,6 +130,68 @@ class TestSampledEfficientZeroModel:
         assert reward_hidden_state[0].shape == torch.Size([1, batch_size, lstm_hidden_size])
         assert reward_hidden_state[1].shape == torch.Size([1, batch_size, lstm_hidden_size])
         assert value_prefix.shape == torch.Size([batch_size, output_support_size])
+
+    def test_state_norm_defaults_true_and_bounds_latent_state(self):
+        # Conv model default
+        conv_model = SampledEfficientZeroModel(
+            observation_shape=(4, 4, 4),
+            action_space_size=5,
+            num_res_blocks=1,
+            num_channels=8,
+            lstm_hidden_size=16,
+            reward_head_channels=4,
+            value_head_channels=4,
+            policy_head_channels=4,
+            reward_head_hidden_channels=[16],
+            value_head_hidden_channels=[16],
+            policy_head_hidden_channels=[16],
+            reward_support_range=(-1., 2., 1.),
+            value_support_range=(-1., 2., 1.),
+            proj_hid=32,
+            proj_out=32,
+            pred_hid=16,
+            pred_out=32,
+            continuous_action_space=False,
+        )
+        assert conv_model.state_norm is True
+        obs = torch.randn(4, 4, 4, 4) * 10.0
+        init_out = conv_model.initial_inference(obs)
+        assert init_out.latent_state.min().item() >= -1e-6
+        assert init_out.latent_state.max().item() <= 1.0 + 1e-6
+
+        actions = torch.randint(0, 5, (4,))
+        rec_out = conv_model.recurrent_inference(init_out.latent_state, init_out.reward_hidden_state, actions)
+        assert rec_out.latent_state.min().item() >= -1e-6
+        assert rec_out.latent_state.max().item() <= 1.0 + 1e-6
+        (rec_out.latent_state.sum() + rec_out.value.sum() + rec_out.policy_logits.sum()).backward()
+
+        # MLP model default
+        mlp_model = SampledEfficientZeroModelMLP(
+            observation_shape=8,
+            action_space_size=4,
+            latent_state_dim=16,
+            lstm_hidden_size=16,
+            reward_head_hidden_channels=[16],
+            value_head_hidden_channels=[16],
+            policy_head_hidden_channels=[16],
+            reward_support_range=(-1., 2., 1.),
+            value_support_range=(-1., 2., 1.),
+            proj_hid=32,
+            proj_out=32,
+            pred_hid=16,
+            pred_out=32,
+            continuous_action_space=False,
+        )
+        assert mlp_model.state_norm is True
+        mlp_obs = torch.randn(4, 8) * 10.0
+        mlp_init = mlp_model.initial_inference(mlp_obs)
+        assert mlp_init.latent_state.min().item() >= -1e-6
+        assert mlp_init.latent_state.max().item() <= 1.0 + 1e-6
+
+        mlp_rec = mlp_model.recurrent_inference(mlp_init.latent_state, mlp_init.reward_hidden_state, torch.randint(0, 4, (4,)))
+        assert mlp_rec.latent_state.min().item() >= -1e-6
+        assert mlp_rec.latent_state.max().item() <= 1.0 + 1e-6
+        (mlp_rec.latent_state.sum() + mlp_rec.value.sum() + mlp_rec.policy_logits.sum()).backward()
 
 
 if __name__ == "__main__":

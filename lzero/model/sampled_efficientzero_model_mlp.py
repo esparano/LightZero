@@ -33,7 +33,7 @@ class SampledEfficientZeroModelMLP(nn.Module):
         categorical_distribution: bool = True,
         activation: Optional[nn.Module] = nn.GELU(approximate='tanh'),
         last_linear_layer_init_zero: bool = True,
-        state_norm: bool = False,
+        state_norm: bool = True,
         # ==============================================================
         # specific sampled related config
         # ==============================================================

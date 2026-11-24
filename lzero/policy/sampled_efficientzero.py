@@ -70,6 +70,8 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             res_connection_in_dynamics=True,
             # (str) The type of normalization in MuZero model. Options are ['BN', 'LN']. Default to 'LN'.
             norm_type='LN',
+            # (bool) Whether to renormalize latent states to [0, 1] after representation and dynamics steps.
+            state_norm=True,
         ),
         # ****** common ******
         # (bool) Whether to use multi-gpu training.
