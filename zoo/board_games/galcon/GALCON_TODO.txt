@@ -334,3 +334,4 @@ Experiment Backlog / TODOs
 [ ] Lower update_per_collect / replay ratio (e.g., 25 or 50 instead of 25 * 4 = 100 when symmetric_augment is enabled):
     - Current 100 * 256 = 25,600 samples/collect reuses each real env step ~32x as a root (192x across 6 unroll steps) with reanalyze_ratio=0.0.
     - Test after isolating state_norm=True to reduce overfitting to stale MCTS targets and early primacy bias.
+[ ] Try UniZero
