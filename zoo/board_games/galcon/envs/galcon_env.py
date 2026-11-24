@@ -105,6 +105,9 @@ class GalconEnv(BaseEnv):
         (2.0, math.inf),
     )
     LANDING_FEATURE_COUNT_PER_BUCKET = 4
+    # Lower bound for dynamically sampled map seeds when map_seed=None and dynamic_seed=True,
+    # keeping collector maps strictly disjoint from low static evaluator seeds (e.g. 0..N).
+    DYNAMIC_MAP_SEED_MIN = 1000
 
     config = dict(
         env_id='Galcon',
@@ -276,6 +279,7 @@ class GalconEnv(BaseEnv):
         self.planets: List[Planet] = []
         self.fleets: List[Fleet] = []
         self.frames: List[np.ndarray] = []
+        self._current_map_seed: Optional[int] = None
         self.reset()
 
     def reset(self, start_player_index: int = 0, replay_name_suffix: Optional[str] = None) -> dict:
@@ -284,13 +288,27 @@ class GalconEnv(BaseEnv):
         self._current_player = self.players[start_player_index]
         self._next_fleet_id = self.num_planets
 
+        episode_map_seed = self._resolve_map_seed()
+        self._current_map_seed = episode_map_seed
+
         # Also resets planets and fleets
-        self._generate_map()
-        self._settle_planets()
+        self._generate_map(map_seed=episode_map_seed)
+        self._settle_planets(map_seed=episode_map_seed)
 
         return self.observe()
 
-    def _generate_map(self) -> None:
+    def _resolve_map_seed(self) -> int:
+        if self.map_seed is not None:
+            return int(self.map_seed)
+        if hasattr(self, '_seed'):
+            if getattr(self, '_dynamic_seed', True):
+                if not hasattr(self, '_map_rng') or self._map_rng is None:
+                    self._map_rng = np.random.RandomState(self._seed)
+                return int(self._map_rng.randint(self.DYNAMIC_MAP_SEED_MIN, 2**31 - 1))
+            return int(self._seed)
+        return int(np.random.RandomState().randint(0, 2**31 - 1))
+
+    def _generate_map(self, map_seed: Optional[int] = None) -> None:
         """
         Generate a seeded mirrored Galcon map.
 
@@ -304,12 +322,9 @@ class GalconEnv(BaseEnv):
         if self.num_planets % 2 != 0:
             raise ValueError('GalconEnv currently expects an even number of neutral planets.')
 
-        if self.map_seed is not None:
-            rng = np.random.RandomState(self.map_seed)
-        elif hasattr(self, '_seed'):
-            rng = np.random.RandomState(self._seed)
-        else:
-            rng = np.random.RandomState()
+        if map_seed is None:
+            map_seed = self._resolve_map_seed()
+        rng = np.random.RandomState(map_seed)
 
         # spawn angle for the homes
         a = rng.random_sample() * 2 * math.pi
@@ -380,16 +395,13 @@ class GalconEnv(BaseEnv):
         self.planets = planets
         self.fleets = []
 
-    def _settle_planets(self):
+    def _settle_planets(self, map_seed: Optional[int] = None):
         # Settle planets to prevent overlap
         min_gap = 2 * self.SHIP_RADIUS + self.PLANETS_SETTLE_DELTA
 
-        if self.map_seed is not None:
-            rng = np.random.RandomState(self.map_seed)
-        elif hasattr(self, '_seed'):
-            rng = np.random.RandomState(self._seed)
-        else:
-            rng = np.random.RandomState()
+        if map_seed is None:
+            map_seed = self._resolve_map_seed()
+        rng = np.random.RandomState(map_seed)
 
         # Run relaxation simulation to settle the positions of neutral planets
         for attempt_num in range(self.MAX_SETTLE_ATTEMPTS):
@@ -1151,6 +1163,7 @@ class GalconEnv(BaseEnv):
     def seed(self, seed: int, dynamic_seed: bool = True) -> None:
         self._seed = seed
         self._dynamic_seed = dynamic_seed
+        self._map_rng = np.random.RandomState(seed)
         np.random.seed(seed)
 
     def close(self) -> None:

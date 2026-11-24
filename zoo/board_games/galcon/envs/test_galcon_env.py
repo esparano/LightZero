@@ -824,3 +824,67 @@ class TestGalconEnv:
         assert ts_elim.done
         assert np.isclose(float(ts_elim.reward), 1.0)
         assert np.isclose(float(ts_elim.info['eval_episode_return']), 1.0)
+
+    def test_dynamic_seed_generates_distinct_maps_per_reset(self) -> None:
+        cfg = EasyDict(GalconEnv.default_config())
+        cfg.update(dict(num_planets=6, map_seed=None))
+
+        env1 = GalconEnv(cfg)
+        env1.seed(0, dynamic_seed=True)
+
+        layouts1 = []
+        seeds1 = []
+        for _ in range(5):
+            env1.reset()
+            seeds1.append(env1._current_map_seed)
+            layouts1.append(tuple((round(p.x, 4), round(p.y, 4), round(p.ships, 4), round(p.production, 4)) for p in env1.planets))
+
+        # Every reset must generate a distinct map and draw from the disjoint dynamic seed range
+        assert len(set(layouts1)) == 5
+        assert all(s >= GalconEnv.DYNAMIC_MAP_SEED_MIN for s in seeds1)
+
+        # Re-seeding another env with the same seed reproduces the same sequence of random maps
+        env2 = GalconEnv(cfg)
+        env2.seed(0, dynamic_seed=True)
+        layouts2 = []
+        for _ in range(5):
+            env2.reset()
+            layouts2.append(tuple((round(p.x, 4), round(p.y, 4), round(p.ships, 4), round(p.production, 4)) for p in env2.planets))
+        assert layouts1 == layouts2
+
+    def test_static_seed_and_explicit_map_seed_remain_deterministic(self) -> None:
+        # 1. Evaluator mode: map_seed=None, dynamic_seed=False -> deterministic held-out map per worker
+        cfg_eval = EasyDict(GalconEnv.default_config())
+        cfg_eval.update(dict(num_planets=6, map_seed=None))
+        env_eval = GalconEnv(cfg_eval)
+        env_eval.seed(0, dynamic_seed=False)
+
+        env_eval.reset()
+        eval_layout_1 = [(p.x, p.y, p.ships, p.production) for p in env_eval.planets]
+        assert env_eval._current_map_seed == 0
+
+        env_eval.reset()
+        eval_layout_2 = [(p.x, p.y, p.ships, p.production) for p in env_eval.planets]
+        assert eval_layout_1 == eval_layout_2
+
+        # Disjoint from collector worker with the same base seed (dynamic_seed=True)
+        env_collect = GalconEnv(cfg_eval)
+        env_collect.seed(0, dynamic_seed=True)
+        env_collect.reset()
+        collect_layout = [(p.x, p.y, p.ships, p.production) for p in env_collect.planets]
+        assert env_collect._current_map_seed != env_eval._current_map_seed
+        assert collect_layout != eval_layout_1
+
+        # 2. Explicit map_seed always overrides dynamic_seed=True (e.g. SIMPLE_1map)
+        cfg_fixed = EasyDict(GalconEnv.default_config())
+        cfg_fixed.update(dict(num_planets=6, map_seed=2))
+        env_fixed = GalconEnv(cfg_fixed)
+        env_fixed.seed(0, dynamic_seed=True)
+
+        env_fixed.reset()
+        fixed_layout_1 = [(p.x, p.y, p.ships, p.production) for p in env_fixed.planets]
+        assert env_fixed._current_map_seed == 2
+
+        env_fixed.reset()
+        fixed_layout_2 = [(p.x, p.y, p.ships, p.production) for p in env_fixed.planets]
+        assert fixed_layout_1 == fixed_layout_2
