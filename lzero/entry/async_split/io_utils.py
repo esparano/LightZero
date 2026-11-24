@@ -1,0 +1,267 @@
+"""Filesystem I/O, atomic serialization, weight watching, and config loading
+for the lightweight decoupled actor-learner-evaluator split (no Ray).
+"""
+
+import copy
+import importlib.util
+import os
+import pickle
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+from easydict import EasyDict
+
+
+@dataclass(frozen=True)
+class AsyncSplitDirs:
+    """Standard directory layout for an async actor-learner-evaluator run.
+
+    All workers (local or remote over a shared filesystem) coordinate solely
+    through atomic file operations inside ``root_dir``.
+    """
+
+    root_dir: Path
+    weights_dir: Path
+    latest_weights_path: Path
+    ckpt_dir: Path
+    segments_dir: Path
+    incoming_dir: Path
+    processed_dir: Path
+    log_dir: Path
+
+    @classmethod
+    def from_root(cls, root_dir: os.PathLike | str) -> 'AsyncSplitDirs':
+        root = Path(root_dir).resolve()
+        weights_dir = root / 'weights'
+        segments_dir = root / 'segments'
+        return cls(
+            root_dir=root,
+            weights_dir=weights_dir,
+            latest_weights_path=weights_dir / 'latest_weights.pt',
+            ckpt_dir=root / 'ckpt',
+            segments_dir=segments_dir,
+            incoming_dir=segments_dir / 'incoming',
+            processed_dir=segments_dir / 'processed',
+            log_dir=root / 'log',
+        )
+
+    def ensure_exists(self, create_processed: bool = False) -> None:
+        self.weights_dir.mkdir(parents=True, exist_ok=True)
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.incoming_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        if create_processed:
+            self.processed_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _atomic_tmp_path(target_path: Path) -> Path:
+    token = f'{os.getpid()}.{uuid.uuid4().hex[:10]}'
+    return target_path.parent / f'.{target_path.name}.tmp.{token}'
+
+
+def cpu_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Detach and move all tensors in a model state_dict to CPU."""
+    out: Dict[str, Any] = {}
+    for k, v in state_dict.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.detach().cpu()
+        else:
+            out[k] = v
+    return out
+
+
+def atomic_torch_save(payload: Any, target_path: os.PathLike | str) -> Path:
+    """Atomically write a PyTorch payload via temp file + ``os.replace``."""
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _atomic_tmp_path(target)
+    try:
+        torch.save(payload, str(tmp_path))
+        os.replace(str(tmp_path), str(target))
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+    return target
+
+
+def publish_weights(
+    weights_path: os.PathLike | str,
+    model_state_dict: Dict[str, Any],
+    train_iter: int,
+    envstep: int,
+    extra_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Atomically publish CPU model weights + metadata for actors and evaluator."""
+    payload: Dict[str, Any] = {
+        'model': cpu_state_dict(model_state_dict),
+        'train_iter': int(train_iter),
+        'version': int(train_iter),
+        'envstep': int(envstep),
+        'timestamp': time.time(),
+    }
+    if extra_meta:
+        payload.update(extra_meta)
+    atomic_torch_save(payload, weights_path)
+    return {k: v for k, v in payload.items() if k != 'model'}
+
+
+class WeightWatcher:
+    """Polls an atomically updated weights file and reloads a model when changed."""
+
+    def __init__(self, weights_path: os.PathLike | str) -> None:
+        self.weights_path = Path(weights_path)
+        self.last_mtime_ns: Optional[int] = None
+        self.last_size: Optional[int] = None
+        self.last_version: int = -1
+        self.last_meta: Dict[str, Any] = {'train_iter': 0, 'version': -1, 'envstep': 0}
+
+    def has_update(self) -> bool:
+        try:
+            st = self.weights_path.stat()
+        except FileNotFoundError:
+            return False
+        if self.last_mtime_ns is None:
+            return True
+        return st.st_mtime_ns != self.last_mtime_ns or st.st_size != self.last_size
+
+    def poll_and_load(
+        self,
+        model: torch.nn.Module,
+        device: str = 'cpu',
+        force: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Reload ``model`` if ``weights_path`` has been updated.
+
+        Returns metadata dict (``train_iter``, ``version``, ``envstep``, ...)
+        when a new weight version was loaded, otherwise ``None``.
+        """
+        if not force and not self.has_update():
+            return None
+
+        try:
+            st = self.weights_path.stat()
+            payload = torch.load(str(self.weights_path), map_location=device, weights_only=False)
+        except (FileNotFoundError, EOFError, RuntimeError, OSError):
+            return None
+
+        if not isinstance(payload, dict) or 'model' not in payload:
+            return None
+
+        version = int(payload.get('version', payload.get('train_iter', 0)))
+        if not force and version <= self.last_version and self.last_mtime_ns == st.st_mtime_ns:
+            return None
+
+        model.load_state_dict(payload['model'])
+        self.last_mtime_ns = st.st_mtime_ns
+        self.last_size = st.st_size
+        self.last_version = version
+        meta = {k: v for k, v in payload.items() if k != 'model'}
+        meta.setdefault('train_iter', version)
+        meta.setdefault('version', version)
+        meta.setdefault('envstep', 0)
+        self.last_meta = meta
+        return meta
+
+
+def write_segment_batch(
+    incoming_dir: os.PathLike | str,
+    segments: List[Any],
+    metas: List[Dict[str, Any]],
+    actor_id: str,
+    seq: int,
+    envsteps: int,
+    episodes: int,
+    weight_version: int,
+) -> Path:
+    """Atomically write a batch of ``GameSegment`` objects + metadata to ``incoming_dir``."""
+    incoming = Path(incoming_dir)
+    incoming.mkdir(parents=True, exist_ok=True)
+    ts_ms = int(time.time() * 1000)
+    safe_actor = str(actor_id).replace('/', '_').replace('\\', '_')
+    filename = f'{ts_ms:013d}_{safe_actor}_{int(seq):06d}_{uuid.uuid4().hex[:8]}.seg.pkl'
+    target = incoming / filename
+    tmp_path = _atomic_tmp_path(target)
+
+    payload = {
+        'segments': segments,
+        'metas': metas,
+        'actor_id': str(actor_id),
+        'seq': int(seq),
+        'envsteps': int(envsteps),
+        'episodes': int(episodes),
+        'weight_version': int(weight_version),
+        'timestamp': time.time(),
+    }
+    try:
+        with open(tmp_path, 'wb') as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(str(tmp_path), str(target))
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+    return target
+
+
+def list_incoming_segment_files(incoming_dir: os.PathLike | str) -> List[Path]:
+    """Return finalized ``*.seg.pkl`` files in chronological filename order."""
+    incoming = Path(incoming_dir)
+    if not incoming.exists():
+        return []
+    files = [
+        p for p in incoming.iterdir()
+        if p.is_file() and p.name.endswith('.seg.pkl') and not p.name.startswith('.')
+    ]
+    files.sort(key=lambda p: p.name)
+    return files
+
+
+def read_segment_batch(path: os.PathLike | str) -> Dict[str, Any]:
+    """Read a serialized segment batch file produced by ``write_segment_batch``."""
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
+def consume_segment_file(
+    path: os.PathLike | str,
+    archive_dir: Optional[os.PathLike | str] = None,
+) -> None:
+    """Archive or delete a segment batch file after ingestion."""
+    src = Path(path)
+    if not src.exists():
+        return
+    if archive_dir is not None:
+        dst_dir = Path(archive_dir)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        os.replace(str(src), str(dst_dir / src.name))
+    else:
+        src.unlink()
+
+
+def load_config_from_py(config_path: os.PathLike | str) -> Tuple[EasyDict, EasyDict]:
+    """Load deep-copied ``(main_config, create_config)`` from a LightZero Python config file."""
+    path = Path(config_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f'Config file not found: {path}')
+    module_name = f'_lz_async_cfg_{uuid.uuid4().hex}'
+    spec = importlib.util.spec_from_file_location(module_name, str(path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f'Unable to load config spec from: {path}')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, 'main_config') or not hasattr(module, 'create_config'):
+        raise AttributeError(
+            f'Config file {path} must define both `main_config` and `create_config`.'
+        )
+    return EasyDict(copy.deepcopy(module.main_config)), EasyDict(copy.deepcopy(module.create_config))
