@@ -11,7 +11,7 @@ from ding.rl_utils import get_epsilon_greedy_fn
 from ding.utils import get_rank, set_pkg_seed
 from ding.worker import BaseLearner
 from ditk import logging
-from lzero.entry.utils import log_buffer_memory_usage, log_buffer_run_time
+from lzero.entry.utils import log_buffer_memory_usage, log_buffer_run_time, validate_galcon_episode_horizon
 from lzero.policy import visit_count_temperature
 from lzero.policy.random_policy import LightZeroRandomPolicy
 from lzero.worker import MuZeroCollector as Collector
@@ -69,6 +69,7 @@ def train_muzero(
         cfg.policy.device = 'cpu'
 
     cfg = compile_config(cfg, seed=seed, env=None, auto=True, create_cfg=create_cfg, save_cfg=True)
+    validate_galcon_episode_horizon(cfg, create_cfg)
     # Create main components: env, policy
     env_fn, collector_env_cfg, evaluator_env_cfg = get_vec_env_setting(cfg.env)
     collector_env = create_env_manager(cfg.env.manager, [partial(env_fn, cfg=c) for c in collector_env_cfg])
