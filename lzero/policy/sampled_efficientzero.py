@@ -819,7 +819,10 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             - target_policy_entropy (:obj:`torch.Tensor`): The target policy entropy tensor.
             - target_sampled_actions (:obj:`torch.Tensor`): The target sampled actions tensor.
         """
-        prob = torch.softmax(policy_logits, dim=-1)
+        # Use log_softmax so extreme negative logits (< -89 in fp32) cannot underflow
+        # prob to 0.0 and produce 0.0 * log(0.0) = NaN in the entropy term.
+        log_prob_all = torch.log_softmax(policy_logits, dim=-1)
+        prob = log_prob_all.exp()
 
         # take the init hypothetical step k=unroll_step
         target_normalized_visit_count = target_policy[:, unroll_step]
@@ -841,7 +844,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         # num_of_sampled_actions, action_dim) e.g. (4, 6, 20, 2) ->  (4, 20, 2)
         target_sampled_actions = child_sampled_actions_batch[:, unroll_step]
 
-        entropy = -(prob * prob.log()).sum(-1)
+        entropy = -(prob * log_prob_all).sum(-1)
         policy_entropy = entropy.mean()
         policy_entropy_loss = -entropy
 

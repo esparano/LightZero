@@ -193,3 +193,19 @@ def test_compute_actor_learner_balance():
     )
     assert bal >= 0.5
     assert status == 'learner_bottleneck'
+
+
+@pytest.mark.unittest
+def test_publish_weights_rejects_non_finite_without_overwriting_existing(tmp_path):
+    weights_path = tmp_path / 'weights' / 'latest_weights.pt'
+    good_sd = {'w': torch.tensor([1.0, 2.0]), 'step': torch.tensor(5, dtype=torch.int64)}
+    publish_weights(weights_path, good_sd, train_iter=10, envstep=100)
+
+    nan_sd = {'w': torch.tensor([1.0, float('nan')]), 'b': torch.tensor([float('inf')])}
+    with pytest.raises(FloatingPointError, match='Refusing to publish non-finite weights'):
+        publish_weights(weights_path, nan_sd, train_iter=20, envstep=200)
+
+    # Existing valid weights file must remain untouched
+    loaded = torch.load(weights_path, map_location='cpu', weights_only=False)
+    assert loaded['train_iter'] == 10
+    assert torch.allclose(loaded['model']['w'], torch.tensor([1.0, 2.0]))
