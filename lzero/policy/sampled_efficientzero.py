@@ -489,6 +489,29 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         value_prefix_loss = torch.zeros(self._cfg.batch_size, device=self._cfg.device)
         consistency_loss = torch.zeros(self._cfg.batch_size, device=self._cfg.device)
 
+        # Precompute stop-grad SSL target projections in a single batched no_grad pass,
+        # skipping unused prediction heads and autograd graphs on target observations.
+        ssl_obs_projs = None
+        if (
+            self._cfg.model.self_supervised_learning_loss
+            and self._cfg.ssl_loss_weight > 0
+            and self._cfg.num_unroll_steps > 0
+        ):
+            target_obs_slices = [
+                obs_target_batch[:, beg:end]
+                for beg, end in (
+                    self._get_target_obs_index_in_step_k(k) for k in range(self._cfg.num_unroll_steps)
+                )
+            ]
+            batched_target_obs = torch.cat(target_obs_slices, dim=0)
+            with torch.no_grad():
+                if hasattr(self._learn_model, '_representation'):
+                    batched_repr_states = self._learn_model._representation(batched_target_obs)
+                else:
+                    batched_repr_states = self._learn_model.initial_inference(batched_target_obs).latent_state
+                batched_obs_proj = self._learn_model.project(to_tensor(batched_repr_states), with_grad=False)
+            ssl_obs_projs = batched_obs_proj.chunk(self._cfg.num_unroll_steps, dim=0)
+
         # ==============================================================
         # the core recurrent_inference in SampledEfficientZero policy.
         # ==============================================================
@@ -503,24 +526,17 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                 network_output
             )
 
-            if self._cfg.model.self_supervised_learning_loss:
+            if ssl_obs_projs is not None:
                 # ==============================================================
                 # calculate consistency loss for the next ``num_unroll_steps`` unroll steps.
                 # ==============================================================
-                if self._cfg.ssl_loss_weight > 0:
-                    # obtain the oracle latent states from representation function.
-                    beg_index, end_index = self._get_target_obs_index_in_step_k(step_k)
-                    network_output = self._learn_model.initial_inference(obs_target_batch[:, beg_index:end_index])
+                latent_state = to_tensor(latent_state)
+                # NOTE: no grad for the representation_state branch (precomputed above).
+                dynamic_proj = self._learn_model.project(latent_state, with_grad=True)
+                observation_proj = ssl_obs_projs[step_k]
+                temp_loss = negative_cosine_similarity(dynamic_proj, observation_proj) * mask_batch[:, step_k]
 
-                    latent_state = to_tensor(latent_state)
-                    representation_state = to_tensor(network_output.latent_state)
-
-                    # NOTE: no grad for the representation_state branch.
-                    dynamic_proj = self._learn_model.project(latent_state, with_grad=True)
-                    observation_proj = self._learn_model.project(representation_state, with_grad=False)
-                    temp_loss = negative_cosine_similarity(dynamic_proj, observation_proj) * mask_batch[:, step_k]
-
-                    consistency_loss += temp_loss
+                consistency_loss += temp_loss
 
             # NOTE: the target policy, target_value_categorical, target_value_prefix_categorical is calculated in
             # game buffer now.

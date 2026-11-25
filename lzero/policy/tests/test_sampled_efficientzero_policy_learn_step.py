@@ -370,3 +370,77 @@ class TestSampledEfficientZeroPolicyLearn:
         )
         assert torch.allclose(loss_zero, torch.zeros(B))
         assert float(tpe_zero) == 0.0
+
+    def test_batched_no_grad_ssl_skips_target_prediction_and_matches_reference_in_eval(self):
+        """Verify SSL consistency target projections run in a single batched no_grad
+        _representation() call (without invoking _prediction() on target observations)
+        and match per-step initial_inference projections identically when BN is frozen.
+        """
+        torch.manual_seed(11)
+        np.random.seed(11)
+        cfg = _make_test_policy_and_buffer_cfg()
+        policy = SampledEfficientZeroPolicy(cfg)
+        policy._init_learn()
+
+        buffer = SampledEfficientZeroGameBuffer(cfg)
+        seg1 = _make_dummy_segment(cfg, num_steps=6)
+        seg2 = _make_dummy_segment(cfg, num_steps=6)
+        meta1 = {'done': True, 'unroll_plus_td_steps': 4, 'priorities': np.ones(6)}
+        meta2 = {'done': True, 'unroll_plus_td_steps': 4, 'priorities': np.ones(6)}
+        buffer.push_game_segments(([seg1, seg2], [meta1, meta2]))
+        train_data = buffer.sample(batch_size=2, policy=policy)
+
+        B = cfg.batch_size
+        U = cfg.num_unroll_steps
+
+        # 1. Verify call counts & no_grad during _forward_learn
+        repr_calls = []
+        pred_calls = []
+        orig_repr = policy._learn_model._representation
+        orig_pred = policy._learn_model._prediction
+
+        def _spy_repr(obs):
+            repr_calls.append((obs.size(0), torch.is_grad_enabled()))
+            return orig_repr(obs)
+
+        def _spy_pred(latent):
+            pred_calls.append(latent.size(0))
+            return orig_pred(latent)
+
+        policy._learn_model._representation = _spy_repr
+        policy._learn_model._prediction = _spy_pred
+
+        log_vars = policy._forward_learn(train_data)
+
+        # Root representation (B, grad=True) + 1 batched SSL representation (U*B, grad=False)
+        assert repr_calls == [(B, True), (U * B, False)]
+        # Prediction called only for root + U recurrent steps (never for the U SSL target obs)
+        assert pred_calls == [B] * (1 + U)
+        assert np.isfinite(float(log_vars['consistency_loss']))
+
+        # 2. With BN frozen (eval mode), batched target projections match per-step initial_inference exactly
+        policy._learn_model._representation = orig_repr
+        policy._learn_model._prediction = orig_pred
+        policy._learn_model.eval()
+
+        from lzero.policy import prepare_obs
+        obs_batch_ori = train_data[0][0]
+        _, obs_target_batch = prepare_obs(obs_batch_ori, policy._cfg)
+
+        slices = [
+            obs_target_batch[:, beg:end]
+            for beg, end in (policy._get_target_obs_index_in_step_k(k) for k in range(U))
+        ]
+        with torch.no_grad():
+            batched = policy._learn_model.project(
+                policy._learn_model._representation(torch.cat(slices, dim=0)), with_grad=False
+            ).chunk(U, dim=0)
+            per_step = [
+                policy._learn_model.project(
+                    policy._learn_model.initial_inference(s).latent_state, with_grad=False
+                )
+                for s in slices
+            ]
+
+        for b_proj, p_proj in zip(batched, per_step):
+            assert torch.allclose(b_proj, p_proj, atol=1e-6)
