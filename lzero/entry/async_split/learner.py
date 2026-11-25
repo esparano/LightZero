@@ -7,6 +7,7 @@ with configurable replay-ratio throttling, logs standard TensorBoard metrics,
 saves periodic checkpoints, and atomically publishes ``latest_weights.pt``.
 """
 
+import contextlib
 import copy
 import os
 import queue
@@ -15,7 +16,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 import psutil
 import torch
@@ -131,6 +132,182 @@ class _BackgroundSegmentReader:
                 self._stop_event.wait(self.poll_interval)
 
 
+class _RWLock:
+    """Writer-preferring reader-writer lock for concurrent replay sampling + exclusive ingestion."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writers_waiting = 0
+        self._writer_active = False
+
+    @contextlib.contextmanager
+    def read_lock(self) -> Iterator[None]:
+        with self._cond:
+            while self._writer_active or self._writers_waiting > 0:
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def write_lock(self) -> Iterator[None]:
+        with self._cond:
+            self._writers_waiting += 1
+            try:
+                while self._writer_active or self._readers > 0:
+                    self._cond.wait()
+                self._writer_active = True
+            finally:
+                self._writers_waiting -= 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writer_active = False
+                self._cond.notify_all()
+
+
+def _unwrap_model(model: Any) -> Any:
+    """Unwrap DI-engine model wrappers (e.g. TargetNetworkWrapper) down to the raw nn.Module."""
+    while hasattr(model, '_model') and model._model is not model:
+        model = model._model
+    return model
+
+
+class _PrefetchPolicyProxy:
+    """Thread-isolated view of ``policy`` for background ``replay_buffer.sample()`` workers.
+
+    Owns a private eval-mode deepcopy of the underlying ``policy._target_model`` module
+    so ``_forward_learn()`` toggling ``policy._target_model.train()`` or calling
+    ``_target_model.update()`` never races with background sampling threads.
+    """
+
+    def __init__(self, policy: Any) -> None:
+        self._policy = policy
+        src_target = getattr(policy, '_target_model', None)
+        if src_target is not None:
+            self._target_model = copy.deepcopy(_unwrap_model(src_target))
+            self._target_model.eval()
+        else:
+            self._target_model = None
+
+    def sync_from(self, policy: Any) -> None:
+        src_target = getattr(policy, '_target_model', None)
+        if self._target_model is not None and src_target is not None:
+            self._target_model.load_state_dict(_unwrap_model(src_target).state_dict())
+            self._target_model.eval()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._policy, name)
+
+
+class _BackgroundBatchPrefetcher:
+    """Samples training batches on background thread(s) to overlap CPU buffer work with GPU training."""
+
+    def __init__(
+        self,
+        replay_buffer: Any,
+        policy_proxy: _PrefetchPolicyProxy,
+        batch_size: int,
+        min_transitions: int,
+        buffer_rwlock: _RWLock,
+        target_rwlock: _RWLock,
+        num_workers: int = 1,
+        max_queue_size: Optional[int] = None,
+        poll_interval: float = 0.05,
+    ) -> None:
+        self._replay_buffer = replay_buffer
+        self._policy_proxy = policy_proxy
+        self._batch_size = int(batch_size)
+        self._min_transitions = int(min_transitions)
+        self._buffer_rwlock = buffer_rwlock
+        self._target_rwlock = target_rwlock
+        self.num_workers = max(1, int(num_workers))
+        q_size = int(max_queue_size) if max_queue_size is not None else max(2, self.num_workers * 2)
+        self.max_queue_size = max(1, q_size)
+        self._poll_interval = max(0.01, float(poll_interval))
+        self.queue: 'queue.Queue[Any]' = queue.Queue(maxsize=self.max_queue_size)
+        self._stop_event = threading.Event()
+        self._error_lock = threading.Lock()
+        self._last_error: Optional[BaseException] = None
+        self._threads: List[threading.Thread] = [
+            threading.Thread(
+                target=self._worker_loop,
+                name=f'async-batch-prefetch-{i}',
+                daemon=True,
+            )
+            for i in range(self.num_workers)
+        ]
+
+    @property
+    def last_error(self) -> Optional[BaseException]:
+        with self._error_lock:
+            return self._last_error
+
+    def start(self) -> None:
+        for t in self._threads:
+            t.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        # Drain queue so workers blocked on queue.put() wake up promptly.
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        for t in self._threads:
+            if t.is_alive():
+                t.join(timeout=2.0)
+
+    def get_batch(self, timeout: float = 0.0) -> Optional[Any]:
+        err = self.last_error
+        if err is not None:
+            raise RuntimeError(f'Background batch prefetch worker failed: {err}') from err
+        try:
+            if timeout > 0:
+                return self.queue.get(timeout=timeout)
+            return self.queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                with self._buffer_rwlock.read_lock():
+                    sampleable = self._replay_buffer.get_num_of_sampleable_transitions()
+                    total_in_buf = self._replay_buffer.get_num_of_transitions()
+                    if sampleable < self._min_transitions or total_in_buf <= self._batch_size:
+                        batch = None
+                    else:
+                        with self._target_rwlock.read_lock():
+                            batch = self._replay_buffer.sample(self._batch_size, self._policy_proxy)
+            except Exception as exc:
+                with self._error_lock:
+                    if self._last_error is None:
+                        self._last_error = exc
+                logging.error(f'[AsyncLearner] Batch prefetch worker error: {exc}')
+                self._stop_event.set()
+                return
+
+            if batch is None:
+                self._stop_event.wait(self._poll_interval)
+                continue
+
+            while not self._stop_event.is_set():
+                try:
+                    self.queue.put(batch, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+
 class AsyncLearner:
     """Standalone GPU/CPU learner worker for decoupled MuZero / SampledEfficientZero."""
 
@@ -148,6 +325,8 @@ class AsyncLearner:
         poll_interval: float = 0.25,
         archive_segments: bool = False,
         use_bg_reader: bool = True,
+        prefetch_workers: int = 0,
+        prefetch_queue_size: Optional[int] = None,
     ) -> None:
         self.dirs = AsyncSplitDirs.from_root(run_dir)
         self.dirs.ensure_exists(create_processed=archive_segments)
@@ -156,6 +335,10 @@ class AsyncLearner:
         self.poll_interval = float(poll_interval)
         self.archive_segments = bool(archive_segments)
         self.use_bg_reader = bool(use_bg_reader)
+        self.prefetch_workers = max(0, int(prefetch_workers))
+        self.prefetch_queue_size = (
+            max(1, int(prefetch_queue_size)) if prefetch_queue_size is not None else None
+        )
         self._stop_requested = False
         self._closed = False
 
@@ -210,6 +393,8 @@ class AsyncLearner:
         buffer_cls = _select_game_buffer_cls(self.create_cfg.policy.type)
         self.replay_buffer = buffer_cls(self.cfg.policy)
         env_fn, _, _ = get_vec_env_setting(self.cfg.env)
+        if hasattr(env_fn, 'validate_config'):
+            env_fn.validate_config(self.cfg)
         if hasattr(env_fn, 'reflect_game_segment'):
             self.replay_buffer.reflect_fn = env_fn.reflect_game_segment
 
@@ -232,6 +417,19 @@ class AsyncLearner:
         self._recent_throttled: List[float] = []
         self._last_balance_warn_time = 0.0
         self._bg_reader: Optional[_BackgroundSegmentReader] = None
+        self._buffer_rwlock = _RWLock()
+        self._target_rwlock = _RWLock()
+        self._prefetch_policy_proxy: Optional[_PrefetchPolicyProxy] = None
+        self._batch_prefetcher: Optional[_BackgroundBatchPrefetcher] = None
+        self._target_update_freq = max(
+            1,
+            int(
+                self.cfg.policy.get(
+                    'target_update_freq',
+                    self.cfg.policy.get('target_model_update_freq', 100),
+                )
+            ),
+        )
 
         self.learner.call_hook('before_run')
         # Publish initial weights immediately so actors and evaluator can sync at iter 0.
@@ -251,17 +449,18 @@ class AsyncLearner:
         segments = payload.get('segments', [])
         metas = payload.get('metas', [])
         if segments:
-            before_transitions = self.replay_buffer.get_num_of_transitions()
-            self.replay_buffer.push_game_segments((segments, metas))
-            after_push_transitions = self.replay_buffer.get_num_of_transitions()
-            self.replay_buffer.remove_oldest_data_to_fit()
+            with self._buffer_rwlock.write_lock():
+                before_transitions = self.replay_buffer.get_num_of_transitions()
+                self.replay_buffer.push_game_segments((segments, metas))
+                after_push_transitions = self.replay_buffer.get_num_of_transitions()
+                self.replay_buffer.remove_oldest_data_to_fit()
 
-            raw_transitions = int(payload.get('envsteps', 0))
-            if raw_transitions <= 0:
-                raw_transitions = sum(
-                    self.replay_buffer._game_segment_transition_count(seg) for seg in segments
-                )
-            augmented_transitions = max(raw_transitions, after_push_transitions - before_transitions)
+                raw_transitions = int(payload.get('envsteps', 0))
+                if raw_transitions <= 0:
+                    raw_transitions = sum(
+                        self.replay_buffer._game_segment_transition_count(seg) for seg in segments
+                    )
+                augmented_transitions = max(raw_transitions, after_push_transitions - before_transitions)
             episodes = int(payload.get('episodes', sum(1 for m in metas if bool(m.get('done', False)))))
 
             self.total_ingested_envsteps += raw_transitions
@@ -312,11 +511,49 @@ class AsyncLearner:
             self._ingest_payload(path, payload, stats)
         return stats
 
+    def start_prefetcher(self) -> None:
+        """Start background batch prefetch worker thread(s) when ``prefetch_workers > 0``."""
+        if self.prefetch_workers <= 0 or self._batch_prefetcher is not None:
+            return
+        self._prefetch_policy_proxy = _PrefetchPolicyProxy(self.policy)
+        self._batch_prefetcher = _BackgroundBatchPrefetcher(
+            replay_buffer=self.replay_buffer,
+            policy_proxy=self._prefetch_policy_proxy,
+            batch_size=int(self.cfg.policy.batch_size),
+            min_transitions=self.throttler.min_transitions,
+            buffer_rwlock=self._buffer_rwlock,
+            target_rwlock=self._target_rwlock,
+            num_workers=self.prefetch_workers,
+            max_queue_size=self.prefetch_queue_size,
+            poll_interval=min(0.05, self.poll_interval),
+        )
+        self._batch_prefetcher.start()
+        logging.info(
+            f'[AsyncLearner] Started background batch prefetcher '
+            f'(workers={self._batch_prefetcher.num_workers}, '
+            f'queue_size={self._batch_prefetcher.max_queue_size})'
+        )
+
+    def _sync_prefetch_target_model(self) -> None:
+        if self._prefetch_policy_proxy is None:
+            return
+        with self._target_rwlock.write_lock():
+            self._prefetch_policy_proxy.sync_from(self.policy)
+
+    def _sample_train_batch(self, batch_size: int) -> Any:
+        if self._batch_prefetcher is not None:
+            batch = self._batch_prefetcher.get_batch(timeout=0.05)
+            if batch is not None:
+                return batch
+        with self._buffer_rwlock.read_lock():
+            return self.replay_buffer.sample(batch_size, self.policy)
+
     def train_step(self) -> Optional[Dict[str, Any]]:
         """Run one gradient update if warmup and replay-ratio constraints allow."""
         batch_size = int(self.cfg.policy.batch_size)
-        sampleable = self.replay_buffer.get_num_of_sampleable_transitions()
-        total_in_buf = self.replay_buffer.get_num_of_transitions()
+        with self._buffer_rwlock.read_lock():
+            sampleable = self.replay_buffer.get_num_of_sampleable_transitions()
+            total_in_buf = self.replay_buffer.get_num_of_transitions()
         allowed, reason = self.throttler.can_update(sampleable)
         if not allowed or total_in_buf <= batch_size:
             return None
@@ -329,14 +566,18 @@ class AsyncLearner:
                 trained_steps=int(self.learner.train_iter),
             )
         )
-        train_data = self.replay_buffer.sample(batch_size, self.policy)
+        train_data = self._sample_train_batch(batch_size)
         log_vars = self.learner.train(train_data, self.total_ingested_envsteps)
 
         if self.cfg.policy.use_priority and log_vars and 'value_priority_orig' in log_vars[0]:
-            self.replay_buffer.update_priority(train_data, log_vars[0]['value_priority_orig'])
+            with self._buffer_rwlock.write_lock():
+                self.replay_buffer.update_priority(train_data, log_vars[0]['value_priority_orig'])
 
         self.throttler.record_update(1)
         cur_iter = int(self.learner.train_iter)
+
+        if self._prefetch_policy_proxy is not None and cur_iter % self._target_update_freq == 0:
+            self._sync_prefetch_target_model()
 
         if cur_iter - self._last_published_iter >= self.publish_every_n_updates:
             self.publish_current_weights()
@@ -409,6 +650,10 @@ class AsyncLearner:
         if self._recent_weight_lags:
             mean_lag = sum(self._recent_weight_lags) / len(self._recent_weight_lags)
             self.tb_logger.add_scalar('async_learner/weight_lag_mean', mean_lag, cur_iter)
+        if self._batch_prefetcher is not None:
+            self.tb_logger.add_scalar(
+                'async_learner/prefetch_queue_size', self._batch_prefetcher.queue.qsize(), cur_iter
+            )
         rss_mb = psutil.Process(os.getpid()).memory_info().rss / (1024.0 * 1024.0)
         self.tb_logger.add_scalar('async_learner/rss_mb', rss_mb, cur_iter)
 
@@ -432,6 +677,8 @@ class AsyncLearner:
                 self.dirs.incoming_dir, poll_interval=self.poll_interval
             )
             self._bg_reader.start()
+
+        self.start_prefetcher()
 
         last_progress_time = time.time()
         last_throttle_log_time = 0.0
@@ -494,6 +741,9 @@ class AsyncLearner:
         if self._closed:
             return
         self._closed = True
+        if self._batch_prefetcher is not None:
+            self._batch_prefetcher.stop()
+            self._batch_prefetcher = None
         if self._bg_reader is not None:
             self._bg_reader.stop()
             self._bg_reader = None

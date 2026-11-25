@@ -77,6 +77,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_learner.add_argument('--max-idle-seconds', type=float, default=None, help='Optional idle timeout before exiting.')
     p_learner.add_argument('--archive-segments', action='store_true', help='Move consumed segments to segments/processed/ instead of deleting.')
     p_learner.add_argument('--no-bg-reader', action='store_true', help='Disable background disk reader thread.')
+    p_learner.add_argument(
+        '--prefetch-workers',
+        type=int,
+        default=0,
+        help='Number of background replay-buffer batch prefetch worker threads (0 disables).',
+    )
+    p_learner.add_argument(
+        '--prefetch-queue-size',
+        type=int,
+        default=None,
+        help='Max queued prefetched batches (defaults to max(2, prefetch_workers * 2)).',
+    )
 
     # --- evaluator ---
     p_eval = sub.add_parser('evaluator', help='Run the standalone async evaluator worker.')
@@ -117,6 +129,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument('--eval-min-iter-gap', type=int, default=500)
     p_launch.add_argument('--no-evaluator', action='store_true')
     p_launch.add_argument('--env-manager', default=None, choices=['base', 'subprocess'])
+    p_launch.add_argument(
+        '--prefetch-workers',
+        type=int,
+        default=0,
+        help='Number of background replay-buffer batch prefetch worker threads on learner (0 disables).',
+    )
+    p_launch.add_argument(
+        '--prefetch-queue-size',
+        type=int,
+        default=None,
+        help='Max queued prefetched batches on learner (defaults to max(2, prefetch_workers * 2)).',
+    )
 
     return parser
 
@@ -154,6 +178,10 @@ def _run_launch(args: argparse.Namespace) -> int:
         learner_cmd += ['--model-path', args.model_path]
     if args.min_transitions is not None:
         learner_cmd += ['--min-transitions', str(args.min_transitions)]
+    if args.prefetch_workers and int(args.prefetch_workers) > 0:
+        learner_cmd += ['--prefetch-workers', str(args.prefetch_workers)]
+    if args.prefetch_queue_size is not None:
+        learner_cmd += ['--prefetch-queue-size', str(args.prefetch_queue_size)]
 
     learner_proc = _spawn('learner', learner_cmd)
 
@@ -277,6 +305,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             poll_interval=args.poll_interval,
             archive_segments=args.archive_segments,
             use_bg_reader=not args.no_bg_reader,
+            prefetch_workers=args.prefetch_workers,
+            prefetch_queue_size=args.prefetch_queue_size,
         )
         learner.run(
             max_train_iter=args.max_train_iter,

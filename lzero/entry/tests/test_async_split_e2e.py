@@ -124,6 +124,7 @@ def _make_tiny_galcon_async_cfg() -> Tuple[EasyDict, EasyDict]:
                 fixed_temperature_value=1.0,
                 reanalyze_ratio=0.0,
                 td_steps=4,
+                allow_episode_horizon_mismatch=True,
                 discount_factor=0.99,
                 num_unroll_steps=2,
                 lstm_horizon_len=2,
