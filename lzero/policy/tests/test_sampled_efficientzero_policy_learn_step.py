@@ -296,3 +296,77 @@ class TestSampledEfficientZeroPolicyLearn:
             assert np.isclose(out_on[key], out_off[key], atol=1e-6)
         for p1, p2 in zip(policy_on._learn_model.parameters(), policy_off._learn_model.parameters()):
             assert torch.allclose(p1, p2, atol=1e-6)
+
+    @pytest.mark.parametrize("policy_loss_type", ["cross_entropy", "KL"])
+    def test_vectorized_policy_loss_disc_matches_reference_loop_and_handles_all_zero_mask(self, policy_loss_type):
+        """Verify vectorized _calculate_policy_loss_disc matches the scalar loop reference
+        for loss, gradients, and target_policy_entropy (including partial & all-zero masks and -1 dummy slots).
+        """
+        cfg = _make_test_policy_and_buffer_cfg(grid_h=2, grid_w=2, channels=4, num_sampled_actions=4)
+        cfg.policy_loss_type = policy_loss_type
+        cfg.normalize_prob_of_sampled_actions = False
+        policy = SampledEfficientZeroPolicy(cfg)
+        policy._init_learn()
+
+        B, U, K = 4, 2, 4
+        A = cfg.model.action_space_size
+        torch.manual_seed(7)
+        logits_vec = torch.randn(B, A, requires_grad=True)
+        logits_ref = logits_vec.detach().clone().requires_grad_(True)
+
+        target_policy = torch.tensor(
+            [[[0.5, 0.3, 0.2, 0.0], [0.25, 0.25, 0.25, 0.25]],
+             [[0.8, 0.2, 0.0, 0.0], [0.6, 0.4, 0.0, 0.0]],
+             [[0.4, 0.4, 0.1, 0.1], [0.7, 0.2, 0.1, 0.0]],
+             [[1.0, 0.0, 0.0, 0.0], [0.5, 0.5, 0.0, 0.0]]],
+            dtype=torch.float32,
+        )
+        mask_batch = torch.tensor(
+            [[1.0, 0.0], [0.0, 0.0], [1.0, 0.0], [1.0, 0.0]], dtype=torch.float32
+        )
+        actions_3d = torch.tensor(
+            [[[0, 3, 5, -1], [1, 2, 3, 4]],
+             [[2, 4, -1, -1], [0, 1, -1, -1]],
+             [[1, 2, 6, 7], [3, 4, 5, -1]],
+             [[0, -1, -1, -1], [2, 5, -1, -1]]],
+            dtype=torch.long,
+        ).unsqueeze(-1)
+
+        # Unroll step 0: partial mask [1, 0, 1, 1]
+        loss_vec, pe_vec, pel_vec, tpe_vec, _ = policy._calculate_policy_loss_disc(
+            torch.zeros(B), logits_vec, target_policy, mask_batch, actions_3d, unroll_step=0
+        )
+
+        # Reference scalar-loop calculation
+        prob_ref = torch.softmax(logits_ref, dim=-1)
+        tnvc = target_policy[:, 0]
+        tnvc_masked = torch.index_select(tnvc, 0, torch.nonzero(mask_batch[:, 0]).squeeze(-1))
+        tpe_ref = -((tnvc_masked + 1e-6) * (tnvc_masked + 1e-6).log()).sum(-1).mean()
+        tsa = actions_3d[:, 0]
+        log_probs_ref = []
+        for k in range(K):
+            ai = tsa[:, k].reshape(-1).long()
+            iv = (ai >= 0).float()
+            si = torch.where(ai < 0, torch.zeros_like(ai), ai)
+            rp = prob_ref.gather(-1, si.unsqueeze(-1)).squeeze(-1)
+            log_probs_ref.append(torch.log(rp + 1e-6) * iv)
+        log_probs_ref = torch.stack(log_probs_ref, dim=-1)
+        tlogp = torch.log(tnvc + 1e-6)
+        if policy_loss_type == "KL":
+            loss_ref = (torch.exp(tlogp.detach()) * (tlogp.detach() - log_probs_ref)).sum(-1) * mask_batch[:, 0]
+        else:
+            loss_ref = -torch.sum(torch.exp(tlogp.detach()) * log_probs_ref, 1) * mask_batch[:, 0]
+
+        assert torch.allclose(loss_vec, loss_ref, atol=1e-6)
+        assert torch.allclose(tpe_vec, tpe_ref, atol=1e-6)
+
+        loss_vec.sum().backward()
+        loss_ref.sum().backward()
+        assert torch.allclose(logits_vec.grad, logits_ref.grad, atol=1e-6)
+
+        # Unroll step 1: all-zero mask -> finite 0.0 loss and 0.0 target_policy_entropy (no NaN)
+        loss_zero, _, _, tpe_zero, _ = policy._calculate_policy_loss_disc(
+            torch.zeros(B), logits_vec.detach(), target_policy, mask_batch, actions_3d, unroll_step=1
+        )
+        assert torch.allclose(loss_zero, torch.zeros(B))
+        assert float(tpe_zero) == 0.0

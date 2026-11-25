@@ -802,13 +802,17 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         target_normalized_visit_count = target_policy[:, unroll_step]
 
         # Note: The target_policy_entropy is just for debugging.
-        target_normalized_visit_count_masked = torch.index_select(
-            target_normalized_visit_count, 0,
-            torch.nonzero(mask_batch[:, unroll_step]).squeeze(-1)
+        # Compute masked mean without torch.nonzero() to avoid mid-unroll GPU->CPU syncs.
+        step_mask = (mask_batch[:, unroll_step] != 0).to(target_normalized_visit_count.dtype)
+        row_target_entropy = -(
+            (target_normalized_visit_count + 1e-6) * (target_normalized_visit_count + 1e-6).log()
+        ).sum(-1)
+        valid_count = step_mask.sum()
+        target_policy_entropy = torch.where(
+            valid_count > 0,
+            (row_target_entropy * step_mask).sum() / valid_count.clamp_min(1.0),
+            torch.zeros((), device=target_normalized_visit_count.device, dtype=target_normalized_visit_count.dtype),
         )
-
-        target_policy_entropy = -((target_normalized_visit_count_masked + 1e-6) * (
-                    target_normalized_visit_count_masked + 1e-6).log()).sum(-1).mean()
 
         # shape: (batch_size, num_unroll_steps, num_of_sampled_actions, action_dim) -> (batch_size,
         # num_of_sampled_actions, action_dim) e.g. (4, 6, 20, 2) ->  (4, 20, 2)
@@ -824,30 +828,15 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         # numerical stability.
         target_log_prob_sampled_actions = torch.log(target_normalized_visit_count + 1e-6)
 
-        log_prob_sampled_actions = []
-        for k in range(self._cfg.model.num_of_sampled_actions):
-            # 1. Identify which actions are dummy padding (-1).
-            # ptree produces (batch_size, K) while ctree produces (batch_size, K, 1);
-            # reshape(-1) normalizes both to (batch_size,).
-            action_indices = target_sampled_actions[:, k].reshape(-1).long()
-            is_valid = (action_indices >= 0).float()
-            
-            # 2. Redirect dummy actions to index 0 to avoid CUDA index-out-of-bounds
-            safe_indices = torch.where(action_indices < 0, torch.zeros_like(action_indices), action_indices)
-            
-            # 3. Gather probability from the policy logits
-            # prob shape: (batch_size, action_space_size)
-            # gather result shape: (batch_size, 1)
-            raw_prob = prob.gather(-1, safe_indices.unsqueeze(-1)).squeeze(-1)
-            
-            # 4. Calculate log_prob and mask out the dummy actions
-            # Adding 1e-6 for stability; multiplying by is_valid zeros out the dummy contributions
-            log_prob = torch.log(raw_prob + 1e-6) * is_valid
-            
-            log_prob_sampled_actions.append(log_prob)
-
-        # (batch_size, num_of_sampled_actions) e.g. (4,20)
-        log_prob_sampled_actions = torch.stack(log_prob_sampled_actions, dim=-1)
+        # Vectorized gather over all K sampled actions:
+        # ptree produces (batch_size, K) while ctree produces (batch_size, K, 1).
+        action_indices = target_sampled_actions.reshape(policy_logits.size(0), -1).long()
+        is_valid = (action_indices >= 0).to(prob.dtype)
+        # Redirect dummy actions (-1) to index 0 to avoid CUDA index-out-of-bounds.
+        safe_indices = action_indices.clamp_min(0)
+        raw_prob = prob.gather(-1, safe_indices)
+        # Adding 1e-6 for stability; multiplying by is_valid zeros out dummy contributions.
+        log_prob_sampled_actions = torch.log(raw_prob + 1e-6) * is_valid
 
         if self._cfg.normalize_prob_of_sampled_actions:
             # normalize the prob of sampled actions
