@@ -143,6 +143,51 @@ class TestAsyncSplitPrefetchPrimitives:
         args_default = parser.parse_args(['learner'])
         assert args_default.prefetch_workers == 0
 
+    def test_launch_default_worker_thread_env(self):
+        from lzero.entry.async_split.cli import (
+            _build_worker_env,
+            _compute_default_worker_threads,
+            build_parser,
+        )
+
+        # 32 CPUs, 4 actors + 1 eval + 1 learner = 6 workers -> min(4, 32 // 6) = 4
+        assert _compute_default_worker_threads(num_actors=4, include_evaluator=True, cpu_count=32) == 4
+        # 16 CPUs, 6 workers -> 2
+        assert _compute_default_worker_threads(num_actors=4, include_evaluator=True, cpu_count=16) == 2
+        # 4 CPUs, 6 workers -> floor at 1
+        assert _compute_default_worker_threads(num_actors=4, include_evaluator=True, cpu_count=4) == 1
+
+        # Defaults populate unset OMP/MKL/OPENBLAS without clobbering caller-provided vars
+        env_auto = _build_worker_env(
+            num_actors=4,
+            include_evaluator=True,
+            worker_threads=None,
+            base_env={'PATH': '/usr/bin', 'OMP_NUM_THREADS': '2'},
+            cpu_count=32,
+        )
+        assert env_auto['OMP_NUM_THREADS'] == '2'
+        assert env_auto['MKL_NUM_THREADS'] == '4'
+        assert env_auto['OPENBLAS_NUM_THREADS'] == '4'
+
+        # Explicit --worker-threads overrides all three
+        env_override = _build_worker_env(
+            num_actors=4,
+            include_evaluator=True,
+            worker_threads=3,
+            base_env={'OMP_NUM_THREADS': '16'},
+            cpu_count=32,
+        )
+        assert env_override['OMP_NUM_THREADS'] == '3'
+        assert env_override['MKL_NUM_THREADS'] == '3'
+        assert env_override['OPENBLAS_NUM_THREADS'] == '3'
+
+        with pytest.raises(ValueError):
+            _build_worker_env(num_actors=4, worker_threads=0, base_env={})
+
+        parser = build_parser()
+        assert parser.parse_args(['launch']).worker_threads is None
+        assert parser.parse_args(['launch', '--worker-threads', '3']).worker_threads == 3
+
 
 @pytest.mark.unittest
 class TestAsyncLearnerPrefetchIntegration:

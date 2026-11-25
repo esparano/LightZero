@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ditk import logging
 
@@ -24,10 +24,57 @@ from .io_utils import AsyncSplitDirs, load_config_from_py
 from .learner import AsyncLearner
 
 DEFAULT_GALCON_CONFIG = 'zoo/board_games/galcon/config/galcon_sez_sp_mode_config_SIMPLE.py'
+_THREAD_ENV_VARS = ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS')
 
 
 def _resolve_run_dir(run_dir: Optional[str], cfg) -> str:
     return run_dir if run_dir else str(cfg.exp_name)
+
+
+def _compute_default_worker_threads(
+    num_actors: int,
+    include_evaluator: bool = True,
+    cpu_count: Optional[int] = None,
+) -> int:
+    """Choose a conservative per-worker BLAS/OpenMP thread cap so multi-actor runs
+    do not oversubscribe CPU cores when OMP_NUM_THREADS is unset.
+    """
+    cpus = max(1, int(cpu_count if cpu_count is not None else (os.cpu_count() or 1)))
+    total_workers = max(1, max(0, int(num_actors)) + (1 if include_evaluator else 0) + 1)
+    return max(1, min(4, cpus // total_workers))
+
+
+def _build_worker_env(
+    num_actors: int,
+    include_evaluator: bool = True,
+    worker_threads: Optional[int] = None,
+    base_env: Optional[Mapping[str, str]] = None,
+    cpu_count: Optional[int] = None,
+) -> Dict[str, str]:
+    """Build subprocess env with sensible default OpenMP/BLAS thread caps.
+
+    - If ``worker_threads`` is explicitly provided (> 0), it overrides all thread vars.
+    - Otherwise, any variable already present in ``base_env`` is preserved, and missing
+      ones default to ``_compute_default_worker_threads(...)``.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    if worker_threads is not None:
+        if int(worker_threads) <= 0:
+            raise ValueError(f'worker_threads must be >= 1, got {worker_threads}')
+        val = str(int(worker_threads))
+        for var in _THREAD_ENV_VARS:
+            env[var] = val
+    else:
+        default_val = str(
+            _compute_default_worker_threads(
+                num_actors=num_actors,
+                include_evaluator=include_evaluator,
+                cpu_count=cpu_count,
+            )
+        )
+        for var in _THREAD_ENV_VARS:
+            env.setdefault(var, default_val)
+    return env
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -141,6 +188,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help='Max queued prefetched batches on learner (defaults to max(2, prefetch_workers * 2)).',
     )
+    p_launch.add_argument(
+        '--worker-threads',
+        type=int,
+        default=None,
+        help=(
+            'Per-worker OMP/MKL/OPENBLAS thread cap. When omitted, respects existing '
+            'OMP/MKL/OPENBLAS env vars and defaults unset ones to min(4, max(1, cpus // total_workers)).'
+        ),
+    )
 
     return parser
 
@@ -153,13 +209,25 @@ def _run_launch(args: argparse.Namespace) -> int:
     proc_log_dir = dirs.log_dir / 'procs'
     proc_log_dir.mkdir(parents=True, exist_ok=True)
 
+    worker_env = _build_worker_env(
+        num_actors=int(args.num_actors),
+        include_evaluator=not bool(args.no_evaluator),
+        worker_threads=args.worker_threads,
+    )
+    logging.info(
+        f'[Launcher] Worker thread env: '
+        f'OMP_NUM_THREADS={worker_env["OMP_NUM_THREADS"]}, '
+        f'MKL_NUM_THREADS={worker_env["MKL_NUM_THREADS"]}, '
+        f'OPENBLAS_NUM_THREADS={worker_env["OPENBLAS_NUM_THREADS"]}'
+    )
+
     base_cmd = [sys.executable, '-m', 'lzero.entry.async_split']
     procs: List[Tuple[str, subprocess.Popen, object]] = []
 
     def _spawn(name: str, cmd: List[str]) -> subprocess.Popen:
         log_file = open(proc_log_dir / f'{name}.log', 'w', encoding='utf-8')
         logging.info(f'[Launcher] Starting {name}: {" ".join(cmd)}')
-        proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=worker_env)
         procs.append((name, proc, log_file))
         return proc
 
