@@ -92,6 +92,16 @@ def atomic_torch_save(payload: Any, target_path: os.PathLike | str) -> Path:
     return target
 
 
+def find_non_finite_tensors(state_dict: Dict[str, Any]) -> List[str]:
+    """Return keys of any floating-point tensors containing NaN or Inf values."""
+    bad_keys: List[str] = []
+    for k, v in state_dict.items():
+        if torch.is_tensor(v) and v.is_floating_point():
+            if not bool(torch.isfinite(v).all().item()):
+                bad_keys.append(str(k))
+    return bad_keys
+
+
 def publish_weights(
     weights_path: os.PathLike | str,
     model_state_dict: Dict[str, Any],
@@ -99,9 +109,22 @@ def publish_weights(
     envstep: int,
     extra_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Atomically publish CPU model weights + metadata for actors and evaluator."""
+    """Atomically publish CPU model weights + metadata for actors and evaluator.
+
+    Raises FloatingPointError without touching ``weights_path`` if any floating-point
+    tensor contains NaN/Inf, preventing corrupted weights from segfaulting C++ MCTS actors.
+    """
+    cpu_sd = cpu_state_dict(model_state_dict)
+    bad_keys = find_non_finite_tensors(cpu_sd)
+    if bad_keys:
+        preview = ', '.join(bad_keys[:5])
+        suffix = f' (+{len(bad_keys) - 5} more)' if len(bad_keys) > 5 else ''
+        raise FloatingPointError(
+            f'Refusing to publish non-finite weights at train_iter={int(train_iter)} '
+            f'({len(bad_keys)} bad tensors: {preview}{suffix}).'
+        )
     payload: Dict[str, Any] = {
-        'model': cpu_state_dict(model_state_dict),
+        'model': cpu_sd,
         'train_iter': int(train_iter),
         'version': int(train_iter),
         'envstep': int(envstep),
