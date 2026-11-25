@@ -140,6 +140,9 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             policy_head_type='flat',
             # (int) Per-cell source/target embedding dimension used when ``policy_head_type='factored_spatial'``.
             policy_head_embed_dim=32,
+            # (Optional[Sequence[int]]) Optional hidden widths for the PASS MLP in ``factored_spatial`` mode.
+            # When None, derives a compact width from ``policy_head_hidden_channels`` capped at max(2 * C_p, 64).
+            policy_head_pass_hidden_channels=None,
         ),
         # ****** common ******
         # (bool) Whether to use multi-gpu training.

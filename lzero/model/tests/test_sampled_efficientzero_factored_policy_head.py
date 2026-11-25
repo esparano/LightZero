@@ -26,7 +26,9 @@ def _make_sez_model(
     norm_type='LN',
     downsample=False,
     continuous_action_space=False,
+    policy_head_channels=6,
     policy_head_hidden_channels=(32,),
+    policy_head_pass_hidden_channels=None,
 ):
     if action_space_size is None:
         h, w = obs_shape[1], obs_shape[2]
@@ -40,7 +42,7 @@ def _make_sez_model(
         lstm_hidden_size=16,
         reward_head_channels=4,
         value_head_channels=4,
-        policy_head_channels=6,
+        policy_head_channels=policy_head_channels,
         reward_head_hidden_channels=[16],
         value_head_hidden_channels=[16],
         policy_head_hidden_channels=list(policy_head_hidden_channels),
@@ -61,6 +63,7 @@ def _make_sez_model(
         embedded_action_dim=8,
         policy_head_type=policy_head_type,
         policy_head_embed_dim=policy_head_embed_dim,
+        policy_head_pass_hidden_channels=policy_head_pass_hidden_channels,
     )
 
 
@@ -208,14 +211,15 @@ class TestFactoredSpatialPolicyHead:
         with pytest.raises(ValueError, match='discrete action spaces'):
             _make_sez_model(continuous_action_space=True, policy_head_type='factored_spatial')
 
-        # downsample=True not supported (use valid 64x64 Atari obs shape to hit the downsample check)
-        with pytest.raises(ValueError, match='downsample=False'):
-            _make_sez_model(
-                obs_shape=(4, 64, 64),
-                action_space_size=1 + (64 * 64) ** 2,
-                downsample=True,
-                policy_head_type='factored_spatial',
-            )
+        # downsample=True fails fast on both non-Atari grids (e.g. 4x4) and Atari grids (64x64)
+        for obs_shape, act_size in [((8, 4, 4), 257), ((4, 64, 64), 1 + (64 * 64) ** 2)]:
+            with pytest.raises(ValueError, match='downsample=False'):
+                _make_sez_model(
+                    obs_shape=obs_shape,
+                    action_space_size=act_size,
+                    downsample=True,
+                    policy_head_type='factored_spatial',
+                )
 
         # action_space_size - 1 must be a positive multiple of (H * W)^2
         for bad_action_size in [1, 256, 258, 300, 512]:
@@ -582,10 +586,41 @@ class TestFactoredSpatialPolicyHead:
         )[0]
         assert obs0['action_mask'][int(eval_out['action'])] == 1
 
+    def test_pass_mlp_width_cap_and_explicit_override(self):
+        # Legacy flat-head width [512] is automatically capped to max(2 * C_p, 64) = 64
+        m_capped = _make_sez_model(
+            policy_head_channels=16,
+            policy_head_hidden_channels=[512],
+            policy_head_pass_hidden_channels=None,
+        )
+        capped_linears = [m for m in m_capped.prediction_network.fc_policy_head.pass_head.modules() if isinstance(m, nn.Linear)]
+        assert capped_linears[0].in_features == 32
+        assert capped_linears[0].out_features == 64
+        assert capped_linears[-1].out_features == 1
+
+        # Smaller policy_head_hidden_channels ([16]) are preserved verbatim
+        m_small = _make_sez_model(
+            policy_head_channels=6,
+            policy_head_hidden_channels=[16],
+            policy_head_pass_hidden_channels=None,
+        )
+        small_linears = [m for m in m_small.prediction_network.fc_policy_head.pass_head.modules() if isinstance(m, nn.Linear)]
+        assert small_linears[0].out_features == 16
+
+        # Explicit policy_head_pass_hidden_channels overrides the default cap
+        m_override = _make_sez_model(
+            policy_head_channels=16,
+            policy_head_hidden_channels=[512],
+            policy_head_pass_hidden_channels=[256],
+        )
+        override_linears = [m for m in m_override.prediction_network.fc_policy_head.pass_head.modules() if isinstance(m, nn.Linear)]
+        assert override_linears[0].out_features == 256
+
     def test_default_flat_policy_head_unchanged(self):
         default_model_cfg = SampledEfficientZeroPolicy.default_config().model
         assert default_model_cfg.policy_head_type == 'flat'
         assert default_model_cfg.policy_head_embed_dim == 32
+        assert default_model_cfg.policy_head_pass_hidden_channels is None
 
         # Default discrete model matches explicit policy_head_type='flat' bit-for-bit
         torch.manual_seed(99)

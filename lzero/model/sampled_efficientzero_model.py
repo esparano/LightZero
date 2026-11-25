@@ -56,6 +56,7 @@ class SampledEfficientZeroModel(nn.Module):
             embedded_action_dim: int = 32,
             policy_head_type: str = 'flat',
             policy_head_embed_dim: int = 32,
+            policy_head_pass_hidden_channels: Optional[SequenceType] = None,
             *args,
             **kwargs,
     ):
@@ -112,6 +113,9 @@ class SampledEfficientZeroModel(nn.Module):
                 Default sets it to 'flat'. Options are {'flat', 'factored_spatial'}.
             - policy_head_embed_dim (:obj:`int`): Per-cell source/target embedding dimension when \
                 ``policy_head_type='factored_spatial'``. Default sets it to 32.
+            - policy_head_pass_hidden_channels (:obj:`Optional[SequenceType]`): Optional hidden layer sizes \
+                for the PASS MLP when ``policy_head_type='factored_spatial'``. If ``None``, derives a compact \
+                width from ``policy_head_hidden_channels`` capped at ``max(2 * policy_head_channels, 64)``.
         """
         super(SampledEfficientZeroModel, self).__init__()
         if policy_head_type not in ('flat', 'factored_spatial'):
@@ -119,13 +123,22 @@ class SampledEfficientZeroModel(nn.Module):
                 f"Unsupported policy_head_type='{policy_head_type}'. "
                 f"Expected one of ('flat', 'factored_spatial')."
             )
-        if policy_head_type == 'factored_spatial' and (
-            isinstance(observation_shape, int) or len(observation_shape) != 3
-        ):
-            raise ValueError(
-                f"policy_head_type='factored_spatial' requires a 3D (C, H, W) observation_shape, "
-                f"got {observation_shape}."
-            )
+        if policy_head_type == 'factored_spatial':
+            if continuous_action_space:
+                raise ValueError(
+                    "policy_head_type='factored_spatial' only supports discrete action spaces "
+                    "(continuous_action_space=False)."
+                )
+            if downsample:
+                raise ValueError(
+                    "policy_head_type='factored_spatial' requires downsample=False so latent (H, W) "
+                    "matches the action grid."
+                )
+            if isinstance(observation_shape, int) or len(observation_shape) != 3:
+                raise ValueError(
+                    f"policy_head_type='factored_spatial' requires a 3D (C, H, W) observation_shape, "
+                    f"got {observation_shape}."
+                )
         if isinstance(observation_shape, int) or len(observation_shape) == 1:
             # for vector obs input, e.g. classical control and box2d environments
             # to be compatible with LightZero model/policy, transform to shape: [C, W, H]
@@ -171,6 +184,7 @@ class SampledEfficientZeroModel(nn.Module):
         self.num_of_sampled_actions = num_of_sampled_actions
         self.policy_head_type = policy_head_type
         self.policy_head_embed_dim = policy_head_embed_dim
+        self.policy_head_pass_hidden_channels = policy_head_pass_hidden_channels
 
         if downsample:
             if observation_shape[1] == 96:
@@ -248,6 +262,7 @@ class SampledEfficientZeroModel(nn.Module):
             norm_type=self.norm_type,
             policy_head_type=self.policy_head_type,
             policy_head_embed_dim=self.policy_head_embed_dim,
+            policy_head_pass_hidden_channels=self.policy_head_pass_hidden_channels,
         )
 
         if self.self_supervised_learning_loss:
@@ -679,6 +694,7 @@ class PredictionNetwork(nn.Module):
             norm_type: str = 'LN',
             policy_head_type: str = 'flat',
             policy_head_embed_dim: int = 32,
+            policy_head_pass_hidden_channels: Optional[SequenceType] = None,
     ):
         """
         Overview:
@@ -714,6 +730,9 @@ class PredictionNetwork(nn.Module):
                 Default sets it to 'flat'. Options are {'flat', 'factored_spatial'}.
             - policy_head_embed_dim (:obj:`int`): Per-cell source/target embedding dimension when \
                 ``policy_head_type='factored_spatial'``. Default sets it to 32.
+            - policy_head_pass_hidden_channels (:obj:`Optional[SequenceType]`): Optional hidden layer sizes \
+                for the PASS MLP when ``policy_head_type='factored_spatial'``. If ``None``, derives a compact \
+                width from ``policy_head_hidden_channels`` capped at ``max(2 * policy_head_channels, 64)``.
         """
         super().__init__()
         if policy_head_type not in ('flat', 'factored_spatial'):
@@ -731,6 +750,7 @@ class PredictionNetwork(nn.Module):
         self.activation = activation
         self.policy_head_type = policy_head_type
         self.policy_head_embed_dim = policy_head_embed_dim
+        self.policy_head_pass_hidden_channels = policy_head_pass_hidden_channels
 
         self.resblocks = nn.ModuleList(
             [
@@ -790,13 +810,18 @@ class PredictionNetwork(nn.Module):
                     f"policy_head_type='factored_spatial' requires a 3D (C, H, W) observation_shape, "
                     f"got {observation_shape}."
                 )
+            if policy_head_pass_hidden_channels is not None:
+                pass_hidden_channels = list(policy_head_pass_hidden_channels)
+            else:
+                pass_hidden_cap = max(2 * policy_head_channels, 64)
+                pass_hidden_channels = [min(int(h), pass_hidden_cap) for h in policy_head_hidden_channels]
             self.fc_policy_head = FactoredSpatialPolicyHead(
                 in_channels=policy_head_channels,
                 grid_height=int(observation_shape[1]),
                 grid_width=int(observation_shape[2]),
                 action_space_size=action_space_size,
                 embed_dim=self.policy_head_embed_dim,
-                pass_hidden_channels=policy_head_hidden_channels,
+                pass_hidden_channels=pass_hidden_channels,
                 activation=activation,
                 norm_type=self.norm_type,
                 last_linear_layer_init_zero=last_linear_layer_init_zero,
