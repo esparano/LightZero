@@ -373,4 +373,10 @@ Experiment Backlog / TODOs
     - Extending to send percentages (e.g., 25%/50%/75%/100%):
       - Small/medium grids (e.g., 8x8, N=64): add P discrete percentage buckets as num_pair_layers = P (action_space_size = 1 + P * N^2), with one factored (u, v, s, t, b_{|dy|,|dx|}) layer per percentage — tiny param count, preserves 4x reflection symmetry, and requires zero MCTS or policy-loss changes.
       - Larger grids (e.g., 16x10 or 20x12, where P * N^2 is too big to materialize flat): factor autoregressively as P(src, dst, pct) = P(src, dst) * P(pct | u_src, v_dst, |dy|, |dx|), reusing the same spatial (u, v) embeddings to feed a small discrete or continuous percentage head (requires sampling (src, dst) then pct in SEZ).
+[ ] Scaling from prototyping (SIMPLE_1map) toward strong / superhuman general Galcon play:
+    - Model capacity: Scale trunk up from SIMPLE's tiny (num_channels=16, num_res_blocks=3, lstm_hidden_size=32) to num_channels=64-128, num_res_blocks=4-6 (full-board receptive field for 8x8+), lstm_hidden_size=128 so the network can represent multi-fleet timing, feints, and ship-count arithmetic across the map.
+    - Dynamics lookahead horizon: Increase num_unroll_steps from 5 (1.25s) to 8-10 (2.0-2.5s+) to better cover typical 2-6s fleet flight times.
+    - Action sampling & target freshness: Increase K from 8 to 16-32 and enable reanalyze_ratio > 0 once the value network is strong so stale MCTS targets in the replay buffer get refreshed.
+    - Generalization: Switch from single-map (map_seed=2) to true random maps (map_seed=None) with policy_head_type='factored_spatial' (expected ~15M-50M+ envsteps for general superhuman play on random 6-8p maps).
+    - Replay ratio / throughput: Experiment with raising max_replay_ratio above 0.04 (e.g. 0.08-0.12) once actor throughput or reanalysis can support it without overfitting.
       - Future multi-select note: the same bilinear score (u_i . v_dst / sqrt(D) + s_i + b_{|dy|,|dx|}) also extends to AlphaStar-style Bernoulli source gating p(select i | dst) if structured multi-select actions are ever added.
