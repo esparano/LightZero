@@ -280,6 +280,30 @@ class Node:
             distribution.extend([0] * (len(self.sampled_actions) - len(distribution)))
         return distribution
 
+    def get_children_q_values(self, discount_factor: float) -> List[float]:
+        """
+        Overview:
+            Get the minimax-aware Q values for each unique sampled child in legal_actions.
+            Unvisited children emit 0.0; pair with get_children_distribution() to check visit_count > 0.
+        Returns:
+            - q_values (:obj:`List[float]`): Q(root, a) aligned with the unique prefix of sampled_actions.
+        """
+        if not self.expanded or not self.legal_actions:
+            return []
+        players = 1 if self.to_play == -1 else 2
+        q_values = []
+        for a in self.legal_actions:
+            child = self.get_child(a)
+            if child.visit_count == 0:
+                q_values.append(0.0)
+            else:
+                true_reward = child.value_prefix if self.is_reset == 1 else (child.value_prefix - self.value_prefix)
+                if players == 1:
+                    q_values.append(float(true_reward + discount_factor * child.value))
+                else:
+                    q_values.append(float(true_reward + discount_factor * (-child.value)))
+        return q_values
+
     def get_child(self, action: Union[int, float]) -> "Node":
         """
         Overview:
@@ -467,6 +491,13 @@ class Roots:
             distributions.append(self.roots[i].get_children_distribution())
 
         return distributions
+
+    def get_children_q_values(self, discount_factor: float) -> List[List[float]]:
+        """
+        Overview:
+            Get minimax-aware child Q values for each root (aligned with unique sampled children).
+        """
+        return [self.roots[i].get_children_q_values(discount_factor) for i in range(self.root_num)]
 
     # ==============================================================
     # sampled related core code

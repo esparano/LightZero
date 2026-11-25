@@ -22,6 +22,70 @@ from lzero.policy.muzero import MuZeroPolicy
 from .utils import configure_optimizers_nanogpt
 
 
+def compute_completed_q_policy(
+        visit_counts: Union[List, np.ndarray],
+        child_q_values: Union[List, np.ndarray],
+        sampled_actions: np.ndarray,
+        policy_logits: Union[List, np.ndarray],
+        raw_value: float,
+        c_visit: float = 50.0,
+        c_scale: float = 1.0,
+) -> List[float]:
+    """
+    Overview:
+        Compute the Gumbel-style completed-Q improved policy distribution over the K sampled root actions:
+            pi_improved(a) = softmax(prior_logit(a) + sigma(completed_Q(a)))
+        Unvisited unique children are completed with the root mixed value v_mix (zero advantage),
+        and any trailing duplicate padding slots beyond ``len(child_q_values)`` receive probability 0.0.
+    """
+    total_len = len(visit_counts)
+    num_unique = min(len(child_q_values), total_len)
+    if num_unique == 0:
+        return [float(v) for v in visit_counts]
+
+    visits = np.asarray(visit_counts[:num_unique], dtype=np.float64)
+    q_vals = np.asarray(child_q_values[:num_unique], dtype=np.float64)
+    logits_arr = np.asarray(policy_logits, dtype=np.float64)
+
+    act_indices = np.asarray(sampled_actions[:num_unique]).reshape(-1).astype(np.int64)
+    prior_logits = logits_arr[act_indices]
+
+    shifted = prior_logits - np.max(prior_logits)
+    exp_prior = np.exp(shifted)
+    prior_probs = exp_prior / (np.sum(exp_prior) + 1e-12)
+
+    visited_mask = visits > 0
+    sum_visits = float(np.sum(visits))
+    max_visit = float(np.max(visits))
+
+    if sum_visits > 0 and np.any(visited_mask):
+        visited_prior_sum = float(np.sum(prior_probs[visited_mask]))
+        if visited_prior_sum > 1e-12:
+            weighted_q = float(np.sum(prior_probs[visited_mask] * q_vals[visited_mask])) / visited_prior_sum
+        else:
+            weighted_q = float(np.sum(visits[visited_mask] * q_vals[visited_mask])) / sum_visits
+        v_mix = (float(raw_value) + sum_visits * weighted_q) / (1.0 + sum_visits)
+    else:
+        v_mix = float(raw_value)
+
+    completed_q = np.where(visited_mask, q_vals, v_mix)
+
+    # Scale down only if Q-range exceeds 1.0 (unbounded-reward envs); never amplify tiny noise in [-1, 1].
+    q_span = float(np.max(completed_q) - np.min(completed_q))
+    value_scale = max(1.0, q_span)
+    sigma_q = (float(c_visit) + max_visit) * float(c_scale) * (completed_q - v_mix) / value_scale
+
+    improved_logits = prior_logits + sigma_q
+    improved_logits = improved_logits - np.max(improved_logits)
+    improved_exp = np.exp(improved_logits)
+    improved_probs = improved_exp / (np.sum(improved_exp) + 1e-12)
+
+    out = [float(p) for p in improved_probs]
+    if total_len > num_unique:
+        out.extend([0.0] * (total_len - num_unique))
+    return out
+
+
 @POLICY_REGISTRY.register('sampled_efficientzero')
 class SampledEfficientZeroPolicy(MuZeroPolicy):
     """
@@ -137,6 +201,14 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         init_w=3e-3,
         normalize_prob_of_sampled_actions=False,
         policy_loss_type='cross_entropy',  # options={'cross_entropy', 'KL'}
+        # (str) MCTS root policy improvement target:
+        #   - 'visit_count': standard normalized root visit counts (default).
+        #   - 'completed_q': Gumbel-style softmax(prior_logits + sigma(completed_Q)) over unique sampled actions.
+        policy_target_type='visit_count',  # options={'visit_count', 'completed_q'}
+        # (float) c_visit hyperparameter for completed_q sigma(q) = (c_visit + max_visit) * c_scale * (q - v_mix).
+        completed_q_c_visit=50.0,
+        # (float) c_scale hyperparameter for completed_q sigma(q).
+        completed_q_c_scale=1.0,
         # (int) Frequency of target network update.
         target_update_freq=100,
         weight_decay=1e-4,
@@ -798,11 +870,23 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
 
         return policy_loss, policy_entropy, policy_entropy_loss, target_policy_entropy, target_sampled_actions
 
+    def _validate_policy_target_type(self) -> None:
+        target_type = self._cfg.get('policy_target_type', 'visit_count')
+        if target_type not in ('visit_count', 'completed_q'):
+            raise ValueError(
+                f"Unsupported policy_target_type={target_type!r}; expected 'visit_count' or 'completed_q'."
+            )
+        if target_type == 'completed_q' and self._cfg.model.continuous_action_space:
+            raise NotImplementedError(
+                "policy_target_type='completed_q' is currently only supported for discrete action spaces."
+            )
+
     def _init_collect(self) -> None:
         """
           Overview:
               Collect mode init method. Called by ``self.__init__``. Initialize the collect model and MCTS utils.
           """
+        self._validate_policy_target_type()
         self._collect_model = self._model
         if self._cfg.mcts_ctree:
             self._mcts_collect = MCTSCtree(self._cfg)
@@ -903,6 +987,10 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             roots_visit_count_distributions = roots.get_distributions()
             roots_values = roots.get_values()  # shape: {list: batch_size}
             roots_sampled_actions = roots.get_sampled_actions()  # {list: 1}->{list:6}
+            use_completed_q = self._cfg.get('policy_target_type', 'visit_count') == 'completed_q'
+            roots_child_q_values = (
+                roots.get_children_q_values(float(self._cfg.discount_factor)) if use_completed_q else None
+            )
 
             for i, env_id in enumerate(ready_env_id):
                 distributions, value = roots_visit_count_distributions[i], roots_values[i]
@@ -912,6 +1000,17 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                 else:
                     # In ptree, the same method roots.get_sampled_actions() returns an Action object.
                     root_sampled_actions = np.array([action.value for action in roots_sampled_actions[i]])
+
+                if use_completed_q:
+                    distributions = compute_completed_q_policy(
+                        visit_counts=distributions,
+                        child_q_values=roots_child_q_values[i],
+                        sampled_actions=root_sampled_actions,
+                        policy_logits=policy_logits[i],
+                        raw_value=float(np.asarray(pred_values[i]).reshape(-1)[0]),
+                        c_visit=float(self._cfg.get('completed_q_c_visit', 50.0)),
+                        c_scale=float(self._cfg.get('completed_q_c_scale', 1.0)),
+                    )
 
                 # NOTE: Only legal actions possess visit counts, so the ``action_index_in_legal_action_set`` represents
                 # the index within the legal action set, rather than the index in the entire action set.
@@ -954,6 +1053,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
          Overview:
              Evaluate mode init method. Called by ``self.__init__``. Initialize the eval model and MCTS utils.
          """
+        self._validate_policy_target_type()
         self._eval_model = self._model
         if self._cfg.mcts_ctree:
             self._mcts_eval = MCTSCtree(self._cfg)
@@ -1047,6 +1147,10 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             # ==============================================================
             roots_sampled_actions = roots.get_sampled_actions(
             )  # shape: ``{list: batch_size} ->{list: action_space_size}``
+            use_completed_q = self._cfg.get('policy_target_type', 'visit_count') == 'completed_q'
+            roots_child_q_values = (
+                roots.get_children_q_values(float(self._cfg.discount_factor)) if use_completed_q else None
+            )
 
             for i, env_id in enumerate(ready_env_id):
                 distributions, value = roots_visit_count_distributions[i], roots_values[i]
@@ -1055,6 +1159,17 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                 except Exception:
                     # logging.warning('ctree_sampled_efficientzero roots.get_sampled_actions() return list')
                     root_sampled_actions = np.array([action for action in roots_sampled_actions[i]])
+
+                if use_completed_q:
+                    distributions = compute_completed_q_policy(
+                        visit_counts=distributions,
+                        child_q_values=roots_child_q_values[i],
+                        sampled_actions=root_sampled_actions,
+                        policy_logits=policy_logits[i],
+                        raw_value=float(np.asarray(pred_values[i]).reshape(-1)[0]),
+                        c_visit=float(self._cfg.get('completed_q_c_visit', 50.0)),
+                        c_scale=float(self._cfg.get('completed_q_c_scale', 1.0)),
+                    )
                 # NOTE: Only legal actions possess visit counts, so the ``action_index_in_legal_action_set`` represents
                 # the index within the legal action set, rather than the index in the entire action set.
                 # Setting deterministic=True implies choosing the action with the highest value (argmax) rather than sampling during the evaluation phase.

@@ -67,6 +67,9 @@ cdef class Roots:
     def get_distributions(self):
         return self.roots[0].get_distributions()
 
+    def get_children_q_values(self, float discount_factor):
+        return self.roots[0].get_children_q_values(discount_factor)
+
     def get_sampled_actions(self):
         return self.roots[0].get_sampled_actions()
 

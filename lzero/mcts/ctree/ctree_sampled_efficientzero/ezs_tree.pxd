@@ -57,6 +57,7 @@ cdef extern from "lib/cnode.h" namespace "tree":
         float value()
         vector[vector[float]] get_trajectory()
         vector[int] get_children_distribution()
+        vector[float] get_children_q_values(float discount_factor)
         CNode* get_child(CAction action)
 
     cdef cppclass CRoots:
@@ -72,6 +73,7 @@ cdef extern from "lib/cnode.h" namespace "tree":
         void clear()
         vector[vector[vector[float]]] get_trajectories()
         vector[vector[int]] get_distributions()
+        vector[vector[float]] get_children_q_values(float discount_factor)
         vector[vector[vector[float]]] get_sampled_actions()
         vector[float] get_values()
 

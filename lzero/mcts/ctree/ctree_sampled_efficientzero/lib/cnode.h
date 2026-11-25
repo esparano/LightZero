@@ -67,6 +67,7 @@ namespace tree
         // sampled related core code
         std::vector<std::vector<float> > get_trajectory();
         std::vector<int> get_children_distribution();
+        std::vector<float> get_children_q_values(float discount_factor);
         CNode *get_child(CAction action);
     };
 
@@ -92,6 +93,7 @@ namespace tree
         std::vector<std::vector<std::vector<float> > > get_sampled_actions();
 
         std::vector<std::vector<int> > get_distributions();
+        std::vector<std::vector<float> > get_children_q_values(float discount_factor);
 
         std::vector<float> get_values();
     };

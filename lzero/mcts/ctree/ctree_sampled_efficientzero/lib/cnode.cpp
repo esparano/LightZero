@@ -615,6 +615,48 @@ namespace tree
         return distribution;
     }
 
+    std::vector<float> CNode::get_children_q_values(float discount_factor)
+    {
+        /*
+        Overview:
+            Get the minimax-aware Q values for each unique sampled child in legal_actions.
+            Unvisited children emit 0.0f; pair with get_children_distribution() to check visit_count > 0.
+        Returns:
+            - q_values: a vector of Q(root, a) values aligned with the unique prefix of sampled_actions.
+        */
+        std::vector<float> q_values;
+        if (this->expanded())
+        {
+            q_values.reserve(this->legal_actions.size());
+            int players = (this->to_play == -1) ? 1 : 2;
+            for (auto a : this->legal_actions)
+            {
+                CNode *child = this->get_child(a);
+                if (child->visit_count == 0)
+                {
+                    q_values.push_back(0.0f);
+                }
+                else
+                {
+                    float true_reward = child->value_prefix - this->value_prefix;
+                    if (this->is_reset == 1)
+                    {
+                        true_reward = child->value_prefix;
+                    }
+                    if (players == 1)
+                    {
+                        q_values.push_back(true_reward + discount_factor * child->value());
+                    }
+                    else
+                    {
+                        q_values.push_back(true_reward + discount_factor * (-child->value()));
+                    }
+                }
+            }
+        }
+        return q_values;
+    }
+
     CNode *CNode::get_child(CAction action)
     {
         /*
@@ -770,6 +812,18 @@ namespace tree
             distributions.push_back(this->roots[i].get_children_distribution());
         }
         return distributions;
+    }
+
+    std::vector<std::vector<float> > CRoots::get_children_q_values(float discount_factor)
+    {
+        std::vector<std::vector<float> > q_values_list;
+        q_values_list.reserve(this->root_num);
+
+        for (int i = 0; i < this->root_num; ++i)
+        {
+            q_values_list.push_back(this->roots[i].get_children_q_values(discount_factor));
+        }
+        return q_values_list;
     }
 
     // sampled related core code

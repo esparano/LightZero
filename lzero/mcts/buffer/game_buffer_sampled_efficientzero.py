@@ -506,6 +506,16 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         """
         if policy_re_context is None:
             return []
+        target_type = self._cfg.get('policy_target_type', 'visit_count')
+        if target_type not in ('visit_count', 'completed_q'):
+            raise ValueError(
+                f"Unsupported policy_target_type={target_type!r}; expected 'visit_count' or 'completed_q'."
+            )
+        use_completed_q = target_type == 'completed_q'
+        if use_completed_q and self._cfg.model.continuous_action_space:
+            raise NotImplementedError(
+                "policy_target_type='completed_q' is currently only supported for discrete action spaces."
+            )
         batch_target_policies_re = []
 
         policy_obs_list, policy_mask, pos_in_game_segment_list, batch_index_list, child_visits, root_values, game_segment_lens, action_mask_segment, \
@@ -558,10 +568,11 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
 
                 network_output.append(m_output)
 
-            _, value_prefix_pool, policy_logits_pool, latent_state_roots, reward_hidden_state_roots = concat_output(
+            raw_values_pool, value_prefix_pool, policy_logits_pool, latent_state_roots, reward_hidden_state_roots = concat_output(
                 network_output, data_type='efficientzero'
             )
 
+            raw_values_pool = np.asarray(raw_values_pool).reshape(-1).tolist()
             value_prefix_pool = value_prefix_pool.squeeze().tolist()
             policy_logits_pool = policy_logits_pool.tolist()
             # noises are not necessary for reanalyze
@@ -600,6 +611,12 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             roots_legal_actions_list = legal_actions
             roots_distributions = roots.get_distributions()
             roots_values = roots.get_values()
+            roots_child_q_values = (
+                roots.get_children_q_values(float(self._cfg.discount_factor)) if use_completed_q else None
+            )
+            compute_completed_q_policy = None
+            if use_completed_q:
+                from lzero.policy.sampled_efficientzero import compute_completed_q_policy
 
             # ==============================================================
             # fix reanalyze in sez
@@ -636,6 +653,21 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                             # after the reanalyze search, new target policies and root values are obtained
                             # the target policies and root values are stored in the gamesegment, specifically, ``child_visit_segment`` and ``root_value_segment``
                             # we replace the data at the corresponding location with the latest search results to keep the most up-to-date targets
+                            if use_completed_q:
+                                sampled_row = root_sampled_actions[policy_index]
+                                if sampled_row.dtype == object:
+                                    sampled_row = np.array(
+                                        [a.value if hasattr(a, 'value') else a for a in sampled_row]
+                                    )
+                                distributions = compute_completed_q_policy(
+                                    visit_counts=distributions,
+                                    child_q_values=roots_child_q_values[policy_index],
+                                    sampled_actions=sampled_row,
+                                    policy_logits=policy_logits_pool[policy_index],
+                                    raw_value=float(raw_values_pool[policy_index]),
+                                    c_visit=float(self._cfg.get('completed_q_c_visit', 50.0)),
+                                    c_scale=float(self._cfg.get('completed_q_c_scale', 1.0)),
+                                )
                             sim_num = sum(distributions)
                             child_visit[current_index] = [visit_count/sim_num for visit_count in distributions]
                             root_value[current_index] = searched_value
