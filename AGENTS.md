@@ -38,6 +38,7 @@ Run the full Galcon + SampledEfficientZero regression suite (78 tests, ~7s) afte
 - **Unit tests required:** Every bug fix should include a targeted unit test that would have failed before the fix.
 - **Do not weaken or remove existing passing tests** (especially under `zoo/board_games/galcon/envs/`).
 - **WSL line endings & permissions:** This repo runs on WSL with `core.autocrlf = input` and `core.filemode = false`. Do not introduce CRLF diffs or stray untracked experiment scripts inside the repo (put temporary experiment runners/logs outside the repo or in scratch).
+- **Presenting diffs for review:** Never dump large raw `git diff` blocks into chat. Instead, render diffs as a standalone side-pane HTML artifact (via `write_file` with `UserFacing: true`, following the `generative_ui` skill) featuring per-file tabs + an "All Files" tab, an **Inline / Side-by-Side** toggle (plus a "Hide indentation-only shifts" toggle when whitespace shifts are present), line numbers, and green/red highlighting using the Antigravity theme CSS variables.
 - **Wait for user approval** before pushing or rewriting approved commits.
 
 ## 4. Critical LightZero Board-Game Invariants
