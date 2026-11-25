@@ -54,6 +54,8 @@ class SampledEfficientZeroModel(nn.Module):
             use_sim_norm: bool = False,
             embed_actions: bool = False,
             embedded_action_dim: int = 32,
+            policy_head_type: str = 'flat',
+            policy_head_embed_dim: int = 32,
             *args,
             **kwargs,
     ):
@@ -106,8 +108,24 @@ class SampledEfficientZeroModel(nn.Module):
             - bound_type (:obj:`str`): The type of bound in networks, default set it to None.
             - norm_type (:obj:`str`): The type of normalization in networks, default sets it to 'BN'.
             - discrete_action_encoding_type (:obj:`str`): The type of encoding for discrete action. default sets it to 'one_hot'. options = {'one_hot', 'not_one_hot'}
+            - policy_head_type (:obj:`str`): Policy head architecture for discrete action spaces. \
+                Default sets it to 'flat'. Options are {'flat', 'factored_spatial'}.
+            - policy_head_embed_dim (:obj:`int`): Per-cell source/target embedding dimension when \
+                ``policy_head_type='factored_spatial'``. Default sets it to 32.
         """
         super(SampledEfficientZeroModel, self).__init__()
+        if policy_head_type not in ('flat', 'factored_spatial'):
+            raise ValueError(
+                f"Unsupported policy_head_type='{policy_head_type}'. "
+                f"Expected one of ('flat', 'factored_spatial')."
+            )
+        if policy_head_type == 'factored_spatial' and (
+            isinstance(observation_shape, int) or len(observation_shape) != 3
+        ):
+            raise ValueError(
+                f"policy_head_type='factored_spatial' requires a 3D (C, H, W) observation_shape, "
+                f"got {observation_shape}."
+            )
         if isinstance(observation_shape, int) or len(observation_shape) == 1:
             # for vector obs input, e.g. classical control and box2d environments
             # to be compatible with LightZero model/policy, transform to shape: [C, W, H]
@@ -151,6 +169,8 @@ class SampledEfficientZeroModel(nn.Module):
         self.bound_type = bound_type
         self.norm_type = norm_type
         self.num_of_sampled_actions = num_of_sampled_actions
+        self.policy_head_type = policy_head_type
+        self.policy_head_embed_dim = policy_head_embed_dim
 
         if downsample:
             if observation_shape[1] == 96:
@@ -221,10 +241,13 @@ class SampledEfficientZeroModel(nn.Module):
             flatten_input_size_for_policy_head,
             downsample,
             last_linear_layer_init_zero=self.last_linear_layer_init_zero,
+            activation=activation,
             sigma_type=self.sigma_type,
             fixed_sigma_value=self.fixed_sigma_value,
             bound_type=self.bound_type,
             norm_type=self.norm_type,
+            policy_head_type=self.policy_head_type,
+            policy_head_embed_dim=self.policy_head_embed_dim,
         )
 
         if self.self_supervised_learning_loss:
@@ -496,6 +519,138 @@ class SampledEfficientZeroModel(nn.Module):
         return get_params_mean(self)
 
 
+class FactoredSpatialPolicyHead(nn.Module):
+    """
+    Overview:
+        Factored spatial ``(src, dst)`` policy head for 2D grid environments (e.g. Galcon).
+        Maps a spatial policy feature map ``P`` of shape ``(B, C_p, H, W)`` to flat action logits
+        of shape ``(B, action_space_size)`` where:
+        - action ``0`` is the PASS logit computed from global ``mean`` + ``max`` pooling over ``(H, W)``;
+        - actions ``1 + layer * N^2 + i * N + j`` (``N = H * W``, row-major ``cell = y * W + x``)
+          are pairwise send logits:
+              ``(u_i . v_j) / sqrt(D) + s_i + t_j + b[layer, |y_i - y_j|, |x_i - x_j|]``.
+    """
+
+    def __init__(
+            self,
+            in_channels: int,
+            grid_height: int,
+            grid_width: int,
+            action_space_size: int,
+            embed_dim: int = 32,
+            pass_hidden_channels: SequenceType = [256],
+            activation: Optional[nn.Module] = nn.GELU(approximate='tanh'),
+            norm_type: str = 'LN',
+            last_linear_layer_init_zero: bool = True,
+    ) -> None:
+        super().__init__()
+        if grid_height <= 0 or grid_width <= 0:
+            raise ValueError(
+                f"grid_height and grid_width must be positive integers, got ({grid_height}, {grid_width})."
+            )
+        if isinstance(embed_dim, bool) or not isinstance(embed_dim, int) or embed_dim <= 0:
+            raise ValueError(f"policy_head_embed_dim must be a positive integer, got {embed_dim!r}.")
+
+        num_cells = grid_height * grid_width
+        pair_action_count = num_cells * num_cells
+        send_action_count = action_space_size - 1
+        if send_action_count <= 0 or send_action_count % pair_action_count != 0:
+            raise ValueError(
+                f"Invalid action_space_size={action_space_size} for grid ({grid_height}, {grid_width}): "
+                f"action_space_size - 1 ({send_action_count}) must be a positive multiple of "
+                f"(H * W)^2 = {pair_action_count}."
+            )
+
+        self.in_channels = in_channels
+        self.grid_height = grid_height
+        self.grid_width = grid_width
+        self.num_cells = num_cells
+        self.num_pair_layers = send_action_count // pair_action_count
+        self.action_space_size = action_space_size
+        self.embed_dim = embed_dim
+        self.scale = 1.0 / math.sqrt(embed_dim)
+
+        # Shared 1x1 convs producing per-cell source/target embeddings (u, v) and unary biases (s, t).
+        self.src_proj = nn.Conv2d(in_channels, self.num_pair_layers * embed_dim, kernel_size=1)
+        self.dst_proj = nn.Conv2d(in_channels, self.num_pair_layers * embed_dim, kernel_size=1)
+        self.src_bias_proj = nn.Conv2d(in_channels, self.num_pair_layers, kernel_size=1)
+        self.dst_bias_proj = nn.Conv2d(in_channels, self.num_pair_layers, kernel_size=1)
+
+        # Learnable (L, H, W) relative-distance bias indexed by (|y_i - y_j|, |x_i - x_j|),
+        # preserving exact 4x X/Y reflection equivariance.
+        self.rel_dist_bias = nn.Parameter(torch.zeros(self.num_pair_layers, grid_height, grid_width))
+
+        ys = torch.arange(grid_height, dtype=torch.long)
+        xs = torch.arange(grid_width, dtype=torch.long)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+        cell_y = grid_y.reshape(num_cells)
+        cell_x = grid_x.reshape(num_cells)
+        self.register_buffer('rel_dy', (cell_y[:, None] - cell_y[None, :]).abs(), persistent=False)
+        self.register_buffer('rel_dx', (cell_x[:, None] - cell_x[None, :]).abs(), persistent=False)
+
+        pass_hidden = list(pass_hidden_channels) if pass_hidden_channels is not None else []
+        pass_hidden_dim = pass_hidden[0] if len(pass_hidden) > 0 else 2 * in_channels
+        self.pass_head = MLP(
+            in_channels=2 * in_channels,
+            hidden_channels=pass_hidden_dim,
+            out_channels=1,
+            layer_num=len(pass_hidden) + 1,
+            activation=activation,
+            norm_type=norm_type,
+            output_activation=False,
+            output_norm=False,
+            last_linear_layer_init_zero=last_linear_layer_init_zero,
+        )
+
+        if last_linear_layer_init_zero:
+            # Zero-init dst_proj (v) while keeping src_proj (u) non-zero so initial bilinear scores
+            # are 0.0 without creating a u=v=0 gradient saddle point (v gets non-zero grad on step 0,
+            # and u gets non-zero grad once v moves off zero).
+            nn.init.zeros_(self.dst_proj.weight)
+            nn.init.zeros_(self.dst_proj.bias)
+            nn.init.zeros_(self.src_bias_proj.weight)
+            nn.init.zeros_(self.src_bias_proj.bias)
+            nn.init.zeros_(self.dst_bias_proj.weight)
+            nn.init.zeros_(self.dst_bias_proj.bias)
+            nn.init.zeros_(self.rel_dist_bias)
+
+    def forward(self, policy_features: torch.Tensor) -> torch.Tensor:
+        """
+        Shapes:
+            - policy_features (:obj:`torch.Tensor`): :math:`(B, C_p, H, W)`
+            - output (:obj:`torch.Tensor`): :math:`(B, 1 + L * N * N)` where :math:`N = H * W`
+        """
+        batch_size, _, height, width = policy_features.shape
+        if height != self.grid_height or width != self.grid_width:
+            raise ValueError(
+                f"Expected spatial shape ({self.grid_height}, {self.grid_width}), "
+                f"got ({height}, {width})."
+            )
+
+        # u: (B, L, N, D), v_t: (B, L, D, N) with row-major cell index y * W + x.
+        u = (
+            self.src_proj(policy_features)
+            .reshape(batch_size, self.num_pair_layers, self.embed_dim, self.num_cells)
+            .transpose(-2, -1)
+        )
+        v_t = self.dst_proj(policy_features).reshape(
+            batch_size, self.num_pair_layers, self.embed_dim, self.num_cells
+        )
+
+        pair_scores = torch.matmul(u, v_t) * self.scale  # (B, L, N, N)
+        s = self.src_bias_proj(policy_features).reshape(batch_size, self.num_pair_layers, self.num_cells, 1)
+        t = self.dst_bias_proj(policy_features).reshape(batch_size, self.num_pair_layers, 1, self.num_cells)
+        rel_bias = self.rel_dist_bias[:, self.rel_dy, self.rel_dx].unsqueeze(0)  # (1, L, N, N)
+
+        send_logits = pair_scores + s + t + rel_bias  # (B, L, N, N)
+
+        mean_pool = policy_features.mean(dim=(-2, -1))
+        max_pool = policy_features.amax(dim=(-2, -1))
+        pass_logit = self.pass_head(torch.cat([mean_pool, max_pool], dim=-1))  # (B, 1)
+
+        return torch.cat([pass_logit, send_logits.reshape(batch_size, -1)], dim=-1)
+
+
 class PredictionNetwork(nn.Module):
 
     def __init__(
@@ -522,6 +677,8 @@ class PredictionNetwork(nn.Module):
             fixed_sigma_value: float = 0.3,
             bound_type: str = None,
             norm_type: str = 'LN',
+            policy_head_type: str = 'flat',
+            policy_head_embed_dim: int = 32,
     ):
         """
         Overview:
@@ -553,8 +710,17 @@ class PredictionNetwork(nn.Module):
             - fixed_sigma_value (:obj:`float`): the fixed sigma value in policy head of prediction network,
             - bound_type (:obj:`str`): The type of bound in networks.  Default sets it to None.
             - norm_type (:obj:`str`): The type of normalization in networks. Default sets it to 'BN'.
+            - policy_head_type (:obj:`str`): Policy head architecture for discrete action spaces. \
+                Default sets it to 'flat'. Options are {'flat', 'factored_spatial'}.
+            - policy_head_embed_dim (:obj:`int`): Per-cell source/target embedding dimension when \
+                ``policy_head_type='factored_spatial'``. Default sets it to 32.
         """
         super().__init__()
+        if policy_head_type not in ('flat', 'factored_spatial'):
+            raise ValueError(
+                f"Unsupported policy_head_type='{policy_head_type}'. "
+                f"Expected one of ('flat', 'factored_spatial')."
+            )
         self.continuous_action_space = continuous_action_space
         self.flatten_input_size_for_value_head = flatten_input_size_for_value_head
         self.flatten_input_size_for_policy_head = flatten_input_size_for_policy_head
@@ -563,6 +729,8 @@ class PredictionNetwork(nn.Module):
         self.fixed_sigma_value = fixed_sigma_value
         self.bound_type = bound_type
         self.activation = activation
+        self.policy_head_type = policy_head_type
+        self.policy_head_embed_dim = policy_head_embed_dim
 
         self.resblocks = nn.ModuleList(
             [
@@ -606,7 +774,34 @@ class PredictionNetwork(nn.Module):
         )
 
         # sampled related core code
-        if self.continuous_action_space:
+        if self.policy_head_type == 'factored_spatial':
+            if self.continuous_action_space:
+                raise ValueError(
+                    "policy_head_type='factored_spatial' only supports discrete action spaces "
+                    "(continuous_action_space=False)."
+                )
+            if downsample:
+                raise ValueError(
+                    "policy_head_type='factored_spatial' requires downsample=False so latent (H, W) "
+                    "matches the action grid."
+                )
+            if isinstance(observation_shape, int) or len(observation_shape) != 3:
+                raise ValueError(
+                    f"policy_head_type='factored_spatial' requires a 3D (C, H, W) observation_shape, "
+                    f"got {observation_shape}."
+                )
+            self.fc_policy_head = FactoredSpatialPolicyHead(
+                in_channels=policy_head_channels,
+                grid_height=int(observation_shape[1]),
+                grid_width=int(observation_shape[2]),
+                action_space_size=action_space_size,
+                embed_dim=self.policy_head_embed_dim,
+                pass_hidden_channels=policy_head_hidden_channels,
+                activation=activation,
+                norm_type=self.norm_type,
+                last_linear_layer_init_zero=last_linear_layer_init_zero,
+            )
+        elif self.continuous_action_space:
             self.fc_policy_head = ReparameterizationHead(
                 input_size=self.flatten_input_size_for_policy_head,
                 output_size=action_space_size,
@@ -654,11 +849,14 @@ class PredictionNetwork(nn.Module):
         policy = self.activation(policy)
 
         value = value.reshape(-1, self.flatten_input_size_for_value_head)
-        policy = policy.reshape(-1, self.flatten_input_size_for_policy_head)
         value = self.fc_value_head(value)
 
         # sampled related core code
-        policy = self.fc_policy_head(policy)
+        if self.policy_head_type == 'factored_spatial':
+            policy = self.fc_policy_head(policy)
+        else:
+            policy = policy.reshape(-1, self.flatten_input_size_for_policy_head)
+            policy = self.fc_policy_head(policy)
 
         if self.continuous_action_space:
             policy = torch.cat([policy['mu'], policy['sigma']], dim=-1)

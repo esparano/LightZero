@@ -136,6 +136,10 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             norm_type='LN',
             # (bool) Whether to renormalize latent states to [0, 1] after representation and dynamics steps.
             state_norm=True,
+            # (str) The policy head architecture for discrete conv models. Options are ['flat', 'factored_spatial'].
+            policy_head_type='flat',
+            # (int) Per-cell source/target embedding dimension used when ``policy_head_type='factored_spatial'``.
+            policy_head_embed_dim=32,
         ),
         # ****** common ******
         # (bool) Whether to use multi-gpu training.
