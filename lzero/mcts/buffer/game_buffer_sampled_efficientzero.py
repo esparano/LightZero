@@ -300,55 +300,61 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         # transition_batch_size = game_segment_batch_size * (num_unroll_steps+1)
         transition_batch_size = len(value_obs_list)
         game_segment_batch_size = len(pos_in_game_segment_list)
-
-        to_play, action_mask = self._preprocess_to_play_and_action_mask(
-            game_segment_batch_size, to_play_segment, action_mask_segment, pos_in_game_segment_list
-        )
-        if self._cfg.model.continuous_action_space is True:
-            # when the action space of the environment is continuous, action_mask[:] is None.
-            action_mask = [
-                list(np.ones(self._cfg.model.action_space_size, dtype=np.int8)) for _ in range(transition_batch_size)
-            ]
-            # NOTE: in continuous action space env: we set all legal_actions as -1
-            legal_actions = [
-                [-1 for _ in range(self._cfg.model.action_space_size)] for _ in range(transition_batch_size)
-            ]
-        else:
-            legal_actions = [np.nonzero(action_mask[j])[0].tolist() for j in range(transition_batch_size)]
+        value_mask_arr = np.asarray(value_mask, dtype=np.float64)
+        active_indices = np.flatnonzero(value_mask_arr)
 
         batch_target_values, batch_value_prefixs = [], []
         with torch.no_grad():
-            value_obs_list = prepare_observation(value_obs_list, self._cfg.model.model_type)
-            # split a full batch into slices of mini_infer_size: to save the GPU memory for more GPU actors
-            slices = int(np.ceil(transition_batch_size / self._cfg.mini_infer_size))
-            network_output = []
-            for i in range(slices):
-                beg_index = self._cfg.mini_infer_size * i
-                end_index = self._cfg.mini_infer_size * (i + 1)
-                m_obs = torch.from_numpy(value_obs_list[beg_index:end_index]).to(self._cfg.device).float()
+            if active_indices.size == 0:
+                # All bootstrap targets are masked out (e.g. td_steps >= episode length),
+                # so neither legal-action extraction nor target-model inference affects value targets.
+                value_list = [0.0] * transition_batch_size
+            elif self._cfg.use_root_value:
+                to_play, action_mask = self._preprocess_to_play_and_action_mask(
+                    game_segment_batch_size, to_play_segment, action_mask_segment, pos_in_game_segment_list
+                )
+                if self._cfg.model.continuous_action_space is True:
+                    # when the action space of the environment is continuous, action_mask[:] is None.
+                    action_mask = [
+                        list(np.ones(self._cfg.model.action_space_size, dtype=np.int8))
+                        for _ in range(transition_batch_size)
+                    ]
+                    # NOTE: in continuous action space env: we set all legal_actions as -1
+                    legal_actions = [
+                        [-1 for _ in range(self._cfg.model.action_space_size)] for _ in range(transition_batch_size)
+                    ]
+                else:
+                    legal_actions = [np.nonzero(action_mask[j])[0].tolist() for j in range(transition_batch_size)]
 
-                # calculate the target value
-                m_output = model.initial_inference(m_obs)
+                value_obs_arr = prepare_observation(value_obs_list, self._cfg.model.model_type)
+                # split a full batch into slices of mini_infer_size: to save the GPU memory for more GPU actors
+                slices = int(np.ceil(transition_batch_size / self._cfg.mini_infer_size))
+                network_output = []
+                for i in range(slices):
+                    beg_index = self._cfg.mini_infer_size * i
+                    end_index = self._cfg.mini_infer_size * (i + 1)
+                    m_obs = torch.from_numpy(value_obs_arr[beg_index:end_index]).to(self._cfg.device).float()
 
-                # TODO(pu)
-                if not model.training:
-                    # if not in training, obtain the scalars of the value/reward
-                    [m_output.latent_state, m_output.value, m_output.policy_logits] = to_detach_cpu_numpy(
-                        [
-                            m_output.latent_state,
-                            inverse_scalar_transform(m_output.value, self.value_support),
-                            m_output.policy_logits
-                        ]
-                    )
-                    m_output.reward_hidden_state = (
-                        m_output.reward_hidden_state[0].detach().cpu().numpy(),
-                        m_output.reward_hidden_state[1].detach().cpu().numpy()
-                    )
+                    # calculate the target value
+                    m_output = model.initial_inference(m_obs)
 
-                network_output.append(m_output)
+                    # TODO(pu)
+                    if not model.training:
+                        # if not in training, obtain the scalars of the value/reward
+                        [m_output.latent_state, m_output.value, m_output.policy_logits] = to_detach_cpu_numpy(
+                            [
+                                m_output.latent_state,
+                                inverse_scalar_transform(m_output.value, self.value_support),
+                                m_output.policy_logits
+                            ]
+                        )
+                        m_output.reward_hidden_state = (
+                            m_output.reward_hidden_state[0].detach().cpu().numpy(),
+                            m_output.reward_hidden_state[1].detach().cpu().numpy()
+                        )
 
-            # concat the output slices after model inference
-            if self._cfg.use_root_value:
+                    network_output.append(m_output)
+
                 # use the root values from MCTS
                 # the root values have limited improvement but require much more GPU actors;
                 _, value_prefix_pool, policy_logits_pool, latent_state_roots, reward_hidden_state_roots = concat_output(
@@ -392,26 +398,52 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                 roots_values = roots.get_values()
                 value_list = np.array(roots_values)
             else:
-                # use the predicted values
-                value_list = concat_output_value(network_output)
-
-            # get last state value
-            if self._cfg.env_type == 'board_games' and to_play_segment[0][0] in [1, 2]:
-                # TODO(pu): for board_games, very important, to check
-                value_list = value_list.reshape(-1) * np.array(
-                    [
-                        self._cfg.discount_factor ** td_steps_list[i] if int(td_steps_list[i]) %
-                        2 == 0 else -self._cfg.discount_factor ** td_steps_list[i]
-                        for i in range(transition_batch_size)
-                    ]
+                # use_root_value=False: legal_actions/to_play are unused and only unmasked bootstrap
+                # observations contribute to value targets.
+                active_obs_list = (
+                    value_obs_list
+                    if active_indices.size == transition_batch_size
+                    else [value_obs_list[idx] for idx in active_indices]
                 )
-            else:
-                value_list = value_list.reshape(-1) * (
-                    np.array([self._cfg.discount_factor for _ in range(transition_batch_size)]) ** td_steps_list
-                )
+                active_obs_arr = prepare_observation(active_obs_list, self._cfg.model.model_type)
+                slices = int(np.ceil(active_indices.size / self._cfg.mini_infer_size))
+                network_output = []
+                for i in range(slices):
+                    beg_index = self._cfg.mini_infer_size * i
+                    end_index = self._cfg.mini_infer_size * (i + 1)
+                    m_obs = torch.from_numpy(active_obs_arr[beg_index:end_index]).to(self._cfg.device).float()
+                    m_output = model.initial_inference(m_obs)
+                    if not model.training:
+                        [m_output.value] = to_detach_cpu_numpy(
+                            [inverse_scalar_transform(m_output.value, self.value_support)]
+                        )
+                    network_output.append(m_output)
 
-            value_list = value_list * np.array(value_mask)
-            value_list = value_list.tolist()
+                active_values = concat_output_value(network_output).reshape(-1)
+                if active_indices.size == transition_batch_size:
+                    value_list = active_values
+                else:
+                    value_list = np.zeros(transition_batch_size, dtype=active_values.dtype)
+                    value_list[active_indices] = active_values
+
+            if active_indices.size > 0:
+                # get last state value
+                if self._cfg.env_type == 'board_games' and to_play_segment[0][0] in [1, 2]:
+                    # TODO(pu): for board_games, very important, to check
+                    value_list = value_list.reshape(-1) * np.array(
+                        [
+                            self._cfg.discount_factor ** td_steps_list[i] if int(td_steps_list[i]) %
+                            2 == 0 else -self._cfg.discount_factor ** td_steps_list[i]
+                            for i in range(transition_batch_size)
+                        ]
+                    )
+                else:
+                    value_list = value_list.reshape(-1) * (
+                        np.array([self._cfg.discount_factor for _ in range(transition_batch_size)]) ** td_steps_list
+                    )
+
+                value_list = value_list * value_mask_arr
+                value_list = value_list.tolist()
 
             horizon_id, value_index = 0, 0
             for game_segment_len_non_re, reward_list, state_index, to_play_list in zip(game_segment_lens, rewards_list,
