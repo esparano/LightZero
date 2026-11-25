@@ -444,3 +444,43 @@ class TestSampledEfficientZeroPolicyLearn:
 
         for b_proj, p_proj in zip(batched, per_step):
             assert torch.allclose(b_proj, p_proj, atol=1e-6)
+
+    def test_policy_loss_disc_entropy_finite_for_extreme_negative_logits(self):
+        """Regression test: illegal logits below ~-89 in fp32 underflow softmax(logits)
+        to exact 0.0, which previously caused 0.0 * log(0.0) = NaN in policy entropy.
+        Verify log_softmax entropy and its backward gradients remain finite even at -1000.
+        """
+        cfg = _make_test_policy_and_buffer_cfg(grid_h=2, grid_w=2, channels=4, num_sampled_actions=4)
+        policy = SampledEfficientZeroPolicy(cfg)
+        policy._init_learn()
+
+        B, U, K = 2, 1, 4
+        A = cfg.model.action_space_size
+        logits = torch.full((B, A), -200.0, dtype=torch.float32)
+        logits[:, 0] = 2.0
+        logits[:, 1] = 1.0
+        logits[:, 2] = -1000.0
+        logits.requires_grad_(True)
+
+        target_policy = torch.tensor(
+            [[[0.6, 0.4, 0.0, 0.0]], [[0.5, 0.5, 0.0, 0.0]]],
+            dtype=torch.float32,
+        )
+        mask_batch = torch.ones(B, U, dtype=torch.float32)
+        actions = torch.tensor(
+            [[[0, 1, -1, -1]], [[0, 1, -1, -1]]],
+            dtype=torch.long,
+        ).unsqueeze(-1)
+
+        loss, policy_entropy, policy_entropy_loss, _, _ = policy._calculate_policy_loss_disc(
+            torch.zeros(B), logits, target_policy, mask_batch, actions, unroll_step=0
+        )
+
+        assert torch.isfinite(loss).all()
+        assert torch.isfinite(policy_entropy)
+        assert torch.isfinite(policy_entropy_loss).all()
+
+        total = loss.mean() + 0.001 * policy_entropy_loss.mean()
+        total.backward()
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all()
