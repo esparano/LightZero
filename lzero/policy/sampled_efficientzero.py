@@ -457,16 +457,13 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         # i.e. h^(-1)(.) function in paper https://arxiv.org/pdf/1805.11593.pdf.
         original_value = self.value_inverse_scalar_transform_handle(value)
 
-        # Note: The following lines are just for logging.
-        predicted_value_prefixs = []
+        # Note: The following accumulators stay on-device to avoid mid-loop GPU->CPU syncs.
         if self._cfg.monitor_extra_statistics:
-            predicted_values, predicted_policies = original_value.detach().cpu(), torch.softmax(
-                policy_logits, dim=1
-            ).detach().cpu()
+            predicted_values_sum = original_value.detach().mean()
+            predicted_value_prefixs_sum = torch.zeros((), device=self._cfg.device, dtype=original_value.dtype)
 
-        # calculate the new priorities for each transition.
-        value_priority = L1Loss(reduction='none')(original_value.squeeze(-1), target_value[:, 0])
-        value_priority = value_priority.data.cpu().numpy() + 1e-6
+        # calculate the new priorities for each transition (defer .cpu().numpy() until end of step).
+        value_priority_tensor = L1Loss(reduction='none')(original_value.squeeze(-1), target_value[:, 0]).detach() + 1e-6
 
         # ==============================================================
         # calculate policy and value loss for the first step.
@@ -484,7 +481,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             )
         else:
             """discrete action space"""
-            root_policy_action0_prob = torch.softmax(policy_logits.detach(), dim=-1)[:, 0].mean().item()
+            root_policy_action0_prob = torch.softmax(policy_logits.detach(), dim=-1)[:, 0].mean()
             policy_loss, policy_entropy, policy_entropy_loss, target_policy_entropy, target_sampled_actions = self._calculate_policy_loss_disc(
                 policy_loss, policy_logits, target_policy, mask_batch, child_sampled_actions_batch, unroll_step=0
             )
@@ -564,14 +561,13 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                 )
 
             if self._cfg.monitor_extra_statistics:
-                original_value_prefixs = self.value_inverse_scalar_transform_handle(value_prefix)
-                original_value_prefixs_cpu = original_value_prefixs.detach().cpu()
-
-                predicted_values = torch.cat(
-                    (predicted_values, self.value_inverse_scalar_transform_handle(value).detach().cpu())
-                )
-                predicted_value_prefixs.append(original_value_prefixs_cpu)
-                predicted_policies = torch.cat((predicted_policies, torch.softmax(policy_logits, dim=1).detach().cpu()))
+                with torch.no_grad():
+                    predicted_value_prefixs_sum = predicted_value_prefixs_sum + self.value_inverse_scalar_transform_handle(
+                        value_prefix.detach()
+                    ).mean()
+                    predicted_values_sum = predicted_values_sum + self.value_inverse_scalar_transform_handle(
+                        value.detach()
+                    ).mean()
 
         # ==============================================================
         # the core learn model update step.
@@ -603,8 +599,15 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         self._target_model.update(self._learn_model.state_dict())
 
         if self._cfg.monitor_extra_statistics:
-            predicted_value_prefixs = torch.stack(predicted_value_prefixs).transpose(1, 0).squeeze(-1)
-            predicted_value_prefixs = predicted_value_prefixs.reshape(-1).unsqueeze(-1)
+            predicted_value_prefixs_mean = (
+                predicted_value_prefixs_sum / self._cfg.num_unroll_steps
+            ).item() if self._cfg.num_unroll_steps > 0 else 0.0
+            predicted_values_mean = (predicted_values_sum / (self._cfg.num_unroll_steps + 1)).item()
+        else:
+            predicted_value_prefixs_mean = 0.0
+            predicted_values_mean = 0.0
+
+        value_priority = value_priority_tensor.cpu().numpy()
 
         return_data = {
             'cur_lr': self._optimizer.param_groups[0]['lr'],
@@ -623,12 +626,12 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             # ==============================================================
             'value_priority': value_priority.flatten().mean().item(),
             'value_priority_orig': value_priority,
-            'target_value_prefix': target_value_prefix.detach().cpu().numpy().mean().item(),
-            'target_value': target_value.detach().cpu().numpy().mean().item(),
-            'transformed_target_value_prefix': transformed_target_value_prefix.detach().cpu().numpy().mean().item(),
-            'transformed_target_value': transformed_target_value.detach().cpu().numpy().mean().item(),
-            'predicted_value_prefixs': predicted_value_prefixs.detach().cpu().numpy().mean().item(),
-            'predicted_values': predicted_values.detach().cpu().numpy().mean().item()
+            'target_value_prefix': target_value_prefix.detach().mean().item(),
+            'target_value': target_value.detach().mean().item(),
+            'transformed_target_value_prefix': transformed_target_value_prefix.detach().mean().item(),
+            'transformed_target_value': transformed_target_value.detach().mean().item(),
+            'predicted_value_prefixs': predicted_value_prefixs_mean,
+            'predicted_values': predicted_values_mean
         }
 
         if self._cfg.model.continuous_action_space:
@@ -658,7 +661,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                 'target_sampled_actions_min': target_sampled_actions[:, :].float().min().item(),
                 'target_sampled_actions_mean': target_sampled_actions[:, :].float().mean().item(),
                 'action0_taken_rate': (action_batch[:, 0] == 0).float().mean().item(),
-                'policy_action0_prob': root_policy_action0_prob,
+                'policy_action0_prob': root_policy_action0_prob.item(),
                 'total_grad_norm_before_clip': total_grad_norm_before_clip.item()
             })
 

@@ -238,3 +238,61 @@ class TestSampledEfficientZeroPolicyLearn:
             assert recorded_to_play == [expected_to_play], (
                 f"battle_mode={battle_mode}: expected to_play={expected_to_play}, got {recorded_to_play}"
             )
+
+    def test_forward_learn_monitor_statistics_matches_exact_mean_and_disabled_flag(self):
+        """Verify on-device monitor_extra_statistics accumulation matches exact per-step
+        means and produces bit-identical weights/losses whether enabled or disabled.
+        """
+        import copy
+
+        torch.manual_seed(42)
+        np.random.seed(42)
+        cfg_on = _make_test_policy_and_buffer_cfg()
+        cfg_on.monitor_extra_statistics = True
+        policy_on = SampledEfficientZeroPolicy(cfg_on)
+        policy_on._init_learn()
+
+        cfg_off = copy.deepcopy(cfg_on)
+        cfg_off.monitor_extra_statistics = False
+        policy_off = SampledEfficientZeroPolicy(cfg_off)
+        policy_off._init_learn()
+        policy_off._learn_model.load_state_dict(copy.deepcopy(policy_on._learn_model.state_dict()))
+        policy_off._target_model.load_state_dict(copy.deepcopy(policy_on._target_model.state_dict()))
+
+        buffer = SampledEfficientZeroGameBuffer(cfg_on)
+        seg1 = _make_dummy_segment(cfg_on, num_steps=6)
+        seg2 = _make_dummy_segment(cfg_on, num_steps=6)
+        meta1 = {'done': True, 'unroll_plus_td_steps': 4, 'priorities': np.ones(6)}
+        meta2 = {'done': True, 'unroll_plus_td_steps': 4, 'priorities': np.ones(6)}
+        buffer.push_game_segments(([seg1, seg2], [meta1, meta2]))
+        train_data = buffer.sample(batch_size=2, policy=policy_on)
+
+        # Spy on value_inverse_scalar_transform_handle to collect exact per-step tensors
+        recorded = []
+        orig_handle = policy_on.value_inverse_scalar_transform_handle
+
+        def _spy_handle(tensor):
+            out = orig_handle(tensor)
+            recorded.append(out.detach().clone())
+            return out
+
+        policy_on.value_inverse_scalar_transform_handle = _spy_handle
+
+        out_on = policy_on._forward_learn(train_data)
+        out_off = policy_off._forward_learn(train_data)
+
+        # Calls order: root value, then for each unroll step (value_prefix, value)
+        U = cfg_on.num_unroll_steps
+        assert len(recorded) == 1 + 2 * U
+        expected_vals = torch.cat([recorded[0]] + [recorded[2 + 2 * k] for k in range(U)], dim=0)
+        expected_vprefixes = torch.cat([recorded[1 + 2 * k] for k in range(U)], dim=0)
+
+        assert np.isclose(out_on['predicted_values'], expected_vals.mean().item(), atol=1e-6)
+        assert np.isclose(out_on['predicted_value_prefixs'], expected_vprefixes.mean().item(), atol=1e-6)
+        assert out_off['predicted_values'] == 0.0
+        assert out_off['predicted_value_prefixs'] == 0.0
+
+        for key in ['total_loss', 'policy_loss', 'value_loss', 'value_prefix_loss', 'consistency_loss']:
+            assert np.isclose(out_on[key], out_off[key], atol=1e-6)
+        for p1, p2 in zip(policy_on._learn_model.parameters(), policy_off._learn_model.parameters()):
+            assert torch.allclose(p1, p2, atol=1e-6)
