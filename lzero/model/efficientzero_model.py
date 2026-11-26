@@ -517,7 +517,7 @@ class DynamicsNetwork(nn.Module):
                 ResBlock(
                     in_channels=self.num_latent_channels,
                     activation=self.activation,
-                    norm_type='BN',
+                    norm_type=norm_type,
                     res_type='basic',
                     bias=False
                 ) for _ in range(num_res_blocks)
@@ -538,7 +538,10 @@ class DynamicsNetwork(nn.Module):
         # output_shape: (sequence_length, batch_size, hidden_size)
         self.lstm = nn.LSTM(input_size=self.flatten_input_size_for_reward_head, hidden_size=self.lstm_hidden_size)
 
-        self.norm_value_prefix = nn.BatchNorm1d(self.lstm_hidden_size)
+        if norm_type == 'BN':
+            self.norm_value_prefix = nn.BatchNorm1d(self.lstm_hidden_size)
+        elif norm_type == 'LN':
+            self.norm_value_prefix = nn.LayerNorm(self.lstm_hidden_size)
 
         self.fc_reward_head = MLP(
             in_channels=self.lstm_hidden_size,

@@ -193,6 +193,70 @@ class TestSampledEfficientZeroModel:
         assert mlp_rec.latent_state.max().item() <= 1.0 + 1e-6
         (mlp_rec.latent_state.sum() + mlp_rec.value.sum() + mlp_rec.policy_logits.sum()).backward()
 
+    def test_dynamics_network_norm_type_ln_uses_no_batchnorm(self):
+        """Regression test: DynamicsNetwork(..., norm_type='LN') must not hardcode BatchNorm
+        in resblocks or norm_value_prefix, and must support batch_size=1 in train() mode.
+        """
+        conv_model = SampledEfficientZeroModel(
+            observation_shape=(4, 4, 4),
+            action_space_size=5,
+            num_res_blocks=2,
+            num_channels=8,
+            lstm_hidden_size=16,
+            reward_head_channels=4,
+            value_head_channels=4,
+            policy_head_channels=4,
+            reward_head_hidden_channels=[16],
+            value_head_hidden_channels=[16],
+            policy_head_hidden_channels=[16],
+            reward_support_range=(-1., 2., 1.),
+            value_support_range=(-1., 2., 1.),
+            proj_hid=32,
+            proj_out=32,
+            pred_hid=16,
+            pred_out=32,
+            continuous_action_space=False,
+            norm_type='LN',
+        )
+        dyn = conv_model.dynamics_network
+        bn_modules = [
+            name for name, mod in dyn.named_modules()
+            if isinstance(mod, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d))
+        ]
+        assert bn_modules == [], f"Unexpected BatchNorm layers in DynamicsNetwork under norm_type='LN': {bn_modules}"
+        assert isinstance(dyn.norm_value_prefix, torch.nn.LayerNorm)
+
+        # Batch size 1 in train() mode must succeed without BatchNorm ValueError
+        conv_model.train()
+        obs = torch.randn(1, 4, 4, 4)
+        init_out = conv_model.initial_inference(obs)
+        rec_out = conv_model.recurrent_inference(
+            init_out.latent_state, init_out.reward_hidden_state, torch.zeros((1,), dtype=torch.long)
+        )
+        assert rec_out.latent_state.shape == torch.Size([1, 8, 4, 4])
+        assert rec_out.value_prefix.shape == torch.Size([1, 3])
+
+    def test_dynamics_network_norm_type_bn_unchanged(self):
+        net = DynamicsNetwork(
+            observation_shape=(4, 4, 4),
+            action_encoding_dim=2,
+            num_res_blocks=2,
+            num_channels=10,
+            reward_head_channels=4,
+            reward_head_hidden_channels=[16],
+            output_support_size=5,
+            flatten_input_size_for_reward_head=4 * 4 * 4,
+            downsample=False,
+            lstm_hidden_size=16,
+            norm_type='BN',
+        )
+        assert isinstance(net.norm_value_prefix, torch.nn.BatchNorm1d)
+        resblock_bns = [
+            name for name, mod in net.resblocks.named_modules()
+            if isinstance(mod, torch.nn.BatchNorm2d)
+        ]
+        assert len(resblock_bns) == 4
+
 
 if __name__ == "__main__":
     batch_size = 2
