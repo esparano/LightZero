@@ -272,7 +272,10 @@ class _BackgroundBatchPrefetcher:
                 break
         for t in self._threads:
             if t.is_alive():
-                t.join(timeout=2.0)
+                t.join(timeout=10.0)
+
+    def is_alive(self) -> bool:
+        return any(t.is_alive() for t in self._threads)
 
     def get_batch(self, timeout: float = 0.0) -> Optional[Any]:
         err = self.last_error
@@ -547,7 +550,7 @@ class AsyncLearner:
             logging.warning(f'[AsyncLearner] Failed to save {self.dirs.learner_state_path.name}: {exc}')
 
     def _save_replay_buffer_snapshot(self) -> bool:
-        with self._buffer_rwlock.read_lock():
+        with self._buffer_rwlock.write_lock():
             if self.replay_buffer.get_num_of_game_segments() <= 0:
                 return False
             snapshot = {
@@ -560,18 +563,18 @@ class AsyncLearner:
                 'base_idx': int(self.replay_buffer.base_idx),
                 'clear_time': float(self.replay_buffer.clear_time),
             }
-        try:
-            atomic_pickle_save(snapshot, self.dirs.replay_buffer_path)
-            logging.info(
-                f'[AsyncLearner] Saved replay buffer snapshot to {self.dirs.replay_buffer_path} '
-                f'(train_iter={snapshot["train_iter"]}, '
-                f'segments={len(snapshot["game_segment_buffer"])}, '
-                f'transitions={len(snapshot["game_segment_game_pos_look_up"])})'
-            )
-            return True
-        except Exception as exc:
-            logging.warning(f'[AsyncLearner] Failed to save replay buffer snapshot: {exc}')
-            return False
+            try:
+                atomic_pickle_save(snapshot, self.dirs.replay_buffer_path)
+                logging.info(
+                    f'[AsyncLearner] Saved replay buffer snapshot to {self.dirs.replay_buffer_path} '
+                    f'(train_iter={snapshot["train_iter"]}, '
+                    f'segments={len(snapshot["game_segment_buffer"])}, '
+                    f'transitions={len(snapshot["game_segment_game_pos_look_up"])})'
+                )
+                return True
+            except Exception as exc:
+                logging.warning(f'[AsyncLearner] Failed to save replay buffer snapshot: {exc}')
+                return False
 
     def _load_replay_buffer_snapshot(self, expected_iter: int) -> bool:
         if not self.dirs.replay_buffer_path.is_file():
@@ -687,10 +690,22 @@ class AsyncLearner:
             self._ingest_payload(path, payload, stats)
         return stats
 
+    def _sample_uses_mcts(self) -> bool:
+        reanalyze_ratio = float(self.cfg.policy.get('reanalyze_ratio', 0.0) or 0.0)
+        return reanalyze_ratio > 0.0 or bool(self.cfg.policy.get('use_root_value', False))
+
     def start_prefetcher(self) -> None:
         """Start background batch prefetch worker thread(s) when ``prefetch_workers > 0``."""
         if self.prefetch_workers <= 0 or self._batch_prefetcher is not None:
             return
+        effective_workers = self.prefetch_workers
+        if self._sample_uses_mcts() and effective_workers > 1:
+            logging.info(
+                f'[AsyncLearner] Capping prefetch_workers from {effective_workers} to 1 '
+                f'because replay sampling runs MCTS (reanalyze_ratio={self.cfg.policy.get("reanalyze_ratio", 0.0)}, '
+                f'use_root_value={bool(self.cfg.policy.get("use_root_value", False))}).'
+            )
+            effective_workers = 1
         self._prefetch_policy_proxy = _PrefetchPolicyProxy(self.policy)
         self._batch_prefetcher = _BackgroundBatchPrefetcher(
             replay_buffer=self.replay_buffer,
@@ -699,7 +714,7 @@ class AsyncLearner:
             min_transitions=self.throttler.min_transitions,
             buffer_rwlock=self._buffer_rwlock,
             target_rwlock=self._target_rwlock,
-            num_workers=self.prefetch_workers,
+            num_workers=effective_workers,
             max_queue_size=self.prefetch_queue_size,
             poll_interval=min(0.05, self.poll_interval),
         )
@@ -718,9 +733,37 @@ class AsyncLearner:
 
     def _sample_train_batch(self, batch_size: int) -> Any:
         if self._batch_prefetcher is not None:
-            batch = self._batch_prefetcher.get_batch(timeout=0.05)
-            if batch is not None:
-                return batch
+            if self._sample_uses_mcts():
+                # Always surface any worker error immediately, even if the worker thread has already exited.
+                batch = self._batch_prefetcher.get_batch(timeout=0.0)
+                if batch is not None:
+                    return batch
+                with self._buffer_rwlock.read_lock():
+                    can_prefetch = (
+                        self.replay_buffer.get_num_of_sampleable_transitions()
+                        >= self._batch_prefetcher._min_transitions
+                        and self.replay_buffer.get_num_of_transitions()
+                        > self._batch_prefetcher._batch_size
+                    )
+                if can_prefetch:
+                    # Reanalyze batches take >50ms; wait for the prefetch worker instead of timing out
+                    # and launching a duplicate concurrent GPU MCTS reanalyze on the main thread.
+                    while not self._stop_requested and self._batch_prefetcher.is_alive():
+                        batch = self._batch_prefetcher.get_batch(timeout=0.1)
+                        if batch is not None:
+                            return batch
+                    # Final non-blocking check surfaces any error or batch produced right before exit.
+                    batch = self._batch_prefetcher.get_batch(timeout=0.0)
+                    if batch is not None:
+                        return batch
+                    if self._stop_requested:
+                        return None
+            else:
+                batch = self._batch_prefetcher.get_batch(timeout=0.05)
+                if batch is not None:
+                    return batch
+        if self._stop_requested:
+            return None
         with self._buffer_rwlock.read_lock():
             return self.replay_buffer.sample(batch_size, self.policy)
 
@@ -743,6 +786,8 @@ class AsyncLearner:
             )
         )
         train_data = self._sample_train_batch(batch_size)
+        if train_data is None:
+            return None
         log_vars = self.learner.train(train_data, self.total_ingested_envsteps)
 
         if self.cfg.policy.use_priority and log_vars and 'value_priority_orig' in log_vars[0]:
@@ -879,7 +924,11 @@ class AsyncLearner:
                     did_update = True
                     last_progress_time = time.time()
 
-                if self.learner.train_iter >= max_train_iter or self.total_ingested_envsteps >= max_env_step:
+                if (
+                    self._stop_requested
+                    or self.learner.train_iter >= max_train_iter
+                    or self.total_ingested_envsteps >= max_env_step
+                ):
                     break
 
                 if not did_update:

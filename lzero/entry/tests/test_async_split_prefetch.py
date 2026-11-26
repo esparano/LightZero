@@ -252,3 +252,185 @@ class TestAsyncLearnerPrefetchIntegration:
             assert learner._batch_prefetcher is None
         finally:
             learner.close()
+
+    def test_learner_prefetch_with_reanalyze_caps_workers_and_trains(self, tmp_path):
+        cfg, create_cfg = _make_tiny_galcon_cfg()
+        cfg.policy.reanalyze_ratio = 0.5
+        cfg.policy.reanalyze_outdated = True
+        cfg.policy.reanalyze_noise = False
+        cfg.policy.policy_target_type = 'completed_q'
+        run_dir = tmp_path / 'run_reanalyze_prefetch'
+
+        learner = AsyncLearner(
+            input_cfg=(cfg, create_cfg),
+            run_dir=run_dir,
+            seed=0,
+            device='cpu',
+            publish_every_n_updates=2,
+            save_ckpt_every_n_updates=0,
+            max_replay_ratio=None,
+            min_transitions=8,
+            poll_interval=0.05,
+            use_bg_reader=False,
+            prefetch_workers=2,
+            prefetch_queue_size=2,
+        )
+        actor = SelfPlayActor(
+            input_cfg=(cfg, create_cfg),
+            run_dir=run_dir,
+            actor_id='actor_0',
+            seed=10,
+            device='cpu',
+            collector_env_num=2,
+            n_episode=2,
+            num_simulations=4,
+            env_manager_type='base',
+            wait_for_initial_weights=False,
+        )
+        try:
+            learner.start_prefetcher()
+            assert learner._batch_prefetcher is not None
+            assert learner._batch_prefetcher.num_workers == 1
+            actor.step_once()
+            actor.step_once()
+            summary = learner.run(
+                max_train_iter=4,
+                max_idle_seconds=15.0,
+                install_signal_handlers=False,
+            )
+            assert summary['train_iter'] == 4
+            assert summary['ingested_episodes'] >= 4
+        finally:
+            actor.close()
+            learner.close()
+
+    def test_learner_prefetch_with_reanalyze_surfaces_worker_error(self, tmp_path):
+        """A crash inside the background prefetcher must raise instead of silently falling back to main-thread sample."""
+        cfg, create_cfg = _make_tiny_galcon_cfg()
+        cfg.policy.reanalyze_ratio = 0.5
+        cfg.policy.reanalyze_outdated = True
+        run_dir = tmp_path / 'run_reanalyze_err'
+
+        learner = AsyncLearner(
+            input_cfg=(cfg, create_cfg),
+            run_dir=run_dir,
+            seed=0,
+            device='cpu',
+            save_ckpt_every_n_updates=0,
+            max_replay_ratio=None,
+            min_transitions=4,
+            poll_interval=0.02,
+            use_bg_reader=False,
+            prefetch_workers=1,
+            prefetch_queue_size=2,
+        )
+        actor = SelfPlayActor(
+            input_cfg=(cfg, create_cfg),
+            run_dir=run_dir,
+            actor_id='actor_0',
+            seed=10,
+            device='cpu',
+            collector_env_num=2,
+            n_episode=2,
+            num_simulations=4,
+            env_manager_type='base',
+            wait_for_initial_weights=False,
+        )
+        try:
+            actor.step_once()
+            learner.ingest_pending_segments()
+
+            def _boom(*_a, **_kw):
+                raise ValueError('simulated GPU OOM in prefetch worker')
+
+            learner.replay_buffer.sample = _boom
+            learner.start_prefetcher()
+            # Wait until worker thread hits _boom and exits.
+            deadline = time.time() + 5.0
+            while learner._batch_prefetcher.is_alive() and time.time() < deadline:
+                time.sleep(0.02)
+            assert not learner._batch_prefetcher.is_alive()
+
+            with pytest.raises(RuntimeError, match='simulated GPU OOM in prefetch worker'):
+                learner._sample_train_batch(int(cfg.policy.batch_size))
+        finally:
+            actor.close()
+            learner.close()
+
+    def test_learner_prefetch_with_reanalyze_stop_does_not_launch_duplicate_sample(self, tmp_path):
+        """request_stop() while waiting on a slow reanalyze worker must return None without concurrent main-thread sample."""
+        cfg, create_cfg = _make_tiny_galcon_cfg()
+        cfg.policy.reanalyze_ratio = 0.5
+        cfg.policy.reanalyze_outdated = True
+        run_dir = tmp_path / 'run_reanalyze_stop'
+
+        learner = AsyncLearner(
+            input_cfg=(cfg, create_cfg),
+            run_dir=run_dir,
+            seed=0,
+            device='cpu',
+            save_ckpt_every_n_updates=0,
+            max_replay_ratio=None,
+            min_transitions=4,
+            poll_interval=0.02,
+            use_bg_reader=False,
+            prefetch_workers=1,
+            prefetch_queue_size=2,
+        )
+        actor = SelfPlayActor(
+            input_cfg=(cfg, create_cfg),
+            run_dir=run_dir,
+            actor_id='actor_0',
+            seed=10,
+            device='cpu',
+            collector_env_num=2,
+            n_episode=2,
+            num_simulations=4,
+            env_manager_type='base',
+            wait_for_initial_weights=False,
+        )
+        try:
+            actor.step_once()
+            learner.ingest_pending_segments()
+
+            entered = threading.Event()
+            release = threading.Event()
+            active = 0
+            max_concurrent = 0
+            guard = threading.Lock()
+            orig_sample = learner.replay_buffer.sample
+
+            def _slow_sample(bs, pol):
+                nonlocal active, max_concurrent
+                with guard:
+                    active += 1
+                    max_concurrent = max(max_concurrent, active)
+                entered.set()
+                release.wait(timeout=5.0)
+                try:
+                    return orig_sample(bs, pol)
+                finally:
+                    with guard:
+                        active -= 1
+
+            learner.replay_buffer.sample = _slow_sample
+            learner.start_prefetcher()
+            assert entered.wait(timeout=5.0)
+
+            def _trigger_stop():
+                time.sleep(0.05)
+                learner.request_stop()
+
+            stopper = threading.Thread(target=_trigger_stop)
+            stopper.start()
+            try:
+                batch = learner._sample_train_batch(int(cfg.policy.batch_size))
+                stopper.join(timeout=2.0)
+            finally:
+                release.set()
+
+            assert batch is None
+            assert max_concurrent == 1
+        finally:
+            actor.close()
+            learner.close()
