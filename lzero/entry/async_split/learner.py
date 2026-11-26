@@ -37,6 +37,7 @@ from .io_utils import (
     atomic_pickle_save,
     consume_segment_file,
     detect_existing_run_artifacts,
+    extract_optimizer_step,
     find_latest_checkpoint,
     find_non_finite_tensors,
     list_incoming_segment_files,
@@ -47,6 +48,7 @@ from .io_utils import (
     read_segment_batch,
 )
 from .replay_throttle import ReplayRatioThrottler, compute_actor_learner_balance
+from .tb_utils import inspect_tb_max_steps, truncate_tb_events_after
 
 
 def _ding_exp_name(root_dir: Path) -> str:
@@ -403,25 +405,22 @@ class AsyncLearner:
         self.create_cfg = create_cfg
         set_pkg_seed(self.cfg.seed, use_cuda=self.cfg.policy.cuda)
 
+        # Validate env config before mutating logs/weights or loading large checkpoints/buffers.
+        env_fn, _, _ = get_vec_env_setting(self.cfg.env)
+        if hasattr(env_fn, 'validate_config'):
+            env_fn.validate_config(self.cfg)
+
         # SampledEfficientZeroPolicy._forward_learn logs _collect_mcts_temperature (must be float for DI-engine monitor).
         self.policy = create_policy(self.cfg.policy, model=None, enable_field=['learn', 'collect'])
 
         resumed_iter = 0
         resumed_envsteps = 0
+        has_resumed_envsteps = False
         resumed_episodes = 0
         resumed_files = 0
         ckpt_to_load = resume_ckpt_path if self.resume else (Path(model_path) if model_path is not None else None)
         if ckpt_to_load is not None:
             ckpt = torch.load(str(ckpt_to_load), map_location=self.cfg.policy.device, weights_only=False)
-            if 'optimizer' in ckpt and 'target_model' in ckpt:
-                self.policy.learn_mode.load_state_dict(ckpt)
-            elif 'model' in ckpt:
-                self.policy._learn_model.load_state_dict(ckpt['model'])
-                if hasattr(self.policy, '_target_model') and self.policy._target_model is not None:
-                    self.policy._target_model.load_state_dict(ckpt['model'])
-            else:
-                raise ValueError(f'Unrecognized checkpoint format at {ckpt_to_load}')
-
             if self.resume:
                 if ckpt.get('last_iter') is not None:
                     resumed_iter = int(ckpt['last_iter'])
@@ -431,23 +430,68 @@ class AsyncLearner:
                     parsed_iter = parse_checkpoint_iter(ckpt_to_load)
                     resumed_iter = int(parsed_iter) if parsed_iter is not None else 0
 
+                opt_step = extract_optimizer_step(ckpt)
+                if opt_step is not None and opt_step > resumed_iter:
+                    raise ValueError(
+                        f"Cannot --resume from '{ckpt_to_load}': checkpoint reports "
+                        f'last_iter={resumed_iter}, but optimizer state has step={opt_step}. '
+                        'This indicates the iteration counter was previously reset (e.g. restarted '
+                        'without --resume). Resuming into this run directory would overwrite '
+                        'existing checkpoints and cause backward horizontal lines in TensorBoard. '
+                        'Repair the checkpoint/logs first or start in a new --run-dir.'
+                    )
+
+                if model_path is not None:
+                    highest_ckpt = find_latest_checkpoint(self.dirs.ckpt_dir)
+                    if highest_ckpt is not None:
+                        highest_iter = parse_checkpoint_iter(highest_ckpt)
+                        if highest_iter is not None and resumed_iter < highest_iter:
+                            raise ValueError(
+                                f"Cannot --resume into '{self.dirs.root_dir}' from '{ckpt_to_load.name}' "
+                                f'(train_iter={resumed_iter}) because newer checkpoint '
+                                f"'{highest_ckpt.name}' (train_iter={highest_iter}) already exists in "
+                                f"'{self.dirs.ckpt_dir}'. Resuming from an earlier iteration in the same "
+                                'run directory would overwrite checkpoints and create backward lines in '
+                                'TensorBoard. Use a new --run-dir to branch from an earlier checkpoint, '
+                                'or archive/remove newer checkpoints first.'
+                            )
+
                 if ckpt.get('last_step') is not None:
                     resumed_envsteps = int(ckpt['last_step'])
+                    has_resumed_envsteps = True
                 elif ckpt.get('envstep') is not None:
                     resumed_envsteps = int(ckpt['envstep'])
+                    has_resumed_envsteps = True
 
                 saved_state = self._read_learner_state_safe()
                 if saved_state is not None and int(saved_state.get('train_iter', -1)) == resumed_iter:
                     resumed_envsteps = max(resumed_envsteps, int(saved_state.get('total_ingested_envsteps', 0)))
+                    has_resumed_envsteps = True
                     resumed_episodes = int(saved_state.get('total_ingested_episodes', 0))
                     resumed_files = int(saved_state.get('total_files_ingested', 0))
 
-                if (
-                    resumed_iter > 0
-                    and hasattr(self.policy, '_target_model')
-                    and hasattr(self.policy._target_model, 'reset_state')
-                ):
-                    self.policy._target_model.reset_state(target_update_count=resumed_iter)
+            if 'optimizer' in ckpt and 'target_model' in ckpt:
+                self.policy.learn_mode.load_state_dict(ckpt)
+            elif 'model' in ckpt:
+                self.policy._learn_model.load_state_dict(ckpt['model'])
+                if hasattr(self.policy, '_target_model') and self.policy._target_model is not None:
+                    self.policy._target_model.load_state_dict(ckpt['model'])
+            else:
+                raise ValueError(f'Unrecognized checkpoint format at {ckpt_to_load}')
+
+            if (
+                self.resume
+                and resumed_iter > 0
+                and hasattr(self.policy, '_target_model')
+                and hasattr(self.policy._target_model, 'reset_state')
+            ):
+                self.policy._target_model.reset_state(target_update_count=resumed_iter)
+
+        if self.resume:
+            self._reconcile_resumed_logs_and_eval_state(
+                resumed_iter=resumed_iter,
+                resumed_envsteps=resumed_envsteps if has_resumed_envsteps else None,
+            )
 
         self.policy._collect_mcts_temperature = float(
             visit_count_temperature(
@@ -473,14 +517,8 @@ class AsyncLearner:
         # Initialize replay buffer with exact env_fn.reflect_game_segment attachment
         buffer_cls = _select_game_buffer_cls(self.create_cfg.policy.type)
         self.replay_buffer = buffer_cls(self.cfg.policy)
-        env_fn, _, _ = get_vec_env_setting(self.cfg.env)
-        if hasattr(env_fn, 'validate_config'):
-            env_fn.validate_config(self.cfg)
         if hasattr(env_fn, 'reflect_game_segment'):
             self.replay_buffer.reflect_fn = env_fn.reflect_game_segment
-
-        if self.resume and self.persist_replay_buffer:
-            self._load_replay_buffer_snapshot(expected_iter=resumed_iter)
 
         effective_min = (
             int(min_transitions)
@@ -516,6 +554,13 @@ class AsyncLearner:
         )
 
         self.learner.call_hook('before_run')
+        # Publish initial (or resumed) weights before loading replay_buffer.pkl so actors
+        # and evaluator immediately observe the reconciled train_iter rather than stale weights.
+        self.publish_current_weights()
+
+        if self.resume and self.persist_replay_buffer:
+            self._load_replay_buffer_snapshot(expected_iter=resumed_iter)
+
         if self.resume:
             logging.info(
                 f'[AsyncLearner] Resumed from {resume_ckpt_path}: '
@@ -524,8 +569,69 @@ class AsyncLearner:
                 f'ingested_episodes={self.total_ingested_episodes}, '
                 f'buffer_transitions={self.replay_buffer.get_num_of_transitions()}'
             )
-        # Publish initial (or resumed) weights immediately so actors and evaluator sync to current train_iter.
-        self.publish_current_weights()
+
+    def _reconcile_resumed_logs_and_eval_state(
+        self,
+        resumed_iter: int,
+        resumed_envsteps: Optional[int],
+    ) -> None:
+        """Prune orphaned post-checkpoint TensorBoard events (e.g. after an unclean crash)
+        and roll back ``evaluator_state.json`` if it advanced past ``resumed_iter``.
+        """
+        learner_stats = truncate_tb_events_after(
+            self.dirs.log_dir / 'learner',
+            max_iter=resumed_iter,
+            max_envstep=resumed_envsteps,
+            pre_increment_iter_prefixes=('learner_iter/',),
+        )
+        if learner_stats['events_dropped'] > 0:
+            logging.warning(
+                f'[AsyncLearner] Pruned {learner_stats["events_dropped"]} orphaned post-checkpoint '
+                f'learner TensorBoard event(s) beyond train_iter={resumed_iter}'
+                + (f', envstep={resumed_envsteps}' if resumed_envsteps is not None else '')
+                + f' (modified={learner_stats["files_modified"]}, removed={learner_stats["files_removed"]}).'
+            )
+
+        eval_log_dir = self.dirs.log_dir / 'evaluator'
+        eval_stats = truncate_tb_events_after(
+            eval_log_dir,
+            max_iter=resumed_iter,
+            max_envstep=resumed_envsteps,
+            pre_increment_iter_prefixes=(),
+        )
+        if eval_stats['events_dropped'] > 0:
+            logging.warning(
+                f'[AsyncLearner] Pruned {eval_stats["events_dropped"]} orphaned post-checkpoint '
+                f'evaluator TensorBoard event(s) beyond train_iter={resumed_iter}'
+                + (f', envstep={resumed_envsteps}' if resumed_envsteps is not None else '')
+                + f' (modified={eval_stats["files_modified"]}, removed={eval_stats["files_removed"]}).'
+            )
+
+        try:
+            eval_state = read_json(self.dirs.evaluator_state_path)
+        except Exception:
+            eval_state = None
+        if (
+            eval_state is not None
+            and eval_state.get('last_eval_iter') is not None
+            and int(eval_state['last_eval_iter']) > resumed_iter
+        ):
+            old_eval_iter = int(eval_state['last_eval_iter'])
+            clamped_iter = inspect_tb_max_steps(eval_log_dir)['max_iter']
+            if clamped_iter is not None and clamped_iter > resumed_iter:
+                clamped_iter = resumed_iter
+            eval_state['last_eval_iter'] = clamped_iter
+            eval_state['timestamp'] = time.time()
+            try:
+                atomic_json_save(eval_state, self.dirs.evaluator_state_path)
+                logging.warning(
+                    f'[AsyncLearner] Rolled back evaluator_state.json last_eval_iter '
+                    f'from {old_eval_iter} to {clamped_iter} to match resumed train_iter={resumed_iter}.'
+                )
+            except Exception as exc:
+                logging.warning(
+                    f'[AsyncLearner] Failed to update {self.dirs.evaluator_state_path.name}: {exc}'
+                )
 
     def _read_learner_state_safe(self) -> Optional[Dict[str, Any]]:
         try:

@@ -11,15 +11,28 @@ import pytest
 import torch
 
 from lzero.entry.async_split import AsyncEvaluator, AsyncLearner, SelfPlayActor
-from lzero.entry.async_split.cli import build_parser
+from lzero.entry.async_split.cli import (
+    _stat_signature,
+    _wait_for_learner_weights_refresh,
+    build_parser,
+)
 from lzero.entry.async_split.io_utils import (
     AsyncSplitDirs,
     atomic_json_save,
     atomic_pickle_save,
     detect_existing_run_artifacts,
+    extract_optimizer_step,
     find_latest_checkpoint,
     parse_checkpoint_iter,
+    publish_weights,
+    read_json,
     write_segment_batch,
+)
+from lzero.entry.async_split.tb_utils import (
+    inspect_tb_max_steps,
+    is_envstep_tag,
+    list_tb_event_files,
+    truncate_tb_events_after,
 )
 from lzero.entry.tests.test_async_split_e2e import _make_tiny_galcon_async_cfg
 
@@ -469,3 +482,415 @@ def test_close_skips_checkpoint_save_when_weights_are_non_finite(tmp_path):
     assert find_latest_checkpoint(learner.dirs.ckpt_dir) is None
     assert not learner.dirs.learner_state_path.exists()
     assert not learner.dirs.replay_buffer_path.exists()
+
+
+@pytest.mark.unittest
+def test_resume_refuses_optimizer_step_ahead_of_last_iter(tmp_path):
+    """A checkpoint whose optimizer step exceeds last_iter (from a legacy counter reset)
+    must be rejected on --resume instead of silently overwriting checkpoints and drawing
+    backward TensorBoard lines.
+    """
+    run_dir = tmp_path / 'reset_counter_run'
+    cfg_pair = _make_tiny_galcon_async_cfg()
+
+    learner1 = AsyncLearner(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=0,
+        device='cpu',
+        save_ckpt_every_n_updates=0,
+        use_bg_reader=False,
+    )
+    try:
+        ckpt_state = learner1.policy.learn_mode.state_dict()
+        ckpt_state['last_iter'] = 39251
+        ckpt_state['last_step'] = 981295
+        ckpt_state['optimizer'] = {'state': {0: {'step': torch.tensor(139426.0)}}, 'param_groups': []}
+        assert extract_optimizer_step(ckpt_state) == 139426
+        bad_ckpt = learner1.dirs.ckpt_dir / 'iteration_39251.pth.tar'
+        torch.save(ckpt_state, str(bad_ckpt))
+    finally:
+        learner1.close()
+
+    with pytest.raises(ValueError, match='optimizer state has step=139426'):
+        AsyncLearner(
+            input_cfg=cfg_pair,
+            run_dir=run_dir,
+            seed=0,
+            device='cpu',
+            resume=True,
+            model_path=str(bad_ckpt),
+            save_ckpt_every_n_updates=0,
+            use_bg_reader=False,
+        )
+
+
+@pytest.mark.unittest
+def test_resume_refuses_explicit_model_path_older_than_latest_checkpoint(tmp_path):
+    """Explicit --resume --model-path pointing to an earlier iteration than existing
+    checkpoints in the same run_dir must fail fast instead of regressing steps.
+    """
+    run_dir = tmp_path / 'step_regression_run'
+    cfg_pair = _make_tiny_galcon_async_cfg()
+
+    learner1 = AsyncLearner(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=0,
+        device='cpu',
+        save_ckpt_every_n_updates=0,
+        use_bg_reader=False,
+    )
+    try:
+        base_sd = learner1.policy.learn_mode.state_dict()
+        older_ckpt = learner1.dirs.ckpt_dir / 'iteration_10.pth.tar'
+        newer_ckpt = learner1.dirs.ckpt_dir / 'iteration_50.pth.tar'
+        torch.save({**base_sd, 'last_iter': 10, 'last_step': 200}, str(older_ckpt))
+        torch.save({**base_sd, 'last_iter': 50, 'last_step': 1000}, str(newer_ckpt))
+    finally:
+        learner1.close()
+
+    with pytest.raises(ValueError, match='newer checkpoint'):
+        AsyncLearner(
+            input_cfg=cfg_pair,
+            run_dir=run_dir,
+            seed=0,
+            device='cpu',
+            resume=True,
+            model_path=str(older_ckpt),
+            save_ckpt_every_n_updates=0,
+            use_bg_reader=False,
+        )
+
+
+@pytest.mark.unittest
+def test_unclean_crash_rollback_prunes_orphaned_tb_events_and_clamps_eval_state(tmp_path):
+    """Simulate a hard crash (SIGKILL) between periodic checkpoints:
+    - Periodic checkpoint saved at iter 2, then learner continues to iter 3 and evaluator
+      evaluates iter 2 and iter 3 before crashing without graceful shutdown.
+    - Resuming from iteration_2.pth.tar must prune orphaned events (> iter 2 / > envstep@2)
+      across BOTH iter-axis and envstep-axis tags without wiping valid envstep history,
+      roll back evaluator_state.json from 3 -> 2, and produce strictly non-decreasing
+      TensorBoard steps across every tag when continuing to iter 5.
+    """
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    run_dir = tmp_path / 'crash_rollback_e2e'
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    cfg_pair[0].policy.learn = dict(learner=dict(hook=dict(log_show_after_iter=1)))
+
+    actor = SelfPlayActor(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        actor_id='actor_0',
+        seed=10,
+        device='cpu',
+        env_manager_type='base',
+        weight_sync_interval=1,
+    )
+    learner1 = AsyncLearner(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=0,
+        device='cpu',
+        publish_every_n_updates=1,
+        save_ckpt_every_n_updates=2,
+        max_replay_ratio=None,
+        min_transitions=4,
+        use_bg_reader=False,
+    )
+    evaluator1 = AsyncEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=20,
+        device='cpu',
+        evaluator_env_num=2,
+        n_evaluator_episode=2,
+        env_manager_type='base',
+        min_iter_gap=0,
+    )
+
+    try:
+        actor.step_once(n_episode=2)
+        learner1.ingest_pending_segments()
+        for _ in range(2):
+            assert learner1.train_step() is not None
+        assert learner1.learner.train_iter == 2
+        assert (learner1.dirs.ckpt_dir / 'iteration_2.pth.tar').is_file()
+        envsteps_at_2 = learner1.total_ingested_envsteps
+
+        # Evaluate at iter 2 (valid pre-checkpoint eval)
+        st = learner1.dirs.latest_weights_path.stat()
+        os.utime(learner1.dirs.latest_weights_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        ev_at_2 = evaluator1.eval_once_if_updated()
+        assert ev_at_2 is not None and ev_at_2['train_iter'] == 2
+
+        # Ingest more data and train to iter 3 (NOT a periodic checkpoint multiple -> no iter 3 ckpt)
+        actor.step_once(n_episode=2)
+        learner1.ingest_pending_segments()
+        assert learner1.total_ingested_envsteps > envsteps_at_2
+        assert learner1.train_step() is not None
+        assert learner1.learner.train_iter == 3
+        assert not (learner1.dirs.ckpt_dir / 'iteration_3.pth.tar').is_file()
+
+        # Evaluator also advances past checkpoint 2 to iter 3 before crash
+        st = learner1.dirs.latest_weights_path.stat()
+        os.utime(learner1.dirs.latest_weights_path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000))
+        ev_at_3 = evaluator1.eval_once_if_updated()
+        assert ev_at_3 is not None and ev_at_3['train_iter'] == 3
+        assert read_json(learner1.dirs.evaluator_state_path)['last_eval_iter'] == 3
+
+        # Simulate SIGKILL: flush writers WITHOUT calling learner1.close() so no iteration_3.pth.tar is saved
+        learner1.tb_logger.flush()
+        learner1.tb_logger.close()
+        evaluator1.close()
+    except Exception:
+        actor.close()
+        raise
+
+    # Confirm orphaned iter-3 events exist on disk before resume
+    assert inspect_tb_max_steps(run_dir / 'log' / 'learner')['max_iter'] == 3
+    assert inspect_tb_max_steps(run_dir / 'log' / 'learner')['max_envstep'] > envsteps_at_2
+    assert inspect_tb_max_steps(run_dir / 'log' / 'evaluator')['max_iter'] == 3
+
+    # --- Session 2: Resume after crash (auto-picks iteration_2.pth.tar) ---
+    learner2 = AsyncLearner(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=0,
+        device='cpu',
+        resume=True,
+        publish_every_n_updates=1,
+        save_ckpt_every_n_updates=2,
+        max_replay_ratio=None,
+        min_transitions=4,
+        use_bg_reader=False,
+    )
+    evaluator2 = AsyncEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=20,
+        device='cpu',
+        evaluator_env_num=2,
+        n_evaluator_episode=2,
+        env_manager_type='base',
+        min_iter_gap=0,
+        resume=True,
+    )
+
+    try:
+        assert learner2.learner.train_iter == 2
+        assert learner2.total_ingested_envsteps == envsteps_at_2
+        # Evaluator state must have been rolled back from 3 -> 2
+        assert evaluator2._last_eval_iter == 2
+        assert read_json(learner2.dirs.evaluator_state_path)['last_eval_iter'] == 2
+        # Published weights must already reflect reconciled iter 2
+        published = torch.load(str(learner2.dirs.latest_weights_path), map_location='cpu', weights_only=False)
+        assert published['train_iter'] == 2
+        assert published['envstep'] == envsteps_at_2
+
+        # Continue training 2->5 and evaluate at 5
+        actor.step_once(n_episode=2)
+        learner2.ingest_pending_segments()
+        for _ in range(3):
+            assert learner2.train_step() is not None
+        assert learner2.learner.train_iter == 5
+
+        st = learner2.dirs.latest_weights_path.stat()
+        os.utime(learner2.dirs.latest_weights_path, ns=(st.st_atime_ns, st.st_mtime_ns + 3_000_000))
+        ev_at_5 = evaluator2.eval_once_if_updated()
+        assert ev_at_5 is not None and ev_at_5['train_iter'] == 5
+    finally:
+        actor.close()
+        evaluator2.close()
+        learner2.close()
+
+    # Check EVERY scalar tag in BOTH learner and evaluator via TensorBoard's real EventAccumulator
+    for sub in ('learner', 'evaluator'):
+        ea = EventAccumulator(str(run_dir / 'log' / sub), size_guidance={'scalars': 0})
+        ea.Reload()
+        tags = ea.Tags().get('scalars', [])
+        assert len(tags) > 0
+        for tag in tags:
+            steps = [e.step for e in ea.Scalars(tag)]
+            assert steps == sorted(steps), f'Backward step jump in {sub}/{tag}: {steps}'
+
+    # Verify exact continuity on both iter-axis AND envstep-axis (no wiped envstep history!)
+    ea_learner = EventAccumulator(str(run_dir / 'log' / 'learner'), size_guidance={'scalars': 0})
+    ea_learner.Reload()
+    assert [e.step for e in ea_learner.Scalars('learner_iter/value_loss_avg')] == [0, 1, 2, 3, 4]
+    learner_step_steps = [e.step for e in ea_learner.Scalars('learner_step/value_loss_avg')]
+    assert len(learner_step_steps) == 5
+    assert learner_step_steps[0] == envsteps_at_2 and learner_step_steps[-1] > envsteps_at_2
+
+    ea_eval = EventAccumulator(str(run_dir / 'log' / 'evaluator'), size_guidance={'scalars': 0})
+    ea_eval.Reload()
+    assert [e.step for e in ea_eval.Scalars('evaluator_iter/eval_episode_return_mean')] == [2, 5]
+    eval_step_steps = [e.step for e in ea_eval.Scalars('evaluator_step/eval_episode_return_mean')]
+    assert len(eval_step_steps) == 2 and eval_step_steps[0] == envsteps_at_2 and eval_step_steps[1] > envsteps_at_2
+
+
+@pytest.mark.unittest
+def test_evaluator_resume_infers_last_eval_iter_from_tb_when_state_json_missing(tmp_path):
+    """If evaluator_state.json is absent when resuming a legacy run, AsyncEvaluator must
+    infer last_eval_iter from existing TensorBoard event files so it never logs backwards.
+    """
+    run_dir = tmp_path / 'eval_tb_fallback'
+    cfg_pair = _make_tiny_galcon_async_cfg()
+
+    learner = AsyncLearner(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=0,
+        device='cpu',
+        save_ckpt_every_n_updates=0,
+        use_bg_reader=False,
+    )
+    evaluator1 = AsyncEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=20,
+        device='cpu',
+        evaluator_env_num=2,
+        n_evaluator_episode=2,
+        env_manager_type='base',
+        min_iter_gap=0,
+    )
+    try:
+        publish_weights(
+            learner.dirs.latest_weights_path,
+            learner.policy._learn_model.state_dict(),
+            train_iter=100,
+            envstep=2500,
+        )
+        res = evaluator1.eval_once_if_updated()
+        assert res is not None and res['train_iter'] == 100
+    finally:
+        evaluator1.close()
+        learner.close()
+
+    # Delete evaluator_state.json to simulate a legacy pre-resume run
+    learner.dirs.evaluator_state_path.unlink()
+    assert not learner.dirs.evaluator_state_path.exists()
+
+    # Publish a lower train_iter (e.g. stale/regressed weights)
+    publish_weights(
+        learner.dirs.latest_weights_path,
+        learner.policy._learn_model.state_dict(),
+        train_iter=40,
+        envstep=1000,
+    )
+
+    evaluator2 = AsyncEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=20,
+        device='cpu',
+        evaluator_env_num=2,
+        n_evaluator_episode=2,
+        env_manager_type='base',
+        min_iter_gap=0,
+        resume=True,
+    )
+    try:
+        assert evaluator2._last_eval_iter == 100
+        # Must refuse to evaluate train_iter=40 <= 100
+        assert evaluator2.eval_once_if_updated() is None
+    finally:
+        evaluator2.close()
+
+
+@pytest.mark.unittest
+def test_tb_utils_tag_classification_clean_noop_and_corrupt_tail(tmp_path):
+    from tensorboardX import SummaryWriter
+
+    assert is_envstep_tag('learner_step/value_loss_avg') is True
+    assert is_envstep_tag('evaluator_step/eval_episode_return_mean') is True
+    assert is_envstep_tag('evaluator_step_task0/reward_mean') is True
+    assert is_envstep_tag('learner_iter/value_loss_avg') is False
+    assert is_envstep_tag('async_learner/ingested_envsteps') is False
+    assert is_envstep_tag('evaluator_iter/avg_envstep_per_episode') is False
+
+    log_dir = tmp_path / 'tb_dir'
+    w1 = SummaryWriter(str(log_dir), filename_suffix='.session1')
+    w1.add_scalar('learner_iter/loss', 1.0, 0)
+    w1.add_scalar('learner_iter/loss', 0.9, 1)
+    w1.add_scalar('async_learner/ingested_envsteps', 100.0, 2)
+    w1.add_scalar('learner_step/loss', 0.9, 100)
+    w1.flush()
+    w1.close()
+
+    ef1 = list_tb_event_files(log_dir)[0]
+    mtime_before = ef1.stat().st_mtime_ns
+
+    # Clean cutoff at (iter=2, envstep=100) must leave ef1 completely untouched
+    stats_clean = truncate_tb_events_after(log_dir, max_iter=2, max_envstep=100)
+    assert stats_clean == {'files_modified': 0, 'files_removed': 0, 'events_dropped': 0}
+    assert ef1.stat().st_mtime_ns == mtime_before
+
+    # Write a second file whose events are ALL post-checkpoint, plus corrupt tail on ef1
+    w2 = SummaryWriter(str(log_dir), filename_suffix='.session2')
+    w2.add_scalar('learner_iter/loss', 0.8, 2)
+    w2.add_scalar('async_learner/ingested_envsteps', 150.0, 3)
+    w2.add_scalar('learner_step/loss', 0.8, 150)
+    w2.flush()
+    w2.close()
+    assert len(list_tb_event_files(log_dir)) == 2
+
+    with open(ef1, 'ab') as f:
+        f.write(b'\x99\x88\x77\x66\x55')  # simulated SIGKILL partial trailing bytes
+
+    stats_prune = truncate_tb_events_after(log_dir, max_iter=2, max_envstep=100)
+    assert stats_prune['files_removed'] == 1
+    assert stats_prune['files_modified'] == 1
+    assert stats_prune['events_dropped'] == 3
+    assert len(list_tb_event_files(log_dir)) == 1
+    assert inspect_tb_max_steps(log_dir) == {'max_iter': 2, 'max_envstep': 100}
+
+
+@pytest.mark.unittest
+def test_wait_for_learner_weights_refresh_sync_and_early_exit(tmp_path):
+    weights_path = tmp_path / 'latest_weights.pt'
+    weights_path.write_bytes(b'old_weights')
+    prev_sig = _stat_signature(weights_path)
+
+    class _FakeProc:
+        def __init__(self, rc=None):
+            self._rc = rc
+            self.calls = 0
+
+        def poll(self):
+            self.calls += 1
+            return self._rc
+
+    # Case 1: Learner exits early (e.g., guardrail error) -> returns immediately without waiting
+    failed_proc = _FakeProc(rc=1)
+    ready, rc = _wait_for_learner_weights_refresh(
+        weights_path=weights_path,
+        prev_sig=prev_sig,
+        learner_proc=failed_proc,
+        stop_check=lambda: False,
+        timeout_sec=5.0,
+        poll_interval=0.01,
+    )
+    assert ready is False
+    assert rc == 1
+
+    # Case 2: Learner atomically replaces weights file -> detected promptly
+    running_proc = _FakeProc(rc=None)
+    tmp_new = tmp_path / '.latest_weights.pt.tmp'
+    tmp_new.write_bytes(b'fresh_reconciled_weights')
+    os.replace(str(tmp_new), str(weights_path))
+    st = weights_path.stat()
+    os.utime(weights_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+
+    ready2, rc2 = _wait_for_learner_weights_refresh(
+        weights_path=weights_path,
+        prev_sig=prev_sig,
+        learner_proc=running_proc,
+        stop_check=lambda: False,
+        timeout_sec=5.0,
+        poll_interval=0.01,
+    )
+    assert ready2 is True
+    assert rc2 is None

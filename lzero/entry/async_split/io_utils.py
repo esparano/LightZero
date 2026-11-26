@@ -12,7 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 from easydict import EasyDict
@@ -165,6 +165,39 @@ def parse_checkpoint_iter(path: os.PathLike | str) -> Optional[int]:
     if match is None:
         return None
     return int(match.group(1))
+
+
+def extract_optimizer_step(ckpt: Mapping[str, Any]) -> Optional[int]:
+    """Return the maximum integer optimizer ``step`` recorded in ``ckpt['optimizer']``, or ``None``.
+
+    PyTorch adaptive optimizers (e.g. Adam / AdamW) persist a monotonic per-parameter ``step``
+    counter in ``optimizer['state'][param_id]['step']``. Comparing this against ``last_iter``
+    detects checkpoints whose iteration counter was previously reset (e.g. legacy restarts
+    without ``--resume``).
+    """
+    opt = ckpt.get('optimizer')
+    if not isinstance(opt, Mapping):
+        return None
+    state = opt.get('state')
+    if not isinstance(state, Mapping) or not state:
+        return None
+    max_step: Optional[int] = None
+    for param_state in state.values():
+        if not isinstance(param_state, Mapping) or 'step' not in param_state:
+            continue
+        raw_step = param_state['step']
+        try:
+            if torch.is_tensor(raw_step):
+                if raw_step.numel() != 1:
+                    continue
+                val = int(raw_step.item())
+            else:
+                val = int(raw_step)
+        except (TypeError, ValueError):
+            continue
+        if max_step is None or val > max_step:
+            max_step = val
+    return max_step
 
 
 def find_latest_checkpoint(ckpt_dir: os.PathLike | str) -> Optional[Path]:

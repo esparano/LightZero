@@ -34,6 +34,7 @@ from .io_utils import (
     cpu_state_dict,
     read_json,
 )
+from .tb_utils import inspect_tb_max_steps
 
 
 def _ding_exp_name(root_dir: Path) -> str:
@@ -131,21 +132,31 @@ class AsyncEvaluator:
                 f'[AsyncEvaluator] Ignoring unreadable {self.dirs.evaluator_state_path.name}: {exc}'
             )
             state = None
-        if state is None:
-            return
-        if state.get('last_eval_iter') is not None:
-            self._last_eval_iter = int(state['last_eval_iter'])
-        if state.get('num_evals') is not None:
-            self._num_evals = int(state['num_evals'])
-        max_ret = state.get('max_episode_return')
-        if max_ret is not None and math.isfinite(float(max_ret)):
-            self.evaluator._max_episode_return = float(max_ret)
-        logging.info(
-            f'[AsyncEvaluator] Resumed evaluator state: '
-            f'last_eval_iter={self._last_eval_iter}, '
-            f'max_episode_return={self.evaluator._max_episode_return}, '
-            f'num_evals={self._num_evals}'
-        )
+        if state is not None:
+            if state.get('last_eval_iter') is not None:
+                self._last_eval_iter = int(state['last_eval_iter'])
+            if state.get('num_evals') is not None:
+                self._num_evals = int(state['num_evals'])
+            max_ret = state.get('max_episode_return')
+            if max_ret is not None and math.isfinite(float(max_ret)):
+                self.evaluator._max_episode_return = float(max_ret)
+
+        if self._last_eval_iter is None:
+            tb_stats = inspect_tb_max_steps(self.dirs.log_dir / 'evaluator')
+            if tb_stats['max_iter'] is not None:
+                self._last_eval_iter = int(tb_stats['max_iter'])
+                logging.info(
+                    f'[AsyncEvaluator] Inferred last_eval_iter={self._last_eval_iter} '
+                    'from existing TensorBoard logs (evaluator_state.json absent or unset).'
+                )
+
+        if state is not None or self._last_eval_iter is not None:
+            logging.info(
+                f'[AsyncEvaluator] Resumed evaluator state: '
+                f'last_eval_iter={self._last_eval_iter}, '
+                f'max_episode_return={self.evaluator._max_episode_return}, '
+                f'num_evals={self._num_evals}'
+            )
 
     def _save_evaluator_state(self) -> None:
         max_ret = float(self.evaluator._max_episode_return)

@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ditk import logging
 
@@ -241,6 +241,46 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _stat_signature(path: Path) -> Optional[Tuple[int, int, int]]:
+    """Return ``(st_ino, st_mtime_ns, st_size)`` for ``path``, or ``None`` if absent."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (int(st.st_ino), int(st.st_mtime_ns), int(st.st_size))
+
+
+def _wait_for_learner_weights_refresh(
+    weights_path: Path,
+    prev_sig: Optional[Tuple[int, int, int]],
+    learner_proc: subprocess.Popen,
+    stop_check: Callable[[], bool],
+    timeout_sec: float = 120.0,
+    poll_interval: float = 0.1,
+) -> Tuple[bool, Optional[int]]:
+    """Wait until the learner publishes a fresh ``latest_weights.pt`` after startup/resume.
+
+    Prevents actors and evaluator from racing against a stale pre-restart weights file
+    or pre-rollback ``evaluator_state.json``. Returns ``(ready, learner_exit_code)``.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while not stop_check():
+        rc = learner_proc.poll()
+        if rc is not None:
+            return False, rc
+        cur_sig = _stat_signature(weights_path)
+        if cur_sig is not None and cur_sig != prev_sig:
+            return True, None
+        if time.monotonic() >= deadline:
+            logging.warning(
+                f'[Launcher] Timed out after {timeout_sec:.0f}s waiting for learner to refresh '
+                f'{weights_path}; proceeding to start workers.'
+            )
+            return True, None
+        time.sleep(poll_interval)
+    return False, 0
+
+
 def _run_launch(args: argparse.Namespace) -> int:
     main_cfg, _ = load_config_from_py(args.config)
     run_dir = _resolve_run_dir(args.run_dir, main_cfg)
@@ -325,47 +365,6 @@ def _run_launch(args: argparse.Namespace) -> int:
     if args.prefetch_queue_size is not None:
         learner_cmd += ['--prefetch-queue-size', str(args.prefetch_queue_size)]
 
-    learner_proc = _spawn('learner', learner_cmd)
-
-    for i in range(max(0, int(args.num_actors))):
-        actor_cmd = base_cmd + [
-            'actor',
-            '--config', args.config,
-            '--run-dir', str(dirs.root_dir),
-            '--actor-id', f'actor_{i}',
-            '--seed', str(args.seed + 100 + i),
-            '--device', args.actor_device,
-            '--wait-for-initial-weights',
-        ]
-        if args.actor_env_num is not None:
-            actor_cmd += ['--env-num', str(args.actor_env_num)]
-        if args.actor_n_episode is not None:
-            actor_cmd += ['--n-episode', str(args.actor_n_episode)]
-        if args.env_manager is not None:
-            actor_cmd += ['--env-manager', args.env_manager]
-        _spawn(f'actor_{i}', actor_cmd)
-
-    if not args.no_evaluator:
-        eval_cmd = base_cmd + [
-            'evaluator',
-            '--config', args.config,
-            '--run-dir', str(dirs.root_dir),
-            '--seed', str(args.seed + 1000),
-            '--device', args.eval_device,
-            '--min-iter-gap', str(args.eval_min_iter_gap),
-        ]
-        if args.resume:
-            eval_cmd += ['--resume']
-        if args.eval_env_num is not None:
-            eval_cmd += ['--env-num', str(args.eval_env_num)]
-        if args.eval_n_episode is not None:
-            eval_cmd += ['--n-episode', str(args.eval_n_episode)]
-        if args.eval_bot is not None:
-            eval_cmd += ['--bot-action-type', args.eval_bot]
-        if args.env_manager is not None:
-            eval_cmd += ['--env-manager', args.env_manager]
-        _spawn('evaluator', eval_cmd)
-
     stop_requested = False
 
     def _handle_signal(*_a):
@@ -377,6 +376,70 @@ def _run_launch(args: argparse.Namespace) -> int:
 
     exit_code = 0
     try:
+        prev_weights_sig = _stat_signature(dirs.latest_weights_path)
+        learner_proc = _spawn('learner', learner_cmd)
+
+        # When resuming (or overwriting a directory that already has latest_weights.pt),
+        # wait for the learner to validate checkpoints, reconcile TensorBoard/evaluator
+        # state, and publish fresh weights before starting actors and evaluator.
+        if args.resume or prev_weights_sig is not None:
+            logging.info(
+                f'[Launcher] Waiting for learner to publish reconciled weights to {dirs.latest_weights_path}...'
+            )
+            ready, early_rc = _wait_for_learner_weights_refresh(
+                weights_path=dirs.latest_weights_path,
+                prev_sig=prev_weights_sig,
+                learner_proc=learner_proc,
+                stop_check=lambda: stop_requested,
+            )
+            if not ready:
+                if early_rc is not None and early_rc != 0:
+                    logging.error(
+                        f'[Launcher] Learner exited early with code {early_rc} during startup; '
+                        f'see {proc_log_dir / "learner.log"} for details.'
+                    )
+                exit_code = int(early_rc or 0)
+                return exit_code
+
+        for i in range(max(0, int(args.num_actors))):
+            actor_cmd = base_cmd + [
+                'actor',
+                '--config', args.config,
+                '--run-dir', str(dirs.root_dir),
+                '--actor-id', f'actor_{i}',
+                '--seed', str(args.seed + 100 + i),
+                '--device', args.actor_device,
+                '--wait-for-initial-weights',
+            ]
+            if args.actor_env_num is not None:
+                actor_cmd += ['--env-num', str(args.actor_env_num)]
+            if args.actor_n_episode is not None:
+                actor_cmd += ['--n-episode', str(args.actor_n_episode)]
+            if args.env_manager is not None:
+                actor_cmd += ['--env-manager', args.env_manager]
+            _spawn(f'actor_{i}', actor_cmd)
+
+        if not args.no_evaluator:
+            eval_cmd = base_cmd + [
+                'evaluator',
+                '--config', args.config,
+                '--run-dir', str(dirs.root_dir),
+                '--seed', str(args.seed + 1000),
+                '--device', args.eval_device,
+                '--min-iter-gap', str(args.eval_min_iter_gap),
+            ]
+            if args.resume:
+                eval_cmd += ['--resume']
+            if args.eval_env_num is not None:
+                eval_cmd += ['--env-num', str(args.eval_env_num)]
+            if args.eval_n_episode is not None:
+                eval_cmd += ['--n-episode', str(args.eval_n_episode)]
+            if args.eval_bot is not None:
+                eval_cmd += ['--bot-action-type', args.eval_bot]
+            if args.env_manager is not None:
+                eval_cmd += ['--env-manager', args.env_manager]
+            _spawn('evaluator', eval_cmd)
+
         while not stop_requested:
             rc = learner_proc.poll()
             if rc is not None:
