@@ -356,6 +356,7 @@ class OfflineTournament:
         self._pending_is_catchup = False
         self._catchup_player_ids: Set[str] = set()
         self._catchup_rounds_remaining: int = 0
+        self._restored_ordered_player_ids: List[str] = []
         self._newly_added_ids: Set[str] = set()
         self.runner: Optional[HeadToHeadRunner] = None
         self.tb_logger: Optional[SummaryWriter] = None
@@ -437,17 +438,25 @@ class OfflineTournament:
 
             # Build chronological player ordering:
             # - Bots first (anchor at index 0).
-            # - On incremental --resume (CLI passed only new checkpoints), place existing
-            #   checkpoints before new ones rather than prepending new checkpoints next to bot:random.
-            # - When all checkpoints share numeric train_iter values within their run prefix,
-            #   keep each prefix group sorted numerically by train_iter.
+            # - On --resume, preserve the exact persisted checkpoint order (unaffected by JSON
+            #   sort_keys=True or partial-overlap retries), appending only newly added checkpoints.
+            # - When new numeric checkpoints are inserted, sort each run-prefix group numerically
+            #   by train_iter so both appended and mid-inserted checkpoints connect chronologically.
             bot_ids = [f'bot:{b}' for b in self.ladder.anchor_bot_types]
-            if restored_existing and existing_ckpt_ids and not any(
-                pid in existing_ckpt_ids for pid in cli_ckpt_ids
-            ):
-                ordered_ckpts = list(existing_ckpt_ids) + [
-                    pid for pid in cli_ckpt_ids if pid not in existing_ckpt_ids
+            if restored_existing:
+                existing_set = set(existing_ckpt_ids)
+                base_ckpts: List[str] = [
+                    pid
+                    for pid in self._restored_ordered_player_ids
+                    if pid in existing_set
                 ]
+                seen_base = set(base_ckpts)
+                leftover = [pid for pid in existing_ckpt_ids if pid not in seen_base]
+                if leftover and all(self.ladder.players[pid].train_iter is not None for pid in leftover):
+                    leftover.sort(key=lambda pid: int(self.ladder.players[pid].train_iter))
+                base_ckpts.extend(leftover)
+                seen_base.update(leftover)
+                ordered_ckpts = base_ckpts + [pid for pid in cli_ckpt_ids if pid not in seen_base]
             else:
                 ordered_ckpts = list(cli_ckpt_ids) + [
                     pid for pid in existing_ckpt_ids if pid not in cli_ckpt_ids
@@ -474,14 +483,25 @@ class OfflineTournament:
             self._ordered_player_ids: List[str] = bot_ids + ordered_ckpts
 
             # If --resume added new checkpoints or anchor bots, re-open the chain pass and
-            # persist catch-up Swiss targets so mid-catch-up crashes resume cleanly.
+            # persist catch-up Swiss targets (accounting for any already in-flight pending round
+            # that was planned without the newly added players).
             if restored_existing and self._newly_added_ids:
                 self._chain_completed = False
                 self._catchup_player_ids.update(self._newly_added_ids)
                 target_swiss = max(0, self.num_rounds - 1)
-                regular_remaining = max(0, target_swiss - self._completed_swiss_rounds)
+                in_flight_regular = (
+                    1 if (self._pending_swiss_pairs and not self._pending_is_catchup) else 0
+                )
+                regular_remaining = max(
+                    0, target_swiss - (self._completed_swiss_rounds + in_flight_regular)
+                )
                 needed_catchup = max(0, target_swiss - regular_remaining)
-                self._catchup_rounds_remaining = max(self._catchup_rounds_remaining, needed_catchup)
+                in_flight_catchup = (
+                    1 if (self._pending_swiss_pairs and self._pending_is_catchup) else 0
+                )
+                self._catchup_rounds_remaining = max(
+                    self._catchup_rounds_remaining, needed_catchup + in_flight_catchup
+                )
 
             self.ladder.fit_ratings()
             if self.write_tb:
@@ -577,6 +597,9 @@ class OfflineTournament:
         self._pending_is_catchup = bool(state.get('pending_is_catchup', False))
         self._catchup_player_ids = {str(pid) for pid in state.get('catchup_player_ids', [])}
         self._catchup_rounds_remaining = max(0, int(state.get('catchup_rounds_remaining', 0)))
+        self._restored_ordered_player_ids = [
+            str(pid) for pid in state.get('ordered_player_ids', [])
+        ]
         logging.info(
             f'[Tournament] Resumed state from {self.state_path} '
             f'({len(self.ladder.matches)} prior match(es), '
@@ -599,6 +622,7 @@ class OfflineTournament:
             'pending_is_catchup': bool(self._pending_is_catchup),
             'catchup_player_ids': sorted(self._catchup_player_ids),
             'catchup_rounds_remaining': int(self._catchup_rounds_remaining),
+            'ordered_player_ids': list(self._ordered_player_ids),
             'timestamp': time.time(),
             'ladder': self.ladder.to_dict(),
         }

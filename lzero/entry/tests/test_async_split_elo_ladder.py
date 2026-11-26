@@ -814,6 +814,71 @@ def test_elo_evaluator_promotion_uses_post_refit_champion_score(tmp_path):
 
 
 @pytest.mark.unittest
+def test_offline_tournament_preserves_custom_order_and_inflight_catchup_on_resume(tmp_path):
+    from lzero.entry.async_split.io_utils import atomic_json_save, read_json
+
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    cfg_pair[0].policy.device = 'cpu'
+    compiled = compile_config(
+        copy.deepcopy(cfg_pair[0]), seed=0, env=None, auto=True, create_cfg=copy.deepcopy(cfg_pair[1]), save_cfg=False
+    )
+    policy = create_policy(copy.deepcopy(compiled.policy), model=None, enable_field=['learn', 'eval'])
+
+    ckpt_dir = tmp_path / 'custom_ckpts'
+    ckpt_dir.mkdir(parents=True)
+    # Intentionally non-alphabetical custom labels ('early', 'mid', 'late', 'final')
+    specs = []
+    for idx, label in enumerate(('early', 'mid', 'late', 'final')):
+        p = _save_dummy_ckpt(policy, ckpt_dir / f'{label}.pth.tar', train_iter=idx * 10, perturb=0.01 * idx)
+        specs.extend(parse_checkpoint_spec(f'{label}={p}'))
+
+    out_dir = tmp_path / 'tourn_custom_order'
+    t1 = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=specs[:3],  # early, mid, late
+        output_dir=out_dir,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=1,  # chain only
+        seed=13,
+        device='cpu',
+        env_num=1,
+    )
+    t1.run()
+
+    # Simulate an in-flight regular Swiss round when resuming with partial overlap ['late', 'final']
+    state = read_json(out_dir / 'tournament_state.json')
+    assert state['ordered_player_ids'] == ['bot:random', 'early', 'mid', 'late']
+    state['completed_swiss_rounds'] = 0
+    state['pending_swiss_pairs'] = [['bot:random', 'mid']]
+    state['pending_is_catchup'] = False
+    atomic_json_save(state, out_dir / 'tournament_state.json')
+
+    t2 = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=specs[2:],  # partial overlap: 'late' (existing) + 'final' (new)
+        output_dir=out_dir,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=2,  # 1 Swiss round total (currently in-flight without 'final')
+        seed=13,
+        device='cpu',
+        env_num=1,
+        resume=True,
+    )
+    try:
+        # Exact original order must be preserved despite sort_keys=True and partial overlap!
+        assert t2._ordered_player_ids == ['bot:random', 'early', 'mid', 'late', 'final']
+        # In-flight regular Swiss round planned without 'final' -> 'final' must get 1 catch-up Swiss round!
+        assert t2._catchup_rounds_remaining == 1
+        assert 'final' in t2._catchup_player_ids
+    finally:
+        t2.close()
+
+
+@pytest.mark.unittest
 def test_async_evaluator_both_mode_resume_desync_skips_duplicate_elo(tmp_path):
     cfg_pair = _make_tiny_galcon_async_cfg()
     run_dir = tmp_path / 'both_desync'

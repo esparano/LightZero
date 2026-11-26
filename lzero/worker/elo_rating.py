@@ -232,6 +232,10 @@ def fit_bradley_terry_elo(
     # Aggregate undirected pair counts: pair_scores[(i, j)] = [s_ij, s_ji, n_ij] for i < j
     pair_totals: Dict[Tuple[int, int], List[float]] = {}
     for m in matches:
+        if m.wins_a < 0 or m.draws < 0 or m.losses_a < 0:
+            raise ValueError(
+                f'MatchRecord counts must be non-negative, got ({m.wins_a}, {m.draws}, {m.losses_a})'
+            )
         if m.total_games <= 0 or m.player_a == m.player_b:
             continue
         ia = idx_of[m.player_a]

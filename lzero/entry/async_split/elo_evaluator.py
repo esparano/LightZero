@@ -558,6 +558,8 @@ class AsyncEloEvaluator:
             scalars['win_rate_vs_anchor'] = float(score_vs_anchor)
 
         for tag, val in scalars.items():
+            if not math.isfinite(val):
+                continue
             self.tb_logger.add_scalar(f'elo_iter/{tag}', val, int(train_iter))
             self.tb_logger.add_scalar(f'elo_step/{tag}', val, int(envstep))
         self.tb_logger.flush()

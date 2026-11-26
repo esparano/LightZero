@@ -121,7 +121,10 @@ class PolicyMatchPlayer(MatchPlayer):
                 self.eval_mode.reset(task_id=self.task_id)
         else:
             try:
-                self.eval_mode.reset(list(env_ids))
+                if self.task_id is None:
+                    self.eval_mode.reset(list(env_ids))
+                else:
+                    self.eval_mode.reset(list(env_ids), task_id=self.task_id)
             except TypeError:
                 self.eval_mode.reset()
 
