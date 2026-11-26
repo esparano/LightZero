@@ -33,9 +33,17 @@ from lzero.policy import visit_count_temperature
 
 from .io_utils import (
     AsyncSplitDirs,
+    atomic_json_save,
+    atomic_pickle_save,
     consume_segment_file,
+    detect_existing_run_artifacts,
+    find_latest_checkpoint,
+    find_non_finite_tensors,
     list_incoming_segment_files,
+    parse_checkpoint_iter,
     publish_weights,
+    read_json,
+    read_pickle,
     read_segment_batch,
 )
 from .replay_throttle import ReplayRatioThrottler, compute_actor_learner_balance
@@ -318,6 +326,9 @@ class AsyncLearner:
         seed: int = 0,
         device: str = 'auto',
         model_path: Optional[str] = None,
+        resume: bool = False,
+        overwrite: bool = False,
+        persist_replay_buffer: bool = True,
         publish_every_n_updates: int = 25,
         save_ckpt_every_n_updates: int = 1000,
         max_replay_ratio: Optional[float] = 0.5,
@@ -329,6 +340,35 @@ class AsyncLearner:
         prefetch_queue_size: Optional[int] = None,
     ) -> None:
         self.dirs = AsyncSplitDirs.from_root(run_dir)
+        self.resume = bool(resume)
+        self.overwrite = bool(overwrite)
+        self.persist_replay_buffer = bool(persist_replay_buffer)
+
+        if not self.resume and not self.overwrite:
+            existing_artifacts = detect_existing_run_artifacts(self.dirs)
+            if existing_artifacts:
+                summary = ', '.join(existing_artifacts)
+                raise FileExistsError(
+                    f"Run directory '{self.dirs.root_dir}' already contains existing run artifacts "
+                    f'({summary}). Pass --resume to continue this run, choose a new --run-dir, '
+                    'or pass --overwrite to start fresh in this directory.'
+                )
+
+        resume_ckpt_path: Optional[Path] = None
+        if self.resume:
+            if model_path is not None:
+                resume_ckpt_path = Path(model_path)
+                if not resume_ckpt_path.is_file():
+                    raise FileNotFoundError(
+                        f'Cannot resume: specified checkpoint does not exist: {resume_ckpt_path}'
+                    )
+            else:
+                resume_ckpt_path = find_latest_checkpoint(self.dirs.ckpt_dir)
+                if resume_ckpt_path is None:
+                    raise FileNotFoundError(
+                        f"Cannot resume: no 'iteration_<N>.pth.tar' checkpoint found in '{self.dirs.ckpt_dir}'."
+                    )
+
         self.dirs.ensure_exists(create_processed=archive_segments)
         self.publish_every_n_updates = max(1, int(publish_every_n_updates))
         self.save_ckpt_every_n_updates = max(0, int(save_ckpt_every_n_updates))
@@ -362,16 +402,14 @@ class AsyncLearner:
 
         # SampledEfficientZeroPolicy._forward_learn logs _collect_mcts_temperature (must be float for DI-engine monitor).
         self.policy = create_policy(self.cfg.policy, model=None, enable_field=['learn', 'collect'])
-        self.policy._collect_mcts_temperature = float(
-            visit_count_temperature(
-                self.cfg.policy.manual_temperature_decay,
-                self.cfg.policy.fixed_temperature_value,
-                self.cfg.policy.threshold_training_steps_for_final_temperature,
-                trained_steps=0,
-            )
-        )
-        if model_path is not None:
-            ckpt = torch.load(model_path, map_location=self.cfg.policy.device, weights_only=False)
+
+        resumed_iter = 0
+        resumed_envsteps = 0
+        resumed_episodes = 0
+        resumed_files = 0
+        ckpt_to_load = resume_ckpt_path if self.resume else (Path(model_path) if model_path is not None else None)
+        if ckpt_to_load is not None:
+            ckpt = torch.load(str(ckpt_to_load), map_location=self.cfg.policy.device, weights_only=False)
             if 'optimizer' in ckpt and 'target_model' in ckpt:
                 self.policy.learn_mode.load_state_dict(ckpt)
             elif 'model' in ckpt:
@@ -379,7 +417,43 @@ class AsyncLearner:
                 if hasattr(self.policy, '_target_model') and self.policy._target_model is not None:
                     self.policy._target_model.load_state_dict(ckpt['model'])
             else:
-                raise ValueError(f'Unrecognized checkpoint format at {model_path}')
+                raise ValueError(f'Unrecognized checkpoint format at {ckpt_to_load}')
+
+            if self.resume:
+                if ckpt.get('last_iter') is not None:
+                    resumed_iter = int(ckpt['last_iter'])
+                elif ckpt.get('train_iter') is not None:
+                    resumed_iter = int(ckpt['train_iter'])
+                else:
+                    parsed_iter = parse_checkpoint_iter(ckpt_to_load)
+                    resumed_iter = int(parsed_iter) if parsed_iter is not None else 0
+
+                if ckpt.get('last_step') is not None:
+                    resumed_envsteps = int(ckpt['last_step'])
+                elif ckpt.get('envstep') is not None:
+                    resumed_envsteps = int(ckpt['envstep'])
+
+                saved_state = self._read_learner_state_safe()
+                if saved_state is not None and int(saved_state.get('train_iter', -1)) == resumed_iter:
+                    resumed_envsteps = max(resumed_envsteps, int(saved_state.get('total_ingested_envsteps', 0)))
+                    resumed_episodes = int(saved_state.get('total_ingested_episodes', 0))
+                    resumed_files = int(saved_state.get('total_files_ingested', 0))
+
+                if (
+                    resumed_iter > 0
+                    and hasattr(self.policy, '_target_model')
+                    and hasattr(self.policy._target_model, 'reset_state')
+                ):
+                    self.policy._target_model.reset_state(target_update_count=resumed_iter)
+
+        self.policy._collect_mcts_temperature = float(
+            visit_count_temperature(
+                self.cfg.policy.manual_temperature_decay,
+                self.cfg.policy.fixed_temperature_value,
+                self.cfg.policy.threshold_training_steps_for_final_temperature,
+                trained_steps=resumed_iter,
+            )
+        )
 
         self.tb_logger = SummaryWriter(str(self.dirs.log_dir / 'learner'))
         self.learner = BaseLearner(
@@ -388,6 +462,10 @@ class AsyncLearner:
             self.tb_logger,
             exp_name=self.cfg.exp_name,
         )
+        if self.resume and resumed_iter > 0:
+            self.learner._last_iter.update(resumed_iter)
+        if self.resume and resumed_envsteps > 0:
+            self.learner._collector_envstep = resumed_envsteps
 
         # Initialize replay buffer with exact env_fn.reflect_game_segment attachment
         buffer_cls = _select_game_buffer_cls(self.create_cfg.policy.type)
@@ -397,6 +475,9 @@ class AsyncLearner:
             env_fn.validate_config(self.cfg)
         if hasattr(env_fn, 'reflect_game_segment'):
             self.replay_buffer.reflect_fn = env_fn.reflect_game_segment
+
+        if self.resume and self.persist_replay_buffer:
+            self._load_replay_buffer_snapshot(expected_iter=resumed_iter)
 
         effective_min = (
             int(min_transitions)
@@ -408,11 +489,11 @@ class AsyncLearner:
             max_replay_ratio=max_replay_ratio,
         )
 
-        self.total_ingested_envsteps = 0
-        self.total_ingested_episodes = 0
-        self.total_files_ingested = 0
-        self._last_published_iter = -1
-        self._last_saved_ckpt_iter = 0
+        self.total_ingested_envsteps = resumed_envsteps
+        self.total_ingested_episodes = resumed_episodes
+        self.total_files_ingested = resumed_files
+        self._last_published_iter = resumed_iter - 1
+        self._last_saved_ckpt_iter = resumed_iter
         self._recent_weight_lags: List[int] = []
         self._recent_throttled: List[float] = []
         self._last_balance_warn_time = 0.0
@@ -432,8 +513,103 @@ class AsyncLearner:
         )
 
         self.learner.call_hook('before_run')
-        # Publish initial weights immediately so actors and evaluator can sync at iter 0.
+        if self.resume:
+            logging.info(
+                f'[AsyncLearner] Resumed from {resume_ckpt_path}: '
+                f'train_iter={int(self.learner.train_iter)}, '
+                f'ingested_envsteps={self.total_ingested_envsteps}, '
+                f'ingested_episodes={self.total_ingested_episodes}, '
+                f'buffer_transitions={self.replay_buffer.get_num_of_transitions()}'
+            )
+        # Publish initial (or resumed) weights immediately so actors and evaluator sync to current train_iter.
         self.publish_current_weights()
+
+    def _read_learner_state_safe(self) -> Optional[Dict[str, Any]]:
+        try:
+            return read_json(self.dirs.learner_state_path)
+        except Exception as exc:
+            logging.warning(f'[AsyncLearner] Ignoring unreadable {self.dirs.learner_state_path.name}: {exc}')
+            return None
+
+    def _save_learner_state(self, checkpoint_name: Optional[str] = None) -> None:
+        payload: Dict[str, Any] = {
+            'version': 1,
+            'train_iter': int(self.learner.train_iter),
+            'total_ingested_envsteps': int(self.total_ingested_envsteps),
+            'total_ingested_episodes': int(self.total_ingested_episodes),
+            'total_files_ingested': int(self.total_files_ingested),
+            'checkpoint_name': checkpoint_name,
+            'timestamp': time.time(),
+        }
+        try:
+            atomic_json_save(payload, self.dirs.learner_state_path)
+        except Exception as exc:
+            logging.warning(f'[AsyncLearner] Failed to save {self.dirs.learner_state_path.name}: {exc}')
+
+    def _save_replay_buffer_snapshot(self) -> bool:
+        with self._buffer_rwlock.read_lock():
+            if self.replay_buffer.get_num_of_game_segments() <= 0:
+                return False
+            snapshot = {
+                'version': 1,
+                'train_iter': int(self.learner.train_iter),
+                'game_segment_buffer': self.replay_buffer.game_segment_buffer,
+                'game_pos_priorities': self.replay_buffer.game_pos_priorities,
+                'game_segment_game_pos_look_up': self.replay_buffer.game_segment_game_pos_look_up,
+                'num_of_collected_episodes': int(self.replay_buffer.num_of_collected_episodes),
+                'base_idx': int(self.replay_buffer.base_idx),
+                'clear_time': float(self.replay_buffer.clear_time),
+            }
+        try:
+            atomic_pickle_save(snapshot, self.dirs.replay_buffer_path)
+            logging.info(
+                f'[AsyncLearner] Saved replay buffer snapshot to {self.dirs.replay_buffer_path} '
+                f'(train_iter={snapshot["train_iter"]}, '
+                f'segments={len(snapshot["game_segment_buffer"])}, '
+                f'transitions={len(snapshot["game_segment_game_pos_look_up"])})'
+            )
+            return True
+        except Exception as exc:
+            logging.warning(f'[AsyncLearner] Failed to save replay buffer snapshot: {exc}')
+            return False
+
+    def _load_replay_buffer_snapshot(self, expected_iter: int) -> bool:
+        if not self.dirs.replay_buffer_path.is_file():
+            return False
+        try:
+            snapshot = read_pickle(self.dirs.replay_buffer_path)
+        except Exception as exc:
+            logging.warning(f'[AsyncLearner] Could not read replay buffer snapshot; starting cold: {exc}')
+            return False
+        if not isinstance(snapshot, dict):
+            logging.warning('[AsyncLearner] Invalid replay buffer snapshot format; starting cold.')
+            return False
+        snap_iter = snapshot.get('train_iter')
+        if snap_iter is not None and int(snap_iter) != int(expected_iter):
+            logging.warning(
+                f'[AsyncLearner] Replay buffer snapshot train_iter={snap_iter} does not match '
+                f'resumed checkpoint train_iter={expected_iter}; skipping stale buffer.'
+            )
+            return False
+        segments = snapshot.get('game_segment_buffer')
+        priorities = snapshot.get('game_pos_priorities')
+        lookup = snapshot.get('game_segment_game_pos_look_up')
+        if segments is None or priorities is None or lookup is None or len(priorities) != len(lookup):
+            logging.warning('[AsyncLearner] Corrupted/misaligned replay buffer snapshot; starting cold.')
+            return False
+        self.replay_buffer.game_segment_buffer = list(segments)
+        self.replay_buffer.game_pos_priorities = priorities
+        self.replay_buffer.game_segment_game_pos_look_up = list(lookup)
+        self.replay_buffer.num_of_collected_episodes = int(snapshot.get('num_of_collected_episodes', 0))
+        self.replay_buffer.base_idx = int(snapshot.get('base_idx', 0))
+        self.replay_buffer.clear_time = float(snapshot.get('clear_time', 0.0))
+        self.replay_buffer.remove_oldest_data_to_fit()
+        logging.info(
+            f'[AsyncLearner] Restored replay buffer snapshot: '
+            f'segments={self.replay_buffer.get_num_of_game_segments()}, '
+            f'transitions={self.replay_buffer.get_num_of_transitions()}'
+        )
+        return True
 
     def publish_current_weights(self) -> Dict[str, Any]:
         meta = publish_weights(
@@ -587,7 +763,9 @@ class AsyncLearner:
             and cur_iter > 0
             and cur_iter - self._last_saved_ckpt_iter >= self.save_ckpt_every_n_updates
         ):
-            self.learner.save_checkpoint(f'iteration_{cur_iter}.pth.tar')
+            ckpt_name = f'iteration_{cur_iter}.pth.tar'
+            self.learner.save_checkpoint(ckpt_name)
+            self._save_learner_state(checkpoint_name=ckpt_name)
             self._last_saved_ckpt_iter = cur_iter
 
         if cur_iter % max(1, self.publish_every_n_updates) == 0:
@@ -724,8 +902,12 @@ class AsyncLearner:
                         break
                     time.sleep(self.poll_interval)
         finally:
-            self.publish_current_weights()
-            self.close()
+            try:
+                self.publish_current_weights()
+            except FloatingPointError as exc:
+                logging.error(f'[AsyncLearner] Skipping final weight publish on shutdown: {exc}')
+            finally:
+                self.close()
 
         return {
             'train_iter': int(self.learner.train_iter),
@@ -747,10 +929,22 @@ class AsyncLearner:
         if self._bg_reader is not None:
             self._bg_reader.stop()
             self._bg_reader = None
-        try:
-            self.learner.call_hook('after_run')
-        except Exception:
-            pass
+        self.learner._collector_envstep = int(self.total_ingested_envsteps)
+        bad_keys = find_non_finite_tensors(self.policy._learn_model.state_dict())
+        if bad_keys:
+            preview = ', '.join(bad_keys[:5])
+            logging.error(
+                f'[AsyncLearner] Skipping shutdown checkpoint/state save due to non-finite weights '
+                f'({len(bad_keys)} bad tensors: {preview}).'
+            )
+        else:
+            try:
+                self.learner.call_hook('after_run')
+            except Exception as exc:
+                logging.warning(f'[AsyncLearner] after_run hook failed during close: {exc}')
+            self._save_learner_state(checkpoint_name=f'iteration_{int(self.learner.train_iter)}.pth.tar')
+            if self.persist_replay_buffer:
+                self._save_replay_buffer_snapshot()
         if self.tb_logger is not None:
             try:
                 self.tb_logger.flush()

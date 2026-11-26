@@ -4,8 +4,10 @@ for the lightweight decoupled actor-learner-evaluator split (no Ray).
 
 import copy
 import importlib.util
+import json
 import os
 import pickle
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -14,6 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from easydict import EasyDict
+
+_ITER_CKPT_RE = re.compile(r'^iteration_(\d+)\.pth\.tar$')
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,9 @@ class AsyncSplitDirs:
     weights_dir: Path
     latest_weights_path: Path
     ckpt_dir: Path
+    learner_state_path: Path
+    replay_buffer_path: Path
+    evaluator_state_path: Path
     segments_dir: Path
     incoming_dir: Path
     processed_dir: Path
@@ -37,12 +44,16 @@ class AsyncSplitDirs:
     def from_root(cls, root_dir: os.PathLike | str) -> 'AsyncSplitDirs':
         root = Path(root_dir).resolve()
         weights_dir = root / 'weights'
+        ckpt_dir = root / 'ckpt'
         segments_dir = root / 'segments'
         return cls(
             root_dir=root,
             weights_dir=weights_dir,
             latest_weights_path=weights_dir / 'latest_weights.pt',
-            ckpt_dir=root / 'ckpt',
+            ckpt_dir=ckpt_dir,
+            learner_state_path=ckpt_dir / 'learner_state.json',
+            replay_buffer_path=ckpt_dir / 'replay_buffer.pkl',
+            evaluator_state_path=ckpt_dir / 'evaluator_state.json',
             segments_dir=segments_dir,
             incoming_dir=segments_dir / 'incoming',
             processed_dir=segments_dir / 'processed',
@@ -90,6 +101,118 @@ def atomic_torch_save(payload: Any, target_path: os.PathLike | str) -> Path:
                 pass
         raise
     return target
+
+
+def atomic_json_save(payload: Dict[str, Any], target_path: os.PathLike | str) -> Path:
+    """Atomically write a JSON dictionary via temp file + ``os.replace``."""
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _atomic_tmp_path(target)
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+        os.replace(str(tmp_path), str(target))
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+    return target
+
+
+def read_json(path: os.PathLike | str) -> Optional[Dict[str, Any]]:
+    """Read a JSON dictionary if the file exists, otherwise return ``None``."""
+    target = Path(path)
+    if not target.is_file():
+        return None
+    with open(target, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f'Expected JSON object in {target}, got {type(data).__name__}')
+    return data
+
+
+def atomic_pickle_save(payload: Any, target_path: os.PathLike | str) -> Path:
+    """Atomically write a pickled payload via temp file + ``os.replace``."""
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _atomic_tmp_path(target)
+    try:
+        with open(tmp_path, 'wb') as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(str(tmp_path), str(target))
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+    return target
+
+
+def read_pickle(path: os.PathLike | str) -> Any:
+    """Read a pickled payload written by ``atomic_pickle_save``."""
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
+def parse_checkpoint_iter(path: os.PathLike | str) -> Optional[int]:
+    """Extract iteration number from ``iteration_<N>.pth.tar``, or ``None``."""
+    match = _ITER_CKPT_RE.match(Path(path).name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def find_latest_checkpoint(ckpt_dir: os.PathLike | str) -> Optional[Path]:
+    """Return the ``iteration_<N>.pth.tar`` file with the highest numeric ``N``."""
+    directory = Path(ckpt_dir)
+    if not directory.is_dir():
+        return None
+    best_iter = -1
+    best_path: Optional[Path] = None
+    for entry in directory.iterdir():
+        if not entry.is_file() or entry.name.startswith('.'):
+            continue
+        it = parse_checkpoint_iter(entry)
+        if it is not None and it > best_iter:
+            best_iter = it
+            best_path = entry
+    return best_path
+
+
+def detect_existing_run_artifacts(dirs: AsyncSplitDirs) -> List[str]:
+    """Return descriptions of existing run artifacts that would be overwritten or
+    mixed with TensorBoard history if starting a fresh run without ``--resume``.
+    """
+    found: List[str] = []
+    if dirs.latest_weights_path.is_file():
+        found.append(str(dirs.latest_weights_path.relative_to(dirs.root_dir)))
+    if dirs.ckpt_dir.is_dir():
+        ckpt_files = sorted(
+            p.name
+            for p in dirs.ckpt_dir.iterdir()
+            if p.is_file()
+            and not p.name.startswith('.')
+            and (
+                p.name.endswith('.pth.tar')
+                or p.name in {'learner_state.json', 'evaluator_state.json', 'replay_buffer.pkl'}
+            )
+        )
+        if ckpt_files:
+            preview = ', '.join(ckpt_files[:3])
+            suffix = f' (+{len(ckpt_files) - 3} more)' if len(ckpt_files) > 3 else ''
+            found.append(f'ckpt/{preview}{suffix}')
+    for sub in ('learner', 'evaluator'):
+        sub_dir = dirs.log_dir / sub
+        if sub_dir.is_dir():
+            tb_events = [p for p in sub_dir.iterdir() if p.is_file() and p.name.startswith('events.out.tfevents.')]
+            if tb_events:
+                found.append(f'log/{sub}/ ({len(tb_events)} TensorBoard event file(s))')
+    return found
 
 
 def find_non_finite_tensors(state_dict: Dict[str, Any]) -> List[str]:

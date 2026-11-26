@@ -20,7 +20,12 @@ from ditk import logging
 
 from .actor import SelfPlayActor
 from .evaluator import AsyncEvaluator
-from .io_utils import AsyncSplitDirs, load_config_from_py
+from .io_utils import (
+    AsyncSplitDirs,
+    detect_existing_run_artifacts,
+    find_latest_checkpoint,
+    load_config_from_py,
+)
 from .learner import AsyncLearner
 
 DEFAULT_GALCON_CONFIG = 'zoo/board_games/galcon/config/galcon_sez_sp_mode_config_SIMPLE.py'
@@ -108,7 +113,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_learner.add_argument('--run-dir', default=None, help='Shared run directory (defaults to cfg.exp_name).')
     p_learner.add_argument('--seed', type=int, default=0, help='Random seed.')
     p_learner.add_argument('--device', default='auto', choices=['cpu', 'cuda', 'auto'], help='Training device.')
-    p_learner.add_argument('--model-path', default=None, help='Optional pretrained checkpoint path.')
+    p_learner.add_argument('--model-path', default=None, help='Optional pretrained checkpoint path (or specific checkpoint to resume from with --resume).')
+    p_learner.add_argument(
+        '--resume',
+        action='store_true',
+        help='Resume an existing run in --run-dir, restoring checkpoint, counters, and saved replay buffer.',
+    )
+    p_learner.add_argument(
+        '--overwrite',
+        action='store_true',
+        help='Allow starting a fresh run inside a --run-dir that already contains checkpoints/logs.',
+    )
+    p_learner.add_argument(
+        '--no-persist-buffer',
+        action='store_true',
+        help='Disable saving/restoring replay_buffer.pkl on graceful shutdown and --resume.',
+    )
     p_learner.add_argument('--publish-every', type=int, default=25, help='Publish latest_weights.pt every N updates.')
     p_learner.add_argument('--save-ckpt-every', type=int, default=1000, help='Save iteration checkpoint every N updates (0 disables).')
     p_learner.add_argument(
@@ -152,6 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument('--poll-interval', type=float, default=2.0, help='Polling interval (seconds) for new weights.')
     p_eval.add_argument('--max-evals', type=int, default=None, help='Stop after N evaluations.')
     p_eval.add_argument('--max-idle-seconds', type=float, default=None, help='Optional idle timeout before exiting.')
+    p_eval.add_argument(
+        '--resume',
+        action='store_true',
+        help='Resume evaluator state (best return and last evaluated iteration) from --run-dir.',
+    )
 
     # --- launch ---
     p_launch = sub.add_parser('launch', help='Launch local learner + N actors + evaluator as OS subprocesses.')
@@ -164,6 +189,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument('--actor-n-episode', type=int, default=None)
     p_launch.add_argument('--learner-device', default='auto', choices=['cpu', 'cuda', 'auto'])
     p_launch.add_argument('--model-path', default=None)
+    p_launch.add_argument(
+        '--resume',
+        action='store_true',
+        help='Resume an existing run in --run-dir (restores latest checkpoint, counters, evaluator state, and saved replay buffer).',
+    )
+    p_launch.add_argument(
+        '--overwrite',
+        action='store_true',
+        help='Allow launching a fresh run inside a --run-dir that already contains checkpoints/logs.',
+    )
+    p_launch.add_argument(
+        '--no-persist-buffer',
+        action='store_true',
+        help='Disable saving/restoring replay_buffer.pkl on learner graceful shutdown and --resume.',
+    )
     p_launch.add_argument('--publish-every', type=int, default=25)
     p_launch.add_argument('--save-ckpt-every', type=int, default=1000)
     p_launch.add_argument('--max-replay-ratio', type=float, default=0.5)
@@ -205,6 +245,29 @@ def _run_launch(args: argparse.Namespace) -> int:
     main_cfg, _ = load_config_from_py(args.config)
     run_dir = _resolve_run_dir(args.run_dir, main_cfg)
     dirs = AsyncSplitDirs.from_root(run_dir)
+
+    if args.resume:
+        if args.model_path:
+            if not Path(args.model_path).is_file():
+                raise FileNotFoundError(
+                    f'Cannot --resume: specified checkpoint does not exist: {args.model_path}'
+                )
+        else:
+            latest_ckpt = find_latest_checkpoint(dirs.ckpt_dir)
+            if latest_ckpt is None:
+                raise FileNotFoundError(
+                    f"Cannot --resume: no 'iteration_<N>.pth.tar' checkpoint found in '{dirs.ckpt_dir}'."
+                )
+    elif not args.overwrite:
+        existing_artifacts = detect_existing_run_artifacts(dirs)
+        if existing_artifacts:
+            summary = ', '.join(existing_artifacts)
+            raise FileExistsError(
+                f"Run directory '{dirs.root_dir}' already contains existing run artifacts "
+                f'({summary}). Pass --resume to continue this run, choose a new --run-dir, '
+                'or pass --overwrite to start fresh in this directory.'
+            )
+
     dirs.ensure_exists()
     proc_log_dir = dirs.log_dir / 'procs'
     proc_log_dir.mkdir(parents=True, exist_ok=True)
@@ -225,7 +288,12 @@ def _run_launch(args: argparse.Namespace) -> int:
     procs: List[Tuple[str, subprocess.Popen, object]] = []
 
     def _spawn(name: str, cmd: List[str]) -> subprocess.Popen:
-        log_file = open(proc_log_dir / f'{name}.log', 'w', encoding='utf-8')
+        log_mode = 'a' if args.resume else 'w'
+        log_file = open(proc_log_dir / f'{name}.log', log_mode, encoding='utf-8')
+        if args.resume:
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            log_file.write(f'\n=== [Launcher] Resumed {name} at {ts} ===\n')
+            log_file.flush()
         logging.info(f'[Launcher] Starting {name}: {" ".join(cmd)}')
         proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=worker_env)
         procs.append((name, proc, log_file))
@@ -244,6 +312,12 @@ def _run_launch(args: argparse.Namespace) -> int:
     ]
     if args.model_path:
         learner_cmd += ['--model-path', args.model_path]
+    if args.resume:
+        learner_cmd += ['--resume']
+    if args.overwrite:
+        learner_cmd += ['--overwrite']
+    if args.no_persist_buffer:
+        learner_cmd += ['--no-persist-buffer']
     if args.min_transitions is not None:
         learner_cmd += ['--min-transitions', str(args.min_transitions)]
     if args.prefetch_workers and int(args.prefetch_workers) > 0:
@@ -280,6 +354,8 @@ def _run_launch(args: argparse.Namespace) -> int:
             '--device', args.eval_device,
             '--min-iter-gap', str(args.eval_min_iter_gap),
         ]
+        if args.resume:
+            eval_cmd += ['--resume']
         if args.eval_env_num is not None:
             eval_cmd += ['--env-num', str(args.eval_env_num)]
         if args.eval_n_episode is not None:
@@ -315,7 +391,7 @@ def _run_launch(args: argparse.Namespace) -> int:
                     proc.terminate()
                 except OSError:
                     pass
-        deadline = time.time() + 10.0
+        deadline = time.time() + 30.0
         for name, proc, log_file in procs:
             remaining = max(0.0, deadline - time.time())
             try:
@@ -366,6 +442,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             seed=args.seed,
             device=args.device,
             model_path=args.model_path,
+            resume=args.resume,
+            overwrite=args.overwrite,
+            persist_replay_buffer=not args.no_persist_buffer,
             publish_every_n_updates=args.publish_every,
             save_ckpt_every_n_updates=args.save_ckpt_every,
             max_replay_ratio=max_rr,
@@ -396,6 +475,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             env_manager_type=args.env_manager,
             min_iter_gap=args.min_iter_gap,
             poll_interval=args.poll_interval,
+            resume=args.resume,
         )
         evaluator.run(max_evals=args.max_evals, max_idle_seconds=args.max_idle_seconds)
         return 0

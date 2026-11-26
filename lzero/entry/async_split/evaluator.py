@@ -7,6 +7,7 @@ and atomically saves ``WM_ckpt_best.pth.tar`` on improvement.
 """
 
 import copy
+import math
 import os
 import signal
 import time
@@ -25,7 +26,14 @@ from tensorboardX import SummaryWriter
 
 from lzero.worker import MuZeroEvaluator as Evaluator
 
-from .io_utils import AsyncSplitDirs, WeightWatcher, atomic_torch_save, cpu_state_dict
+from .io_utils import (
+    AsyncSplitDirs,
+    WeightWatcher,
+    atomic_json_save,
+    atomic_torch_save,
+    cpu_state_dict,
+    read_json,
+)
 
 
 def _ding_exp_name(root_dir: Path) -> str:
@@ -48,11 +56,13 @@ class AsyncEvaluator:
         env_manager_type: Optional[str] = None,
         min_iter_gap: int = 0,
         poll_interval: float = 1.0,
+        resume: bool = False,
     ) -> None:
         self.dirs = AsyncSplitDirs.from_root(run_dir)
         self.dirs.ensure_exists()
         self.min_iter_gap = max(0, int(min_iter_gap))
         self.poll_interval = float(poll_interval)
+        self.resume = bool(resume)
         self._stop_requested = False
         self._closed = False
         self._last_eval_iter: Optional[int] = None
@@ -110,6 +120,48 @@ class AsyncEvaluator:
             policy_config=self.cfg.policy,
         )
         self.weight_watcher = WeightWatcher(self.dirs.latest_weights_path)
+        if self.resume:
+            self._restore_evaluator_state()
+
+    def _restore_evaluator_state(self) -> None:
+        try:
+            state = read_json(self.dirs.evaluator_state_path)
+        except Exception as exc:
+            logging.warning(
+                f'[AsyncEvaluator] Ignoring unreadable {self.dirs.evaluator_state_path.name}: {exc}'
+            )
+            state = None
+        if state is None:
+            return
+        if state.get('last_eval_iter') is not None:
+            self._last_eval_iter = int(state['last_eval_iter'])
+        if state.get('num_evals') is not None:
+            self._num_evals = int(state['num_evals'])
+        max_ret = state.get('max_episode_return')
+        if max_ret is not None and math.isfinite(float(max_ret)):
+            self.evaluator._max_episode_return = float(max_ret)
+        logging.info(
+            f'[AsyncEvaluator] Resumed evaluator state: '
+            f'last_eval_iter={self._last_eval_iter}, '
+            f'max_episode_return={self.evaluator._max_episode_return}, '
+            f'num_evals={self._num_evals}'
+        )
+
+    def _save_evaluator_state(self) -> None:
+        max_ret = float(self.evaluator._max_episode_return)
+        payload: Dict[str, Any] = {
+            'version': 1,
+            'last_eval_iter': self._last_eval_iter,
+            'max_episode_return': max_ret if math.isfinite(max_ret) else None,
+            'num_evals': int(self._num_evals),
+            'timestamp': time.time(),
+        }
+        try:
+            atomic_json_save(payload, self.dirs.evaluator_state_path)
+        except Exception as exc:
+            logging.warning(
+                f'[AsyncEvaluator] Failed to save {self.dirs.evaluator_state_path.name}: {exc}'
+            )
 
     def _make_save_ckpt_fn(self, train_iter: int, envstep: int):
         def _save_ckpt(ckpt_name: str) -> None:
@@ -142,7 +194,10 @@ class AsyncEvaluator:
         if (
             not force
             and self._last_eval_iter is not None
-            and (train_iter - self._last_eval_iter) < self.min_iter_gap
+            and (
+                train_iter <= self._last_eval_iter
+                or (train_iter - self._last_eval_iter) < self.min_iter_gap
+            )
         ):
             return None
 
@@ -153,6 +208,7 @@ class AsyncEvaluator:
         )
         self._last_eval_iter = train_iter
         self._num_evals += 1
+        self._save_evaluator_state()
         return {
             'train_iter': train_iter,
             'envstep': envstep,

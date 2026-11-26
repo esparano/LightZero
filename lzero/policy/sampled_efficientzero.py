@@ -1310,11 +1310,14 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         Returns:
             - state_dict (:obj:`Dict[str, Any]`): the dict of current policy learn state, for saving and restoring.
         """
-        return {
+        state_dict: Dict[str, Any] = {
             'model': self._learn_model.state_dict(),
             'target_model': self._target_model.state_dict(),
             'optimizer': self._optimizer.state_dict(),
         }
+        if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None:
+            state_dict['lr_scheduler'] = self.lr_scheduler.state_dict()
+        return state_dict
 
     def _load_state_dict_learn(self, state_dict: Dict[str, Any]) -> None:
         """
@@ -1326,6 +1329,8 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         self._learn_model.load_state_dict(state_dict['model'])
         self._target_model.load_state_dict(state_dict['target_model'])
         self._optimizer.load_state_dict(state_dict['optimizer'])
+        if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None and 'lr_scheduler' in state_dict:
+            self.lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
 
     def _process_transition(self, obs, policy_output, timestep):
         # be compatible with DI-engine Policy class
