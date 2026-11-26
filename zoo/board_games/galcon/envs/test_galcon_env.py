@@ -153,7 +153,7 @@ class TestGalconEnv:
     def test_planets_do_not_overlap(self) -> None:
         env = GalconEnv(self.cfg)
         for seed in range(10):
-            env.cfg.map_seed = seed
+            env.map_seed = seed
             env.reset()
 
             SHIP_RADIUS = 6.0
@@ -877,3 +877,54 @@ class TestGalconEnv:
             layout_2 = [(p.x, p.y, p.ships, p.production) for p in env.planets]
             assert env._current_map_seed == 2
             assert layout_1 == layout_2
+
+    def test_default_and_partial_cfg_init(self) -> None:
+        """BUG-15b: GalconEnv() with cfg=None or partial EasyDict must read replay_* from self.cfg."""
+        env_default = GalconEnv()
+        assert env_default.replay_format == env_default.cfg.replay_format
+        assert env_default.render_mode is None
+
+        env_partial = GalconEnv(EasyDict(dict(num_planets=4, map_seed=2)))
+        assert env_partial.num_planets == 4
+        assert env_partial.replay_format == env_partial.cfg.replay_format
+
+    def test_reset_clears_frames_and_honors_replay_name_suffix(self) -> None:
+        """BUG-15c: reset() must clear accumulated render frames and update replay_name_suffix when given."""
+        cfg = EasyDict(GalconEnv.default_config())
+        cfg.update(dict(num_planets=4, map_seed=2, replay_name_suffix='ep1'))
+        env = GalconEnv(cfg)
+        env.frames.append(np.zeros((4, 4, 3), dtype=np.uint8))
+        assert len(env.frames) == 1
+
+        env.reset(replay_name_suffix='ep2')
+        assert len(env.frames) == 0
+        assert env.replay_name_suffix == 'ep2'
+
+    def test_settle_planets_converges_on_full_maps_across_many_seeds(self) -> None:
+        """BUG-15a: With MAX_SETTLE_ATTEMPTS=100, FULL_8p_16x10 settles cleanly without gap overlaps
+        across 50 seeds and FULL_20p_16x10 has zero hard planet-circle overlaps.
+        """
+        cfg_8p = EasyDict(GalconEnv.default_config())
+        cfg_8p.update(dict(num_planets=8, grid_max_x=200.0, grid_max_y=125.0, grid_square_size=25.0))
+        env_8p = GalconEnv(cfg_8p)
+        min_gap = 2 * env_8p.SHIP_RADIUS + env_8p.PLANETS_SETTLE_DELTA
+        for seed in range(50):
+            env_8p.map_seed = seed
+            env_8p.reset()
+            for i in range(len(env_8p.planets)):
+                for j in range(i + 1, len(env_8p.planets)):
+                    p_i, p_j = env_8p.planets[i], env_8p.planets[j]
+                    dist = np.hypot(p_i.x - p_j.x, p_i.y - p_j.y)
+                    assert dist >= (p_i.radius + p_j.radius + min_gap) - 1e-4
+
+        cfg_20p = EasyDict(GalconEnv.default_config())
+        cfg_20p.update(dict(num_planets=20, grid_max_x=200.0, grid_max_y=125.0, grid_square_size=25.0))
+        env_20p = GalconEnv(cfg_20p)
+        for seed in range(50):
+            env_20p.map_seed = seed
+            env_20p.reset()
+            for i in range(len(env_20p.planets)):
+                for j in range(i + 1, len(env_20p.planets)):
+                    p_i, p_j = env_20p.planets[i], env_20p.planets[j]
+                    dist = np.hypot(p_i.x - p_j.x, p_i.y - p_j.y)
+                    assert dist >= (p_i.radius + p_j.radius) - 1e-4

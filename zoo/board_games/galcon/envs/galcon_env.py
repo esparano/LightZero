@@ -75,7 +75,7 @@ class GalconEnv(BaseEnv):
     # Leave an extra bit of space between planets (beyond 2 * SHIP_RADIUS) so that ships can always fit through
     PLANETS_SETTLE_DELTA = 0.5
     # Number of attempts to settle planets (usually finishes in 1 or 2 attempts, and it will break early if successful)
-    MAX_SETTLE_ATTEMPTS = 10
+    MAX_SETTLE_ATTEMPTS = 100
 
     PLANET_LOCAL_X_CHANNEL = 0
     PLANET_LOCAL_Y_CHANNEL = 1
@@ -250,14 +250,14 @@ class GalconEnv(BaseEnv):
         )
 
         # Set the parameters related to replay rendering.
-        self.screen_scaling = cfg.replay_screen_scaling
+        self.screen_scaling = self.cfg.replay_screen_scaling
         # options = {None, 'state_realtime_mode', 'image_realtime_mode', 'image_savefile_mode'}
-        self.render_mode = cfg.render_mode
-        self.replay_name_suffix = cfg.replay_name_suffix
-        self.replay_path = cfg.replay_path
-        self.replay_format = cfg.replay_format
+        self.render_mode = self.cfg.render_mode
+        self.replay_name_suffix = self.cfg.replay_name_suffix
+        self.replay_path = self.cfg.replay_path
+        self.replay_format = self.cfg.replay_format
         self.screen = None
-        self.frames = []
+        self.frames: List[np.ndarray] = []
 
         self.prob_random_agent = self.cfg.prob_random_agent
         self.prob_expert_agent = self.cfg.prob_expert_agent
@@ -279,7 +279,6 @@ class GalconEnv(BaseEnv):
 
         self.planets: List[Planet] = []
         self.fleets: List[Fleet] = []
-        self.frames: List[np.ndarray] = []
         self._current_map_seed: Optional[int] = None
         self.reset()
 
@@ -288,6 +287,9 @@ class GalconEnv(BaseEnv):
         self.players = [self.PLAYER_1, self.PLAYER_2]
         self._current_player = self.players[start_player_index]
         self._next_fleet_id = self.num_planets
+        self.frames = []
+        if replay_name_suffix is not None:
+            self.replay_name_suffix = replay_name_suffix
 
         episode_map_seed = self._resolve_map_seed()
         self._current_map_seed = episode_map_seed
@@ -462,7 +464,7 @@ class GalconEnv(BaseEnv):
                 p_odd.y = -p_i.y
 
             # Print warning if the planets are not settled on the final attempt
-            if attempt_num == self.MAX_SETTLE_ATTEMPTS:
+            if attempt_num == self.MAX_SETTLE_ATTEMPTS - 1:
                 # find the minimum distance between any two planets
                 min_dist = float('inf')
                 for i in range(len(self.planets)):
