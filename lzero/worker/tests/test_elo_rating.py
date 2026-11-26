@@ -283,3 +283,51 @@ def test_prune_if_needed_protects_newly_promoted_rung():
     assert pruned[0].player_id == 'iter_100'
     assert ladder.players['iter_200'].active is True
 
+
+@pytest.mark.unittest
+def test_should_promote_checks_true_post_refit_champion_not_stale_pre_refit_id():
+    # Regression test: if champion_id_before (iter_200) drops below another active rung (iter_100)
+    # after fit_ratings(), a candidate that beats iter_200 6-4 but gets crushed 0-10 by iter_100
+    # must NOT be promoted because it is well below the true post-refit champion (iter_100).
+    ladder = EloLadder(anchor_bots=('random',), promotion_win_rate=0.55, promotion_elo_margin=50.0)
+    for pid in ('iter_100', 'iter_200'):
+        ladder.register_player(PlayerEntry(player_id=pid, kind='checkpoint', active=True))
+    ladder.record_match('iter_100', 'bot:random', wins_a=8, draws=0, losses_a=2)
+    ladder.record_match('iter_200', 'bot:random', wins_a=8, draws=0, losses_a=2)
+    ladder.record_match('iter_200', 'iter_100', wins_a=6, draws=0, losses_a=4)
+    ladder.fit_ratings()
+    assert ladder.get_champion().player_id == 'iter_200'
+
+    # Candidate beats iter_200 9-1 and bot:random 8-2, but loses 1-9 to iter_100 ->
+    # iter_100 overtakes iter_200 as true post-refit champion while iter_300 sits between them
+    ladder.register_player(PlayerEntry(player_id='iter_300', kind='checkpoint', active=False))
+    ladder.record_match('iter_300', 'iter_200', wins_a=9, draws=0, losses_a=1)
+    ladder.record_match('iter_300', 'iter_100', wins_a=1, draws=0, losses_a=9)
+    ladder.record_match('iter_300', 'bot:random', wins_a=8, draws=0, losses_a=2)
+    ladder.fit_ratings()
+
+    assert ladder.get_elo('iter_100') > ladder.get_elo('iter_300') > ladder.get_elo('iter_200')
+    promote, _ = ladder.should_promote('iter_300', score_vs_champion=0.9, champion_id='iter_200')
+    assert promote is False
+
+
+@pytest.mark.unittest
+def test_unregularized_sweep_preserves_finite_std_for_non_sweeping_players():
+    # Even with prior_draws=0.0, l2_reg=0.0 and an extreme sweep alongside a normal player,
+    # the normal player must retain an accurate Elo and finite standard error.
+    matches = [
+        MatchRecord('normal', 'bot:random', wins_a=7, draws=0, losses_a=3),
+        MatchRecord('sweeper', 'bot:random', wins_a=50, draws=0, losses_a=0),
+    ]
+    est = fit_bradley_terry_elo(
+        player_ids=['bot:random', 'normal', 'sweeper'],
+        matches=matches,
+        anchor_id='bot:random',
+        prior_draws=0.0,
+        l2_reg=0.0,
+    )
+    assert est['normal'].elo == pytest.approx(400.0 * math.log10(7.0 / 3.0), abs=1e-3)
+    assert math.isfinite(est['normal'].elo_std)
+    assert 50.0 < est['normal'].elo_std < 300.0
+
+

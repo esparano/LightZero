@@ -67,12 +67,20 @@ def _clean_ckpt_stem(path: Path) -> str:
     return path.stem
 
 
+def _matches_existing_path_or_glob(raw: str) -> bool:
+    if Path(raw).is_file():
+        return True
+    if any(ch in raw for ch in ('*', '?', '[')):
+        return any(Path(p).is_file() for p in glob.glob(raw))
+    return False
+
+
 def parse_checkpoint_spec(spec: str, default_prefix: Optional[str] = None) -> List[CheckpointSpec]:
     """Parse ``path``, ``label=path``, or ``label=path@config_path`` (with glob support).
 
-    Safely handles file paths containing ``=`` or ``@`` (e.g. ``lr=1e-4/iter_100.pth.tar``)
-    by checking whether the raw string already resolves to an existing file and requiring
-    labels to contain no path separators.
+    Safely handles file paths and globs containing ``=`` or ``@`` (e.g.
+    ``run_lr=1e-4/iteration_*.pth.tar``, ``exp@v2/iteration_*.pth.tar``, or
+    ``run_lr=1e-4/iteration_100.pth.tar@cfg.py``).
     """
     raw = str(spec).strip()
     if not raw:
@@ -81,22 +89,25 @@ def parse_checkpoint_spec(spec: str, default_prefix: Optional[str] = None) -> Li
     label: Optional[str] = None
     config_path: Optional[Path] = None
 
-    # Only interpret `label=...` if raw is not already an existing path and label has no path separators
-    if '=' in raw and not Path(raw).is_file():
-        left, right = raw.split('=', 1)
-        left_s = left.strip()
-        if left_s and '/' not in left_s and '\\' not in left_s:
-            label = left_s
-            raw = right.strip()
+    if not _matches_existing_path_or_glob(raw):
+        # 1. Strip trailing @config_path first (only when RHS has no wildcards and looks like a config)
+        if '@' in raw:
+            ckpt_part, cfg_part = raw.rsplit('@', 1)
+            ckpt_s = ckpt_part.strip()
+            cfg_s = cfg_part.strip()
+            has_wildcard = any(ch in cfg_s for ch in ('*', '?', '['))
+            if ckpt_s and cfg_s and not has_wildcard and (cfg_s.endswith('.py') or Path(cfg_s).is_file()):
+                raw = ckpt_s
+                config_path = Path(cfg_s).resolve()
 
-    # Only interpret `...@config_path` if raw is not already an existing path
-    if '@' in raw and not Path(raw).is_file():
-        ckpt_part, cfg_part = raw.rsplit('@', 1)
-        ckpt_s = ckpt_part.strip()
-        cfg_s = cfg_part.strip()
-        if ckpt_s and cfg_s:
-            raw = ckpt_s
-            config_path = Path(cfg_s).resolve()
+        # 2. Strip leading label= only if remaining raw is not already an existing path/glob
+        #    and the label itself contains no path separators
+        if '=' in raw and not _matches_existing_path_or_glob(raw):
+            left, right = raw.split('=', 1)
+            left_s = left.strip()
+            if left_s and '/' not in left_s and '\\' not in left_s:
+                label = left_s
+                raw = right.strip()
 
     # Expand globs when wildcards are present
     if any(ch in raw for ch in ('*', '?', '[')):
@@ -262,14 +273,30 @@ def plan_swiss_round_pairs(
     ladder: EloLadder,
     player_ids: Sequence[str],
     played_counts: Dict[Tuple[str, str], int],
+    require_member_of: Optional[Set[str]] = None,
 ) -> List[Tuple[str, str]]:
-    """Pair players with closest current Elo who have not yet played each other."""
+    """Pair players with closest current Elo who have not yet played each other.
+
+    If ``require_member_of`` is provided (e.g. newly added checkpoints during
+    ``--resume``), only pairs containing at least one player in that set are
+    scheduled so already-calibrated players are not redundantly re-matched.
+    """
     sorted_ids = sorted(player_ids, key=lambda pid: (-ladder.get_elo(pid), pid))
-    unpaired = list(sorted_ids)
+    if require_member_of is not None:
+        # Prioritize players needing catch-up matches so they pick their closest unplayed partner first
+        ordered = [pid for pid in sorted_ids if pid in require_member_of] + [
+            pid for pid in sorted_ids if pid not in require_member_of
+        ]
+    else:
+        ordered = list(sorted_ids)
+
+    unpaired = list(ordered)
     pairs: List[Tuple[str, str]] = []
 
     while len(unpaired) >= 2:
         p = unpaired.pop(0)
+        if require_member_of is not None and p not in require_member_of:
+            break
         p_elo = ladder.get_elo(p)
         # Pick the unplayed opponent with the closest current Elo
         best_idx: Optional[int] = None
@@ -325,6 +352,9 @@ class OfflineTournament:
         self._closed = False
         self._chain_completed = False
         self._completed_swiss_rounds = 0
+        self._pending_swiss_pairs: List[Tuple[str, str]] = []
+        self._pending_is_catchup = False
+        self._newly_added_ids: Set[str] = set()
         self.runner: Optional[HeadToHeadRunner] = None
         self.tb_logger: Optional[SummaryWriter] = None
 
@@ -362,8 +392,9 @@ class OfflineTournament:
                 prior_draws=self.prior_draws,
             )
 
+            restored_existing = False
             if self.resume and self.state_path.is_file():
-                self._restore_state(requested_anchors=parsed_anchors)
+                restored_existing = self._restore_state(requested_anchors=parsed_anchors)
 
             reserved_bot_ids = {
                 pid for pid, entry in self.ladder.players.items() if entry.kind == 'bot'
@@ -388,6 +419,8 @@ class OfflineTournament:
                             active=True,
                         )
                     )
+                    if restored_existing:
+                        self._newly_added_ids.add(spec.player_id)
                 else:
                     # Refresh paths on resume in case files moved or specs were re-passed
                     entry = self.ladder.players[spec.player_id]
@@ -401,6 +434,11 @@ class OfflineTournament:
             for pid in self.ladder.players:
                 if pid not in self._ordered_player_ids:
                     self._ordered_player_ids.append(pid)
+
+            # If --resume added new checkpoints or anchor bots, re-open the chain pass so
+            # new participants connect chronologically (existing edges are never replayed).
+            if restored_existing and self._newly_added_ids:
+                self._chain_completed = False
 
             self.ladder.fit_ratings()
             if self.write_tb:
@@ -464,33 +502,44 @@ class OfflineTournament:
             policy_config=policy_cfg,
         )
 
-    def _restore_state(self, requested_anchors: Sequence[str] = ()) -> None:
+    def _restore_state(self, requested_anchors: Sequence[str] = ()) -> bool:
         state = read_json(self.state_path)
-        if state is not None and isinstance(state.get('ladder'), dict):
-            self.ladder = EloLadder.from_dict(state['ladder'])
-            self.ladder.prior_draws = self.prior_draws
-            for bot_type in requested_anchors:
-                pid = f'bot:{bot_type}'
-                if pid not in self.ladder.players:
-                    self.ladder.register_player(
-                        PlayerEntry(
-                            player_id=pid,
-                            kind='bot',
-                            bot_type=bot_type,
-                            is_anchor=(pid == self.ladder.anchor_id),
-                            active=True,
-                        )
+        if state is None or not isinstance(state.get('ladder'), dict):
+            return False
+        self.ladder = EloLadder.from_dict(state['ladder'])
+        self.ladder.prior_draws = self.prior_draws
+        for bot_type in requested_anchors:
+            pid = f'bot:{bot_type}'
+            if pid not in self.ladder.players:
+                self.ladder.register_player(
+                    PlayerEntry(
+                        player_id=pid,
+                        kind='bot',
+                        bot_type=bot_type,
+                        is_anchor=(pid == self.ladder.anchor_id),
+                        active=True,
                     )
-                    if bot_type not in self.ladder.anchor_bot_types:
-                        self.ladder.anchor_bot_types.append(bot_type)
-            self._chain_completed = bool(state.get('chain_completed', False))
-            self._completed_swiss_rounds = int(state.get('completed_swiss_rounds', 0))
-            logging.info(
-                f'[Tournament] Resumed state from {self.state_path} '
-                f'({len(self.ladder.matches)} prior match(es), '
-                f'chain_completed={self._chain_completed}, '
-                f'completed_swiss_rounds={self._completed_swiss_rounds})'
-            )
+                )
+                if bot_type not in self.ladder.anchor_bot_types:
+                    self.ladder.anchor_bot_types.append(bot_type)
+                self._newly_added_ids.add(pid)
+        self._chain_completed = bool(state.get('chain_completed', False))
+        self._completed_swiss_rounds = int(state.get('completed_swiss_rounds', 0))
+        raw_pending = state.get('pending_swiss_pairs', [])
+        self._pending_swiss_pairs = [
+            (str(pair[0]), str(pair[1]))
+            for pair in raw_pending
+            if isinstance(pair, (list, tuple)) and len(pair) == 2
+        ]
+        self._pending_is_catchup = bool(state.get('pending_is_catchup', False))
+        logging.info(
+            f'[Tournament] Resumed state from {self.state_path} '
+            f'({len(self.ladder.matches)} prior match(es), '
+            f'chain_completed={self._chain_completed}, '
+            f'completed_swiss_rounds={self._completed_swiss_rounds}, '
+            f'pending_swiss_pairs={len(self._pending_swiss_pairs)})'
+        )
+        return True
 
     def _save_state(self) -> None:
         payload = {
@@ -500,6 +549,8 @@ class OfflineTournament:
             'num_rounds': self.num_rounds,
             'chain_completed': bool(self._chain_completed),
             'completed_swiss_rounds': int(self._completed_swiss_rounds),
+            'pending_swiss_pairs': [[a, b] for a, b in self._pending_swiss_pairs],
+            'pending_is_catchup': bool(self._pending_is_catchup),
             'timestamp': time.time(),
             'ladder': self.ladder.to_dict(),
         }
@@ -562,7 +613,7 @@ class OfflineTournament:
                     self._run_pair(a, b, match_index=match_index)
                     matches_played_now += 1
             else:
-                # Round 1: chronological connectivity chain (skipped if already completed on resume)
+                # Round 1: chronological connectivity chain (skips already-played pairs)
                 if not self._chain_completed:
                     played = _played_pair_counts(self.ladder)
                     chain_pairs = plan_ladder_initial_pairs(
@@ -575,23 +626,61 @@ class OfflineTournament:
                     self._chain_completed = True
                     self._save_state()
 
-                # Rounds 2..num_rounds: adaptive Swiss nearest-Elo pairing (resumes only remaining rounds)
+                def _drain_pending_swiss_round() -> None:
+                    nonlocal match_index, matches_played_now
+                    if not self._pending_swiss_pairs:
+                        return
+                    while self._pending_swiss_pairs:
+                        a, b = self._pending_swiss_pairs[0]
+                        played_now = _played_pair_counts(self.ladder)
+                        self._pending_swiss_pairs = self._pending_swiss_pairs[1:]
+                        if played_now.get(_pair_key(a, b), 0) > 0:
+                            self._save_state()
+                            continue
+                        match_index += 1
+                        self._run_pair(a, b, match_index=match_index)
+                        matches_played_now += 1
+                    if not self._pending_is_catchup:
+                        self._completed_swiss_rounds += 1
+                    self._pending_is_catchup = False
+                    self._save_state()
+
+                # Finish any interrupted mid-round Swiss pairs before planning a new round
+                _drain_pending_swiss_round()
+
+                # Rounds 2..num_rounds: adaptive Swiss nearest-Elo pairing
                 target_swiss_rounds = max(0, self.num_rounds - 1)
+                swiss_rounds_run_now = 0
                 while self._completed_swiss_rounds < target_swiss_rounds:
                     played = _played_pair_counts(self.ladder)
                     swiss_pairs = plan_swiss_round_pairs(
                         self.ladder, self._ordered_player_ids, played
                     )
                     if not swiss_pairs:
-                        self._completed_swiss_rounds = target_swiss_rounds
-                        self._save_state()
                         break
-                    for a, b in swiss_pairs:
-                        match_index += 1
-                        self._run_pair(a, b, match_index=match_index)
-                        matches_played_now += 1
-                    self._completed_swiss_rounds += 1
+                    self._pending_swiss_pairs = list(swiss_pairs)
+                    self._pending_is_catchup = False
                     self._save_state()
+                    _drain_pending_swiss_round()
+                    swiss_rounds_run_now += 1
+
+                # Catch-up Swiss rounds if --resume added new players after prior rounds finished
+                catchup_rounds_needed = max(0, target_swiss_rounds - swiss_rounds_run_now)
+                if self._newly_added_ids and catchup_rounds_needed > 0:
+                    for _ in range(catchup_rounds_needed):
+                        played = _played_pair_counts(self.ladder)
+                        catchup_pairs = plan_swiss_round_pairs(
+                            self.ladder,
+                            self._ordered_player_ids,
+                            played,
+                            require_member_of=self._newly_added_ids,
+                        )
+                        if not catchup_pairs:
+                            break
+                        self._pending_swiss_pairs = list(catchup_pairs)
+                        self._pending_is_catchup = True
+                        self._save_state()
+                        _drain_pending_swiss_round()
 
             self.ladder.fit_ratings()
             self._save_state()

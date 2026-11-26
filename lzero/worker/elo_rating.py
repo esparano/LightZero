@@ -385,8 +385,17 @@ def fit_bradley_terry_elo(
             diag_var = np.maximum(0.0, np.diag(cov_free))
             stds[free_indices] = ELO_SCALE * np.sqrt(diag_var)
         except np.linalg.LinAlgError:
-            # Degenerate Hessian (e.g. unregularized sweep -> infinite variance)
-            stds[free_indices] = float('inf')
+            # Partial inversion: keep valid finite stds for non-degenerate players
+            # while leaving degenerate/sweeping players at +inf.
+            nz_mask = np.diag(hess_free) > 1e-12
+            if np.any(nz_mask):
+                sub_hess = hess_free[np.ix_(nz_mask, nz_mask)]
+                try:
+                    sub_cov = np.linalg.inv(sub_hess)
+                    sub_var = np.maximum(0.0, np.diag(sub_cov))
+                    stds[free_indices[nz_mask]] = ELO_SCALE * np.sqrt(sub_var)
+                except np.linalg.LinAlgError:
+                    pass
 
     elos = float(anchor_elo) + ELO_SCALE * gamma
 
@@ -635,19 +644,20 @@ class EloLadder:
             return True, 'first_checkpoint_seed'
 
         cand_elo = self.get_elo(candidate_id)
-        if champion_id is not None and champion_id in self.estimates:
-            champ_elo = self.get_elo(champion_id)
-        else:
-            champ_elo = max(self.get_elo(p.player_id) for p in existing_ckpts)
+        # Always compare against the true post-refit highest active checkpoint Elo
+        # (even if a different rung retroactively overtook champion_id after fit_ratings).
+        champ_elo = max(self.get_elo(p.player_id) for p in existing_ckpts)
 
         if (
-            cand_elo >= champ_elo + self.promotion_elo_margin
-            and (score_vs_champion is None or score_vs_champion > 0.5)
+            math.isfinite(cand_elo)
+            and cand_elo >= champ_elo + self.promotion_elo_margin
+            and (score_vs_champion is None or score_vs_champion >= 0.5)
         ):
             return True, f'elo_margin (+{cand_elo - champ_elo:.1f} >= +{self.promotion_elo_margin:.1f})'
 
         if (
-            score_vs_champion is not None
+            math.isfinite(cand_elo)
+            and score_vs_champion is not None
             and score_vs_champion >= self.promotion_win_rate
             and cand_elo > champ_elo
         ):

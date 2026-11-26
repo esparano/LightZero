@@ -414,6 +414,214 @@ def test_parse_checkpoint_spec_edge_cases_and_bot_id_collision(tmp_path):
             env_num=1,
         )
 
+    # Globs and @config combined with '=' or '@' in directory names must parse cleanly
+    glob_dir = tmp_path / 'run_lr=1e-4'
+    glob_dir.mkdir(parents=True)
+    for it in (100, 200):
+        (glob_dir / f'iteration_{it}.pth.tar').write_bytes(b'x')
+    cfg_file = tmp_path / 'custom_cfg.py'
+    cfg_file.write_text('# dummy\n', encoding='utf-8')
+
+    parsed_glob = parse_checkpoint_spec(str(glob_dir / 'iteration_*.pth.tar'))
+    assert [s.train_iter for s in parsed_glob] == [100, 200]
+
+    parsed_eq_at_cfg = parse_checkpoint_spec(f'{glob_dir / "iteration_100.pth.tar"}@{cfg_file}')
+    assert len(parsed_eq_at_cfg) == 1
+    assert parsed_eq_at_cfg[0].train_iter == 100
+    assert parsed_eq_at_cfg[0].config_path == cfg_file.resolve()
+
+    at_dir = tmp_path / 'exp@v2'
+    at_dir.mkdir(parents=True)
+    (at_dir / 'iteration_50.pth.tar').write_bytes(b'x')
+    parsed_at_glob = parse_checkpoint_spec(str(at_dir / 'iteration_*.pth.tar'))
+    assert [s.train_iter for s in parsed_at_glob] == [50]
+    assert parsed_at_glob[0].config_path is None
+
+
+@pytest.mark.unittest
+def test_offline_tournament_resume_new_checkpoints_and_mid_round_crash(tmp_path):
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    cfg_pair[0].policy.device = 'cpu'
+    compiled = compile_config(
+        copy.deepcopy(cfg_pair[0]), seed=0, env=None, auto=True, create_cfg=copy.deepcopy(cfg_pair[1]), save_cfg=False
+    )
+    policy = create_policy(copy.deepcopy(compiled.policy), model=None, enable_field=['learn', 'eval'])
+
+    ckpt_dir = tmp_path / 'ckpts'
+    ckpt_dir.mkdir(parents=True)
+    for idx, it in enumerate((0, 100, 200, 300)):
+        _save_dummy_ckpt(policy, ckpt_dir / f'iteration_{it}.pth.tar', train_iter=it, perturb=0.01 * idx)
+    all_specs = discover_checkpoints_in_dir(ckpt_dir)
+
+    # 1. Run ladder tournament on first 3 checkpoints (num_rounds=2 -> 3 chain + 2 Swiss = 5 matches)
+    out_dir = tmp_path / 'tourn_inc'
+    t1 = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=all_specs[:3],
+        output_dir=out_dir,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=2,
+        seed=9,
+        device='cpu',
+        env_num=2,
+    )
+    r1 = t1.run()
+    assert r1['total_matches'] == 5
+
+    # 2. Add iter_300 and --resume -> must connect iter_300 in chain + run catch-up Swiss match!
+    t2 = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=all_specs[:4],
+        output_dir=out_dir,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=2,
+        seed=9,
+        device='cpu',
+        env_num=2,
+        resume=True,
+    )
+    r2 = t2.run()
+    assert r2['matches_played'] >= 2  # at least chain edge + 1 Swiss catch-up match for iter_300
+    est_300 = next(row for row in r2['leaderboard'] if row['player_id'] == 'iter_300')
+    assert est_300['games'] >= 4
+
+    # 3. Re-running with --resume and NO new checkpoints must play 0 matches
+    t3 = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=all_specs[:4],
+        output_dir=out_dir,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=2,
+        seed=9,
+        device='cpu',
+        env_num=2,
+        resume=True,
+    )
+    r3 = t3.run()
+    assert r3['matches_played'] == 0
+
+    # 4. Simulate mid-round Swiss crash: pending_swiss_pairs has 1 remaining pair in round 1
+    from lzero.entry.async_split.io_utils import atomic_json_save, read_json
+
+    crash_dir = tmp_path / 'tourn_mid_crash'
+    t_seed = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=all_specs[:3],
+        output_dir=crash_dir,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=1,  # Round 1 chain only (3 matches)
+        seed=9,
+        device='cpu',
+        env_num=2,
+    )
+    t_seed.run()
+
+    state = read_json(crash_dir / 'tournament_state.json')
+    state['completed_swiss_rounds'] = 0
+    state['pending_swiss_pairs'] = [['iter_0', 'iter_200']]
+    state['pending_is_catchup'] = False
+    atomic_json_save(state, crash_dir / 'tournament_state.json')
+
+    t_recover = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=all_specs[:3],
+        output_dir=crash_dir,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=2,  # 1 Swiss round total; finishing the 1 pending pair completes it
+        seed=9,
+        device='cpu',
+        env_num=2,
+        resume=True,
+    )
+    r_rec = t_recover.run()
+    # Must play ONLY the 1 pending pair (not re-plan a full 2-pair Swiss round!)
+    assert r_rec['matches_played'] == 1
+    assert r_rec['total_matches'] == 4
+
+
+@pytest.mark.unittest
+def test_retroactive_best_rung_inversion_updates_elo_ckpt_best(tmp_path):
+    # Regression test: if active rung iter_200 retroactively overtakes initial best_player_id
+    # (iter_100) during iter_300's evaluation, elo_ckpt_best.pth.tar must be updated to iter_200
+    # rather than overwritten with weaker candidate iter_300.
+    from lzero.worker.elo_rating import PlayerEntry
+    from lzero.worker.head_to_head import MatchSummary
+
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    run_dir = tmp_path / 'retro_best_run'
+    elo_eval = AsyncEloEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=0,
+        device='cpu',
+        evaluator_env_num=1,
+        games_per_opponent=10,
+        opponents_per_eval=4,
+    )
+    try:
+        # Save distinct rung checkpoints for iter_100 and iter_200
+        p100 = elo_eval.dirs.elo_rungs_dir / 'iter_100.pth.tar'
+        p200 = elo_eval.dirs.elo_rungs_dir / 'iter_200.pth.tar'
+        _save_dummy_ckpt(elo_eval.candidate_policy, p100, train_iter=100, perturb=0.0)
+        _save_dummy_ckpt(elo_eval.candidate_policy, p200, train_iter=200, perturb=0.5)
+
+        elo_eval.ladder.register_player(
+            PlayerEntry('iter_100', kind='checkpoint', ckpt_path=str(p100), train_iter=100, active=True)
+        )
+        elo_eval.ladder.register_player(
+            PlayerEntry('iter_200', kind='checkpoint', ckpt_path=str(p200), train_iter=200, active=True)
+        )
+        elo_eval.ladder.record_match('iter_100', 'bot:random', wins_a=9, draws=0, losses_a=1)
+        elo_eval.ladder.record_match('iter_200', 'bot:random', wins_a=8, draws=0, losses_a=2)
+        elo_eval.ladder.fit_ratings()
+        elo_eval.ladder.best_player_id = 'iter_100'
+        elo_eval.ladder.best_elo = elo_eval.ladder.get_elo('iter_100')
+
+        # Stub runner.play_match so iter_300 beats iter_100 (9-1), loses to iter_200 (1-9), beats random (8-2)
+        outcomes = {
+            'bot:random': (8, 0, 2),
+            'iter_100': (9, 0, 1),
+            'iter_200': (1, 0, 9),
+        }
+
+        def _fake_play_match(player_a, player_b, num_games, seed):
+            w, d, l = outcomes[player_b.player_id]
+            return MatchSummary(
+                player_a=player_a.player_id,
+                player_b=player_b.player_id,
+                wins_a=w,
+                draws=d,
+                losses_a=l,
+                p1_wins=w,
+                p2_wins=l,
+                total_steps=100,
+                elapsed_sec=0.01,
+                map_seeds=[1] * num_games,
+            )
+
+        elo_eval.runner.play_match = _fake_play_match
+        res = elo_eval.evaluate_loaded_candidate(train_iter=300, envstep=3000)
+
+        # iter_200 must retroactively become best_player_id & elo_ckpt_best.pth.tar (NOT iter_300!)
+        assert res['is_new_best'] is False
+        assert elo_eval.ladder.best_player_id == 'iter_200'
+        assert elo_eval.ladder.best_elo == pytest.approx(elo_eval.ladder.get_elo('iter_200'), abs=1e-6)
+        assert elo_eval.ladder.best_elo > elo_eval.ladder.get_elo('iter_300')
+        saved_best = torch.load(str(elo_eval.dirs.ckpt_dir / 'elo_ckpt_best.pth.tar'), map_location='cpu', weights_only=False)
+        assert saved_best['train_iter'] == 200
+    finally:
+        elo_eval.close()
+
 
 @pytest.mark.unittest
 def test_async_evaluator_both_mode_resume_desync_skips_duplicate_elo(tmp_path):

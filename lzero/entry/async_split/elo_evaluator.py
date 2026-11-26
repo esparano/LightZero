@@ -99,67 +99,75 @@ class AsyncEloEvaluator:
         self._closed = False
         self._last_eval_iter: Optional[int] = None
         self._num_evals: int = 0
+        self.runner: Optional[HeadToHeadRunner] = None
+        self.tb_logger: Optional[SummaryWriter] = None
 
-        cfg = EasyDict(copy.deepcopy(input_cfg[0]))
-        create_cfg = EasyDict(copy.deepcopy(input_cfg[1]))
+        try:
+            cfg = EasyDict(copy.deepcopy(input_cfg[0]))
+            create_cfg = EasyDict(copy.deepcopy(input_cfg[1]))
 
-        if device == 'auto':
-            use_cuda = bool(cfg.policy.get('cuda', False) and torch.cuda.is_available())
-        else:
-            use_cuda = (device == 'cuda' and torch.cuda.is_available())
-        cfg.policy.cuda = use_cuda
-        cfg.policy.device = 'cuda' if use_cuda else 'cpu'
+            if device == 'auto':
+                use_cuda = bool(cfg.policy.get('cuda', False) and torch.cuda.is_available())
+            else:
+                use_cuda = (device == 'cuda' and torch.cuda.is_available())
+            cfg.policy.cuda = use_cuda
+            cfg.policy.device = 'cuda' if use_cuda else 'cpu'
 
-        if evaluator_env_num is not None:
-            cfg.env.evaluator_env_num = int(evaluator_env_num)
-            cfg.policy.evaluator_env_num = int(evaluator_env_num)
-        if num_simulations is not None:
-            cfg.policy.num_simulations = int(num_simulations)
+            if evaluator_env_num is not None:
+                cfg.env.evaluator_env_num = int(evaluator_env_num)
+                cfg.policy.evaluator_env_num = int(evaluator_env_num)
+            if num_simulations is not None:
+                cfg.policy.num_simulations = int(num_simulations)
 
-        cfg.exp_name = _ding_exp_name(self.dirs.root_dir)
-        self.cfg = compile_config(
-            cfg, seed=self.seed, env=None, auto=True, create_cfg=create_cfg, save_cfg=False
-        )
-        self.cfg.exp_name = _ding_exp_name(self.dirs.root_dir)
-        self.create_cfg = create_cfg
-        set_pkg_seed(self.cfg.seed, use_cuda=self.cfg.policy.cuda)
+            cfg.exp_name = _ding_exp_name(self.dirs.root_dir)
+            self.cfg = compile_config(
+                cfg, seed=self.seed, env=None, auto=True, create_cfg=create_cfg, save_cfg=False
+            )
+            self.cfg.exp_name = _ding_exp_name(self.dirs.root_dir)
+            self.create_cfg = create_cfg
+            set_pkg_seed(self.cfg.seed, use_cuda=self.cfg.policy.cuda)
 
-        env_fn, collector_env_cfg, evaluator_env_cfg = get_vec_env_setting(self.cfg.env)
-        base_env_cfg = copy.deepcopy(collector_env_cfg[0] if collector_env_cfg else evaluator_env_cfg[0])
-        base_env_cfg.battle_mode = 'self_play_mode'
-        base_env_cfg.render_mode = None
-        env_num = int(
-            evaluator_env_num
-            if evaluator_env_num is not None
-            else self.cfg.env.get('evaluator_env_num', 4)
-        )
-        self.runner = HeadToHeadRunner(env_fn=env_fn, env_cfg=base_env_cfg, env_num=env_num)
+            env_fn, collector_env_cfg, evaluator_env_cfg = get_vec_env_setting(self.cfg.env)
+            base_env_cfg = copy.deepcopy(
+                collector_env_cfg[0] if collector_env_cfg else evaluator_env_cfg[0]
+            )
+            base_env_cfg.battle_mode = 'self_play_mode'
+            base_env_cfg.render_mode = None
+            env_num = int(
+                evaluator_env_num
+                if evaluator_env_num is not None
+                else self.cfg.env.get('evaluator_env_num', 4)
+            )
+            self.runner = HeadToHeadRunner(env_fn=env_fn, env_cfg=base_env_cfg, env_num=env_num)
 
-        # SampledEfficientZeroPolicy initializes value_inverse_scalar_transform_handle in _init_learn.
-        self.candidate_policy = create_policy(
-            copy.deepcopy(self.cfg.policy), model=None, enable_field=['learn', 'eval']
-        )
-        self.opponent_policy = create_policy(
-            copy.deepcopy(self.cfg.policy), model=None, enable_field=['learn', 'eval']
-        )
-        self._bot_players: Dict[str, EnvBotMatchPlayer] = {}
+            # SampledEfficientZeroPolicy initializes value_inverse_scalar_transform_handle in _init_learn.
+            self.candidate_policy = create_policy(
+                copy.deepcopy(self.cfg.policy), model=None, enable_field=['learn', 'eval']
+            )
+            self.opponent_policy = create_policy(
+                copy.deepcopy(self.cfg.policy), model=None, enable_field=['learn', 'eval']
+            )
+            self._bot_players: Dict[str, EnvBotMatchPlayer] = {}
 
-        parsed_anchors = _parse_anchor_bots(anchor_bots)
-        self.ladder = EloLadder(
-            anchor_bots=parsed_anchors,
-            anchor_elo=0.0,
-            max_ladder_size=max_ladder_size,
-            opponents_per_eval=opponents_per_eval,
-            promotion_win_rate=promotion_win_rate,
-            promotion_elo_margin=promotion_elo_margin,
-            periodic_promote_every=periodic_promote_every,
-            prior_draws=prior_draws,
-        )
+            parsed_anchors = _parse_anchor_bots(anchor_bots)
+            self.ladder = EloLadder(
+                anchor_bots=parsed_anchors,
+                anchor_elo=0.0,
+                max_ladder_size=max_ladder_size,
+                opponents_per_eval=opponents_per_eval,
+                promotion_win_rate=promotion_win_rate,
+                promotion_elo_margin=promotion_elo_margin,
+                periodic_promote_every=periodic_promote_every,
+                prior_draws=prior_draws,
+            )
 
-        self.tb_logger = SummaryWriter(str(self.dirs.log_dir / 'elo_evaluator'))
-        self.weight_watcher = WeightWatcher(self.dirs.latest_weights_path)
-        if self.resume:
-            self._restore_state()
+            self.tb_logger = SummaryWriter(str(self.dirs.log_dir / 'elo_evaluator'))
+            self.weight_watcher = WeightWatcher(self.dirs.latest_weights_path)
+            if self.resume:
+                self._restore_state()
+        except Exception:
+            self.close()
+            raise
 
     def _restore_state(self) -> None:
         try:
@@ -368,10 +376,11 @@ class AsyncEloEvaluator:
             if opp.player_id == self.ladder.anchor_id:
                 score_vs_anchor = summary.win_rate_a
 
+            opp_elo_before = self.ladder.get_elo(opp.player_id)
             match_results.append(
                 {
                     'opponent_id': opp.player_id,
-                    'opponent_elo_before': self.ladder.get_elo(opp.player_id),
+                    'opponent_elo_before': float(opp_elo_before) if math.isfinite(opp_elo_before) else None,
                     'wins': summary.wins_a,
                     'draws': summary.draws,
                     'losses': summary.losses_a,
@@ -423,7 +432,65 @@ class AsyncEloEvaluator:
         else:
             self.ladder.evals_since_promotion += 1
 
-        is_new_best = (
+        # Reconcile best_elo / elo_ckpt_best.pth.tar against any existing active rung
+        # that retroactively overtook the previous best_player_id after fit_ratings().
+        existing_active_rungs = [
+            p for p in self.ladder.active_checkpoint_rungs() if p.player_id != candidate_id
+        ]
+        if existing_active_rungs:
+            top_rung = existing_active_rungs[-1]
+            top_rung_est = self.ladder.estimates.get(top_rung.player_id)
+            if (
+                top_rung_est is not None
+                and math.isfinite(top_rung_est.elo)
+                and (
+                    self.ladder.best_player_id is None
+                    or not math.isfinite(self.ladder.best_elo)
+                    or top_rung_est.elo > self.ladder.best_elo
+                )
+            ):
+                self.ladder.best_elo = float(top_rung_est.elo)
+                self.ladder.best_player_id = top_rung.player_id
+                if top_rung.ckpt_path and Path(top_rung.ckpt_path).is_file():
+                    try:
+                        rung_sd, rung_meta = load_model_state_dict(top_rung.ckpt_path, device='cpu')
+                        best_path = self.dirs.ckpt_dir / 'elo_ckpt_best.pth.tar'
+                        best_payload: Dict[str, Any] = {
+                            'model': cpu_state_dict(rung_sd),
+                            'train_iter': int(
+                                top_rung.train_iter
+                                if top_rung.train_iter is not None
+                                else rung_meta.get('train_iter', 0)
+                            ),
+                            'envstep': int(
+                                top_rung.envstep
+                                if top_rung.envstep is not None
+                                else rung_meta.get('envstep', 0)
+                            ),
+                            'last_iter': int(
+                                top_rung.train_iter
+                                if top_rung.train_iter is not None
+                                else rung_meta.get('train_iter', 0)
+                            ),
+                            'elo': float(top_rung_est.elo),
+                            'elo_std': (
+                                float(top_rung_est.elo_std)
+                                if math.isfinite(top_rung_est.elo_std)
+                                else None
+                            ),
+                        }
+                        atomic_torch_save(best_payload, best_path)
+                        logging.info(
+                            f'[AsyncEloEvaluator] Retroactively promoted active rung {top_rung.player_id} '
+                            f'to {best_path} (elo={top_rung_est.elo:.1f})'
+                        )
+                    except Exception as exc:
+                        logging.warning(
+                            f'[AsyncEloEvaluator] Failed to copy retroactively best rung '
+                            f'{top_rung.player_id}: {exc}'
+                        )
+
+        is_new_best = math.isfinite(cand_est.elo) and (
             self.ladder.best_player_id is None
             or not math.isfinite(self.ladder.best_elo)
             or cand_est.elo > self.ladder.best_elo
@@ -583,12 +650,14 @@ class AsyncEloEvaluator:
         if self._closed:
             return
         self._closed = True
-        try:
-            self.runner.close()
-        except Exception:
-            pass
-        try:
-            self.tb_logger.flush()
-            self.tb_logger.close()
-        except Exception:
-            pass
+        if self.runner is not None:
+            try:
+                self.runner.close()
+            except Exception:
+                pass
+        if self.tb_logger is not None:
+            try:
+                self.tb_logger.flush()
+                self.tb_logger.close()
+            except Exception:
+                pass

@@ -204,7 +204,12 @@ def _build_env_bot(env: Any, bot_type: str) -> Optional[Any]:
 
 
 class EnvBotMatchPlayer(MatchPlayer):
-    """Built-in rule-bot player (e.g. Galcon ``random``, ``fixed``, ``pass``)."""
+    """Built-in rule-bot player (e.g. Galcon ``random``, ``fixed``, ``pass``).
+
+    On Galcon, invokes canonical rule bots directly (independent of
+    ``prob_random_action_in_bot`` / ``prob_pass_action_in_bot``) so Elo anchors
+    stay consistent across configs.
+    """
 
     def __init__(self, bot_type: str, player_id: Optional[str] = None) -> None:
         self.bot_type = str(bot_type).strip().lower()
@@ -233,6 +238,15 @@ class EnvBotMatchPlayer(MatchPlayer):
                 else:
                     actions[env_id] = int(np.random.choice(legal))
             else:
+                env_bot_type = getattr(env, 'bot_action_type', None)
+                if (
+                    env_bot_type is not None
+                    and self.bot_type not in {'default', 'bot', str(env_bot_type).strip().lower()}
+                ):
+                    raise ValueError(
+                        f'EnvBotMatchPlayer requested bot_type={self.bot_type!r}, but '
+                        f'{type(env).__name__} is configured with bot_action_type={env_bot_type!r}.'
+                    )
                 actions[env_id] = int(env.bot_action())
         return actions
 
@@ -339,7 +353,7 @@ class HeadToHeadRunner:
         Games are scheduled as paired waves:
         - First ``num_pairs`` games: ``player_a`` plays Player 1 on seeds ``s_0 .. s_{p-1}``.
         - Next ``num_pairs`` games: ``player_a`` plays Player 2 on the exact same seeds ``s_0 .. s_{p-1}``.
-        - If ``num_games`` is odd, 1 extra game is appended with ``player_a`` as Player 1.
+        - If ``num_games`` is odd, 1 extra game is appended with Player 1/2 chosen uniformly from ``rng``.
         """
         n_games = max(1, int(num_games))
         rng = np.random.RandomState(int(seed) & 0x7FFFFFFF)

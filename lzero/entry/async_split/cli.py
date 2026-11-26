@@ -664,15 +664,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for raw_spec in args.checkpoints:
             specs.extend(parse_checkpoint_spec(raw_spec))
 
-        if not specs and not args.resume:
-            parser.error('tournament requires at least one checkpoint via --ckpt-dir or --checkpoints.')
-
         out_dir = args.output_dir
         if not out_dir:
             if args.ckpt_dir:
                 out_dir = str(Path(args.ckpt_dir[0]).resolve().parent / 'elo_tournament')
             else:
                 out_dir = str(Path(str(main_cfg.exp_name)) / 'elo_tournament')
+
+        if not specs:
+            if not args.resume or not (Path(out_dir).resolve() / 'tournament_state.json').is_file():
+                parser.error(
+                    'tournament requires at least one checkpoint via --ckpt-dir or --checkpoints '
+                    '(or --resume pointing at an --output-dir with an existing tournament_state.json).'
+                )
 
         tournament = OfflineTournament(
             default_input_cfg=(main_cfg, create_cfg),

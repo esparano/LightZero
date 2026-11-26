@@ -94,90 +94,94 @@ class AsyncEvaluator:
         self.tb_logger = None
         self.policy = None
 
-        if self.eval_mode in {'elo_ladder', 'both'}:
-            self.elo_evaluator = AsyncEloEvaluator(
-                input_cfg=input_cfg,
-                run_dir=run_dir,
-                seed=seed,
-                device=device,
-                evaluator_env_num=evaluator_env_num,
-                games_per_opponent=elo_games_per_opponent,
-                opponents_per_eval=elo_opponents_per_eval,
-                max_ladder_size=elo_max_ladder_size,
-                promotion_win_rate=elo_promotion_win_rate,
-                promotion_elo_margin=elo_promotion_margin,
-                periodic_promote_every=elo_periodic_promote_every,
-                anchor_bots=elo_anchor_bots,
-                prior_draws=elo_prior_draws,
-                num_simulations=num_simulations,
-                min_iter_gap=min_iter_gap,
-                poll_interval=poll_interval,
-                resume=resume,
+        try:
+            if self.eval_mode in {'elo_ladder', 'both'}:
+                self.elo_evaluator = AsyncEloEvaluator(
+                    input_cfg=input_cfg,
+                    run_dir=run_dir,
+                    seed=seed,
+                    device=device,
+                    evaluator_env_num=evaluator_env_num,
+                    games_per_opponent=elo_games_per_opponent,
+                    opponents_per_eval=elo_opponents_per_eval,
+                    max_ladder_size=elo_max_ladder_size,
+                    promotion_win_rate=elo_promotion_win_rate,
+                    promotion_elo_margin=elo_promotion_margin,
+                    periodic_promote_every=elo_periodic_promote_every,
+                    anchor_bots=elo_anchor_bots,
+                    prior_draws=elo_prior_draws,
+                    num_simulations=num_simulations,
+                    min_iter_gap=min_iter_gap,
+                    poll_interval=poll_interval,
+                    resume=resume,
+                )
+
+            if self.eval_mode == 'elo_ladder':
+                self.cfg = self.elo_evaluator.cfg
+                self.create_cfg = self.elo_evaluator.create_cfg
+                self.policy = self.elo_evaluator.candidate_policy
+                self.weight_watcher = self.elo_evaluator.weight_watcher
+                self._last_eval_iter = self.elo_evaluator._last_eval_iter
+                self._num_evals = self.elo_evaluator._num_evals
+                return
+
+            cfg = EasyDict(copy.deepcopy(input_cfg[0]))
+            create_cfg = EasyDict(copy.deepcopy(input_cfg[1]))
+
+            if device == 'auto':
+                use_cuda = bool(cfg.policy.get('cuda', False) and torch.cuda.is_available())
+            else:
+                use_cuda = (device == 'cuda' and torch.cuda.is_available())
+            cfg.policy.cuda = use_cuda
+            cfg.policy.device = 'cuda' if use_cuda else 'cpu'
+
+            if evaluator_env_num is not None:
+                cfg.env.evaluator_env_num = int(evaluator_env_num)
+                cfg.policy.evaluator_env_num = int(evaluator_env_num)
+            if n_evaluator_episode is not None:
+                cfg.env.n_evaluator_episode = int(n_evaluator_episode)
+            elif evaluator_env_num is not None and cfg.env.n_evaluator_episode < int(evaluator_env_num):
+                cfg.env.n_evaluator_episode = int(evaluator_env_num)
+            if bot_action_type is not None:
+                cfg.env.bot_action_type = str(bot_action_type)
+            if num_simulations is not None:
+                cfg.policy.num_simulations = int(num_simulations)
+            if env_manager_type is not None:
+                create_cfg.env_manager.type = str(env_manager_type)
+
+            cfg.exp_name = _ding_exp_name(self.dirs.root_dir)
+            self.cfg = compile_config(
+                cfg, seed=seed, env=None, auto=True, create_cfg=create_cfg, save_cfg=False
             )
+            self.cfg.exp_name = _ding_exp_name(self.dirs.root_dir)
+            self.create_cfg = create_cfg
+            set_pkg_seed(self.cfg.seed, use_cuda=self.cfg.policy.cuda)
 
-        if self.eval_mode == 'elo_ladder':
-            self.cfg = self.elo_evaluator.cfg
-            self.create_cfg = self.elo_evaluator.create_cfg
-            self.policy = self.elo_evaluator.candidate_policy
-            self.weight_watcher = self.elo_evaluator.weight_watcher
-            self._last_eval_iter = self.elo_evaluator._last_eval_iter
-            self._num_evals = self.elo_evaluator._num_evals
-            return
+            env_fn, _, evaluator_env_cfg = get_vec_env_setting(self.cfg.env)
+            self.evaluator_env = create_env_manager(
+                self.cfg.env.manager, [partial(env_fn, cfg=c) for c in evaluator_env_cfg]
+            )
+            self.evaluator_env.seed(self.cfg.seed, dynamic_seed=False)
 
-        cfg = EasyDict(copy.deepcopy(input_cfg[0]))
-        create_cfg = EasyDict(copy.deepcopy(input_cfg[1]))
-
-        if device == 'auto':
-            use_cuda = bool(cfg.policy.get('cuda', False) and torch.cuda.is_available())
-        else:
-            use_cuda = (device == 'cuda' and torch.cuda.is_available())
-        cfg.policy.cuda = use_cuda
-        cfg.policy.device = 'cuda' if use_cuda else 'cpu'
-
-        if evaluator_env_num is not None:
-            cfg.env.evaluator_env_num = int(evaluator_env_num)
-            cfg.policy.evaluator_env_num = int(evaluator_env_num)
-        if n_evaluator_episode is not None:
-            cfg.env.n_evaluator_episode = int(n_evaluator_episode)
-        elif evaluator_env_num is not None and cfg.env.n_evaluator_episode < int(evaluator_env_num):
-            cfg.env.n_evaluator_episode = int(evaluator_env_num)
-        if bot_action_type is not None:
-            cfg.env.bot_action_type = str(bot_action_type)
-        if num_simulations is not None:
-            cfg.policy.num_simulations = int(num_simulations)
-        if env_manager_type is not None:
-            create_cfg.env_manager.type = str(env_manager_type)
-
-        cfg.exp_name = _ding_exp_name(self.dirs.root_dir)
-        self.cfg = compile_config(
-            cfg, seed=seed, env=None, auto=True, create_cfg=create_cfg, save_cfg=False
-        )
-        self.cfg.exp_name = _ding_exp_name(self.dirs.root_dir)
-        self.create_cfg = create_cfg
-        set_pkg_seed(self.cfg.seed, use_cuda=self.cfg.policy.cuda)
-
-        env_fn, _, evaluator_env_cfg = get_vec_env_setting(self.cfg.env)
-        self.evaluator_env = create_env_manager(
-            self.cfg.env.manager, [partial(env_fn, cfg=c) for c in evaluator_env_cfg]
-        )
-        self.evaluator_env.seed(self.cfg.seed, dynamic_seed=False)
-
-        # SampledEfficientZeroPolicy initializes value_inverse_scalar_transform_handle in _init_learn.
-        self.policy = create_policy(self.cfg.policy, model=None, enable_field=['learn', 'eval'])
-        self.tb_logger = SummaryWriter(str(self.dirs.log_dir / 'evaluator'))
-        self.evaluator = Evaluator(
-            eval_freq=self.cfg.policy.eval_freq,
-            n_evaluator_episode=self.cfg.env.n_evaluator_episode,
-            stop_value=self.cfg.env.stop_value,
-            env=self.evaluator_env,
-            policy=self.policy.eval_mode,
-            tb_logger=self.tb_logger,
-            exp_name=self.cfg.exp_name,
-            policy_config=self.cfg.policy,
-        )
-        self.weight_watcher = WeightWatcher(self.dirs.latest_weights_path)
-        if self.resume:
-            self._restore_evaluator_state()
+            # SampledEfficientZeroPolicy initializes value_inverse_scalar_transform_handle in _init_learn.
+            self.policy = create_policy(self.cfg.policy, model=None, enable_field=['learn', 'eval'])
+            self.tb_logger = SummaryWriter(str(self.dirs.log_dir / 'evaluator'))
+            self.evaluator = Evaluator(
+                eval_freq=self.cfg.policy.eval_freq,
+                n_evaluator_episode=self.cfg.env.n_evaluator_episode,
+                stop_value=self.cfg.env.stop_value,
+                env=self.evaluator_env,
+                policy=self.policy.eval_mode,
+                tb_logger=self.tb_logger,
+                exp_name=self.cfg.exp_name,
+                policy_config=self.cfg.policy,
+            )
+            self.weight_watcher = WeightWatcher(self.dirs.latest_weights_path)
+            if self.resume:
+                self._restore_evaluator_state()
+        except Exception:
+            self.close()
+            raise
 
     def _restore_evaluator_state(self) -> None:
         try:
