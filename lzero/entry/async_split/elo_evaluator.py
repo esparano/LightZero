@@ -324,6 +324,7 @@ class AsyncEloEvaluator:
         )
 
         match_results: List[Dict[str, Any]] = []
+        scores_by_opp: Dict[str, float] = {}
         total_wins = 0
         total_draws = 0
         total_losses = 0
@@ -370,6 +371,7 @@ class AsyncEloEvaluator:
             total_p1_wins += summary.p1_wins
             total_steps += summary.total_steps
             total_games += summary.total_games
+            scores_by_opp[opp.player_id] = summary.win_rate_a
 
             if opp.player_id == champion_id_before:
                 score_vs_champion = summary.win_rate_a
@@ -396,10 +398,21 @@ class AsyncEloEvaluator:
         cand_est = self.ladder.estimates[candidate_id]
         self.ladder.last_candidate_elo = cand_est.elo
 
+        # Identify true post-refit champion among existing active rungs so score_vs_champion
+        # and champ_elo always refer to the exact same rung.
+        existing_active_rungs = [
+            p for p in self.ladder.active_checkpoint_rungs() if p.player_id != candidate_id
+        ]
+        true_champ_entry = existing_active_rungs[-1] if existing_active_rungs else None
+        true_champ_id = true_champ_entry.player_id if true_champ_entry is not None else None
+        score_vs_true_champ = scores_by_opp.get(true_champ_id) if true_champ_id is not None else None
+        if score_vs_true_champ is not None:
+            score_vs_champion = score_vs_true_champ
+
         promoted, promo_reason = self.ladder.should_promote(
             candidate_id=candidate_id,
-            score_vs_champion=score_vs_champion,
-            champion_id=champion_id_before,
+            score_vs_champion=score_vs_true_champ,
+            champion_id=true_champ_id,
         )
         pruned_ids: List[str] = []
         if promoted:
@@ -432,86 +445,87 @@ class AsyncEloEvaluator:
         else:
             self.ladder.evals_since_promotion += 1
 
-        # Reconcile best_elo / elo_ckpt_best.pth.tar against any existing active rung
-        # that retroactively overtook the previous best_player_id after fit_ratings().
-        existing_active_rungs = [
+        # Resolve the true best checkpoint among (current best, top existing active rung, candidate)
+        # so elo_ckpt_best.pth.tar is written at most once and state only updates after disk save.
+        existing_active_after = [
             p for p in self.ladder.active_checkpoint_rungs() if p.player_id != candidate_id
         ]
-        if existing_active_rungs:
-            top_rung = existing_active_rungs[-1]
-            top_rung_est = self.ladder.estimates.get(top_rung.player_id)
-            if (
-                top_rung_est is not None
-                and math.isfinite(top_rung_est.elo)
-                and (
-                    self.ladder.best_player_id is None
-                    or not math.isfinite(self.ladder.best_elo)
-                    or top_rung_est.elo > self.ladder.best_elo
-                )
-            ):
-                self.ladder.best_elo = float(top_rung_est.elo)
-                self.ladder.best_player_id = top_rung.player_id
-                if top_rung.ckpt_path and Path(top_rung.ckpt_path).is_file():
-                    try:
-                        rung_sd, rung_meta = load_model_state_dict(top_rung.ckpt_path, device='cpu')
-                        best_path = self.dirs.ckpt_dir / 'elo_ckpt_best.pth.tar'
-                        best_payload: Dict[str, Any] = {
-                            'model': cpu_state_dict(rung_sd),
-                            'train_iter': int(
-                                top_rung.train_iter
-                                if top_rung.train_iter is not None
-                                else rung_meta.get('train_iter', 0)
-                            ),
-                            'envstep': int(
-                                top_rung.envstep
-                                if top_rung.envstep is not None
-                                else rung_meta.get('envstep', 0)
-                            ),
-                            'last_iter': int(
-                                top_rung.train_iter
-                                if top_rung.train_iter is not None
-                                else rung_meta.get('train_iter', 0)
-                            ),
-                            'elo': float(top_rung_est.elo),
-                            'elo_std': (
-                                float(top_rung_est.elo_std)
-                                if math.isfinite(top_rung_est.elo_std)
-                                else None
-                            ),
-                        }
-                        atomic_torch_save(best_payload, best_path)
-                        logging.info(
-                            f'[AsyncEloEvaluator] Retroactively promoted active rung {top_rung.player_id} '
-                            f'to {best_path} (elo={top_rung_est.elo:.1f})'
-                        )
-                    except Exception as exc:
-                        logging.warning(
-                            f'[AsyncEloEvaluator] Failed to copy retroactively best rung '
-                            f'{top_rung.player_id}: {exc}'
-                        )
-
-        is_new_best = math.isfinite(cand_est.elo) and (
-            self.ladder.best_player_id is None
-            or not math.isfinite(self.ladder.best_elo)
-            or cand_est.elo > self.ladder.best_elo
+        top_rung = existing_active_after[-1] if existing_active_after else None
+        top_rung_est = self.ladder.estimates.get(top_rung.player_id) if top_rung is not None else None
+        top_rung_elo = (
+            float(top_rung_est.elo)
+            if top_rung_est is not None and math.isfinite(top_rung_est.elo)
+            else float('-inf')
         )
+        current_best_elo = (
+            float(self.ladder.best_elo)
+            if self.ladder.best_player_id is not None and math.isfinite(self.ladder.best_elo)
+            else float('-inf')
+        )
+        best_path = self.dirs.ckpt_dir / 'elo_ckpt_best.pth.tar'
+
+        is_new_best = math.isfinite(cand_est.elo) and cand_est.elo > max(current_best_elo, top_rung_elo)
         if is_new_best:
-            self.ladder.best_elo = cand_est.elo
-            self.ladder.best_player_id = candidate_id
-            best_path = self.dirs.ckpt_dir / 'elo_ckpt_best.pth.tar'
             self._save_checkpoint(
                 best_path,
                 train_iter=train_iter,
                 envstep=envstep,
                 extra_meta={
-                    'elo': float(cand_est.elo) if math.isfinite(cand_est.elo) else None,
+                    'elo': float(cand_est.elo),
                     'elo_std': float(cand_est.elo_std) if math.isfinite(cand_est.elo_std) else None,
                 },
             )
+            self.ladder.best_elo = float(cand_est.elo)
+            self.ladder.best_player_id = candidate_id
             logging.info(
                 f'[AsyncEloEvaluator] Saved new best Elo checkpoint {best_path} '
                 f'(elo={cand_est.elo:.1f} ± {cand_est.elo_std:.1f}, train_iter={train_iter})'
             )
+        elif (
+            top_rung is not None
+            and top_rung_est is not None
+            and top_rung_elo > current_best_elo
+            and top_rung.ckpt_path
+            and Path(top_rung.ckpt_path).is_file()
+        ):
+            try:
+                rung_sd, rung_meta = load_model_state_dict(top_rung.ckpt_path, device='cpu')
+                best_payload: Dict[str, Any] = {
+                    'model': cpu_state_dict(rung_sd),
+                    'train_iter': int(
+                        top_rung.train_iter
+                        if top_rung.train_iter is not None
+                        else rung_meta.get('train_iter', 0)
+                    ),
+                    'envstep': int(
+                        top_rung.envstep
+                        if top_rung.envstep is not None
+                        else rung_meta.get('envstep', 0)
+                    ),
+                    'last_iter': int(
+                        top_rung.train_iter
+                        if top_rung.train_iter is not None
+                        else rung_meta.get('train_iter', 0)
+                    ),
+                    'elo': float(top_rung_est.elo),
+                    'elo_std': (
+                        float(top_rung_est.elo_std)
+                        if math.isfinite(top_rung_est.elo_std)
+                        else None
+                    ),
+                }
+                atomic_torch_save(best_payload, best_path)
+                self.ladder.best_elo = float(top_rung_est.elo)
+                self.ladder.best_player_id = top_rung.player_id
+                logging.info(
+                    f'[AsyncEloEvaluator] Retroactively promoted active rung {top_rung.player_id} '
+                    f'to {best_path} (elo={top_rung_est.elo:.1f})'
+                )
+            except Exception as exc:
+                logging.warning(
+                    f'[AsyncEloEvaluator] Failed to copy retroactively best rung '
+                    f'{top_rung.player_id}: {exc}'
+                )
 
         elapsed_total = time.time() - t_start
         overall_win_rate = (total_wins + 0.5 * total_draws) / total_games if total_games > 0 else 0.5

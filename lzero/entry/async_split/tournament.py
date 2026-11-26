@@ -20,7 +20,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 from ding.config import compile_config
@@ -354,6 +354,8 @@ class OfflineTournament:
         self._completed_swiss_rounds = 0
         self._pending_swiss_pairs: List[Tuple[str, str]] = []
         self._pending_is_catchup = False
+        self._catchup_player_ids: Set[str] = set()
+        self._catchup_rounds_remaining: int = 0
         self._newly_added_ids: Set[str] = set()
         self.runner: Optional[HeadToHeadRunner] = None
         self.tb_logger: Optional[SummaryWriter] = None
@@ -396,11 +398,14 @@ class OfflineTournament:
             if self.resume and self.state_path.is_file():
                 restored_existing = self._restore_state(requested_anchors=parsed_anchors)
 
+            existing_ckpt_ids = [
+                pid for pid, entry in self.ladder.players.items() if entry.kind == 'checkpoint'
+            ]
             reserved_bot_ids = {
                 pid for pid, entry in self.ladder.players.items() if entry.kind == 'bot'
             }
-            self._ordered_player_ids: List[str] = [f'bot:{b}' for b in self.ladder.anchor_bot_types]
             deduped = _deduplicate_specs(checkpoints)
+            cli_ckpt_ids: List[str] = []
             for spec in deduped:
                 if spec.player_id in reserved_bot_ids:
                     raise ValueError(
@@ -427,18 +432,56 @@ class OfflineTournament:
                     entry.ckpt_path = str(spec.ckpt_path)
                     if spec.config_path is not None:
                         entry.config_path = str(spec.config_path)
-                if spec.player_id not in self._ordered_player_ids:
-                    self._ordered_player_ids.append(spec.player_id)
+                if spec.player_id not in cli_ckpt_ids:
+                    cli_ckpt_ids.append(spec.player_id)
 
-            # Include any players loaded from resumed state
-            for pid in self.ladder.players:
-                if pid not in self._ordered_player_ids:
-                    self._ordered_player_ids.append(pid)
+            # Build chronological player ordering:
+            # - Bots first (anchor at index 0).
+            # - On incremental --resume (CLI passed only new checkpoints), place existing
+            #   checkpoints before new ones rather than prepending new checkpoints next to bot:random.
+            # - When all checkpoints share numeric train_iter values within their run prefix,
+            #   keep each prefix group sorted numerically by train_iter.
+            bot_ids = [f'bot:{b}' for b in self.ladder.anchor_bot_types]
+            if restored_existing and existing_ckpt_ids and not any(
+                pid in existing_ckpt_ids for pid in cli_ckpt_ids
+            ):
+                ordered_ckpts = list(existing_ckpt_ids) + [
+                    pid for pid in cli_ckpt_ids if pid not in existing_ckpt_ids
+                ]
+            else:
+                ordered_ckpts = list(cli_ckpt_ids) + [
+                    pid for pid in existing_ckpt_ids if pid not in cli_ckpt_ids
+                ]
 
-            # If --resume added new checkpoints or anchor bots, re-open the chain pass so
-            # new participants connect chronologically (existing edges are never replayed).
+            if restored_existing and self._newly_added_ids and ordered_ckpts:
+                # Re-sort within each run prefix when every checkpoint in that prefix has train_iter
+                prefix_groups: Dict[str, List[str]] = {}
+                prefix_order: List[str] = []
+                for pid in ordered_ckpts:
+                    pref = pid.split(':', 1)[0] if ':' in pid else ''
+                    if pref not in prefix_groups:
+                        prefix_groups[pref] = []
+                        prefix_order.append(pref)
+                    prefix_groups[pref].append(pid)
+                reordered: List[str] = []
+                for pref in prefix_order:
+                    grp = prefix_groups[pref]
+                    if all(self.ladder.players[pid].train_iter is not None for pid in grp):
+                        grp.sort(key=lambda pid: int(self.ladder.players[pid].train_iter))
+                    reordered.extend(grp)
+                ordered_ckpts = reordered
+
+            self._ordered_player_ids: List[str] = bot_ids + ordered_ckpts
+
+            # If --resume added new checkpoints or anchor bots, re-open the chain pass and
+            # persist catch-up Swiss targets so mid-catch-up crashes resume cleanly.
             if restored_existing and self._newly_added_ids:
                 self._chain_completed = False
+                self._catchup_player_ids.update(self._newly_added_ids)
+                target_swiss = max(0, self.num_rounds - 1)
+                regular_remaining = max(0, target_swiss - self._completed_swiss_rounds)
+                needed_catchup = max(0, target_swiss - regular_remaining)
+                self._catchup_rounds_remaining = max(self._catchup_rounds_remaining, needed_catchup)
 
             self.ladder.fit_ratings()
             if self.write_tb:
@@ -532,12 +575,15 @@ class OfflineTournament:
             if isinstance(pair, (list, tuple)) and len(pair) == 2
         ]
         self._pending_is_catchup = bool(state.get('pending_is_catchup', False))
+        self._catchup_player_ids = {str(pid) for pid in state.get('catchup_player_ids', [])}
+        self._catchup_rounds_remaining = max(0, int(state.get('catchup_rounds_remaining', 0)))
         logging.info(
             f'[Tournament] Resumed state from {self.state_path} '
             f'({len(self.ladder.matches)} prior match(es), '
             f'chain_completed={self._chain_completed}, '
             f'completed_swiss_rounds={self._completed_swiss_rounds}, '
-            f'pending_swiss_pairs={len(self._pending_swiss_pairs)})'
+            f'pending_swiss_pairs={len(self._pending_swiss_pairs)}, '
+            f'catchup_rounds_remaining={self._catchup_rounds_remaining})'
         )
         return True
 
@@ -551,12 +597,20 @@ class OfflineTournament:
             'completed_swiss_rounds': int(self._completed_swiss_rounds),
             'pending_swiss_pairs': [[a, b] for a, b in self._pending_swiss_pairs],
             'pending_is_catchup': bool(self._pending_is_catchup),
+            'catchup_player_ids': sorted(self._catchup_player_ids),
+            'catchup_rounds_remaining': int(self._catchup_rounds_remaining),
             'timestamp': time.time(),
             'ladder': self.ladder.to_dict(),
         }
         atomic_json_save(payload, self.state_path)
 
-    def _run_pair(self, player_a_id: str, player_b_id: str, match_index: int) -> Dict[str, Any]:
+    def _run_pair(
+        self,
+        player_a_id: str,
+        player_b_id: str,
+        match_index: int,
+        on_before_save: Optional[Callable[[], None]] = None,
+    ) -> Dict[str, Any]:
         pa = self._build_player(player_a_id, slot=0)
         pb = self._build_player(player_b_id, slot=1)
         match_seed = (self.seed * 1_000_003 + match_index * 7_919) & 0x7FFFFFFF
@@ -580,6 +634,8 @@ class OfflineTournament:
             },
         )
         self.ladder.fit_ratings()
+        if on_before_save is not None:
+            on_before_save()
         self._save_state()
         logging.info(
             f'[Tournament] Match #{match_index}: {player_a_id} vs {player_b_id} -> '
@@ -626,31 +682,46 @@ class OfflineTournament:
                     self._chain_completed = True
                     self._save_state()
 
+                def _complete_pending_round_state() -> None:
+                    if self._pending_is_catchup:
+                        self._catchup_rounds_remaining = max(0, self._catchup_rounds_remaining - 1)
+                        if self._catchup_rounds_remaining == 0:
+                            self._catchup_player_ids.clear()
+                    else:
+                        self._completed_swiss_rounds += 1
+                    self._pending_is_catchup = False
+
                 def _drain_pending_swiss_round() -> None:
                     nonlocal match_index, matches_played_now
                     if not self._pending_swiss_pairs:
                         return
                     while self._pending_swiss_pairs:
                         a, b = self._pending_swiss_pairs[0]
+                        remaining = self._pending_swiss_pairs[1:]
                         played_now = _played_pair_counts(self.ladder)
-                        self._pending_swiss_pairs = self._pending_swiss_pairs[1:]
                         if played_now.get(_pair_key(a, b), 0) > 0:
+                            self._pending_swiss_pairs = remaining
+                            if not self._pending_swiss_pairs:
+                                _complete_pending_round_state()
                             self._save_state()
                             continue
+
+                        def _commit_pair_progress(rem: List[Tuple[str, str]] = remaining) -> None:
+                            self._pending_swiss_pairs = rem
+                            if not self._pending_swiss_pairs:
+                                _complete_pending_round_state()
+
                         match_index += 1
-                        self._run_pair(a, b, match_index=match_index)
+                        self._run_pair(
+                            a, b, match_index=match_index, on_before_save=_commit_pair_progress
+                        )
                         matches_played_now += 1
-                    if not self._pending_is_catchup:
-                        self._completed_swiss_rounds += 1
-                    self._pending_is_catchup = False
-                    self._save_state()
 
                 # Finish any interrupted mid-round Swiss pairs before planning a new round
                 _drain_pending_swiss_round()
 
                 # Rounds 2..num_rounds: adaptive Swiss nearest-Elo pairing
                 target_swiss_rounds = max(0, self.num_rounds - 1)
-                swiss_rounds_run_now = 0
                 while self._completed_swiss_rounds < target_swiss_rounds:
                     played = _played_pair_counts(self.ladder)
                     swiss_pairs = plan_swiss_round_pairs(
@@ -662,25 +733,25 @@ class OfflineTournament:
                     self._pending_is_catchup = False
                     self._save_state()
                     _drain_pending_swiss_round()
-                    swiss_rounds_run_now += 1
 
-                # Catch-up Swiss rounds if --resume added new players after prior rounds finished
-                catchup_rounds_needed = max(0, target_swiss_rounds - swiss_rounds_run_now)
-                if self._newly_added_ids and catchup_rounds_needed > 0:
-                    for _ in range(catchup_rounds_needed):
-                        played = _played_pair_counts(self.ladder)
-                        catchup_pairs = plan_swiss_round_pairs(
-                            self.ladder,
-                            self._ordered_player_ids,
-                            played,
-                            require_member_of=self._newly_added_ids,
-                        )
-                        if not catchup_pairs:
-                            break
-                        self._pending_swiss_pairs = list(catchup_pairs)
-                        self._pending_is_catchup = True
+                # Persisted catch-up Swiss rounds for checkpoints/anchors added via --resume
+                while self._catchup_rounds_remaining > 0 and self._catchup_player_ids:
+                    played = _played_pair_counts(self.ladder)
+                    catchup_pairs = plan_swiss_round_pairs(
+                        self.ladder,
+                        self._ordered_player_ids,
+                        played,
+                        require_member_of=self._catchup_player_ids,
+                    )
+                    if not catchup_pairs:
+                        self._catchup_rounds_remaining = 0
+                        self._catchup_player_ids.clear()
                         self._save_state()
-                        _drain_pending_swiss_round()
+                        break
+                    self._pending_swiss_pairs = list(catchup_pairs)
+                    self._pending_is_catchup = True
+                    self._save_state()
+                    _drain_pending_swiss_round()
 
             self.ladder.fit_ratings()
             self._save_state()

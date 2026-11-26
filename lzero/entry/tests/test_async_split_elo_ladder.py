@@ -624,6 +624,196 @@ def test_retroactive_best_rung_inversion_updates_elo_ckpt_best(tmp_path):
 
 
 @pytest.mark.unittest
+def test_offline_tournament_mid_catchup_crash_and_incremental_ordering(tmp_path):
+    from lzero.entry.async_split.io_utils import atomic_json_save, read_json
+
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    cfg_pair[0].policy.device = 'cpu'
+    compiled = compile_config(
+        copy.deepcopy(cfg_pair[0]), seed=0, env=None, auto=True, create_cfg=copy.deepcopy(cfg_pair[1]), save_cfg=False
+    )
+    policy = create_policy(copy.deepcopy(compiled.policy), model=None, enable_field=['learn', 'eval'])
+
+    ckpt_dir = tmp_path / 'ckpts'
+    ckpt_dir.mkdir(parents=True)
+    for idx, it in enumerate((0, 100, 200, 300)):
+        _save_dummy_ckpt(policy, ckpt_dir / f'iteration_{it}.pth.tar', train_iter=it, perturb=0.01 * idx)
+    all_specs = discover_checkpoints_in_dir(ckpt_dir)
+
+    out_dir = tmp_path / 'tourn_catchup_crash'
+    t1 = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=all_specs[:3],
+        output_dir=out_dir,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=3,  # chain + 2 Swiss rounds
+        seed=11,
+        device='cpu',
+        env_num=2,
+    )
+    t1.run()
+
+    # Passing ONLY the new checkpoint iter_300 on --resume must place it chronologically
+    # AFTER iter_200 (not prepended before iter_0 next to bot:random).
+    t2 = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=[all_specs[3]],
+        output_dir=out_dir,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=3,
+        seed=11,
+        device='cpu',
+        env_num=2,
+        resume=True,
+    )
+    try:
+        assert t2._ordered_player_ids == ['bot:random', 'iter_0', 'iter_100', 'iter_200', 'iter_300']
+        assert 'iter_300' in t2._catchup_player_ids
+        assert t2._catchup_rounds_remaining == 2
+        # Simulate crash right after iter_300 was persisted to state (e.g., after chain edge finished)
+        t2._chain_completed = True
+        t2._save_state()
+    finally:
+        t2.close()
+
+    # Re-resume: iter_300 is ALREADY in ladder.players, so _newly_added_ids is empty,
+    # yet persisted catchup_player_ids + catchup_rounds_remaining must still execute both catch-up rounds!
+    t3 = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=[all_specs[3]],
+        output_dir=out_dir,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=3,
+        seed=11,
+        device='cpu',
+        env_num=2,
+        resume=True,
+    )
+    r3 = t3.run()
+    assert r3['matches_played'] == 2
+    state_after = read_json(out_dir / 'tournament_state.json')
+    assert state_after['catchup_rounds_remaining'] == 0
+    assert state_after['catchup_player_ids'] == []
+
+
+@pytest.mark.unittest
+def test_async_evaluator_closes_env_on_partial_init_failure(tmp_path, monkeypatch):
+    import lzero.entry.async_split.evaluator as eval_mod
+
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    closed_flags = {'env_closed': False}
+
+    real_create_env_manager = eval_mod.create_env_manager
+
+    def _wrapped_create_env_manager(*args, **kwargs):
+        mgr = real_create_env_manager(*args, **kwargs)
+        orig_close = mgr.close
+
+        def _tracked_close():
+            closed_flags['env_closed'] = True
+            return orig_close()
+
+        mgr.close = _tracked_close
+        return mgr
+
+    def _failing_create_policy(*args, **kwargs):
+        raise RuntimeError('simulated policy init failure')
+
+    monkeypatch.setattr(eval_mod, 'create_env_manager', _wrapped_create_env_manager)
+    monkeypatch.setattr(eval_mod, 'create_policy', _failing_create_policy)
+
+    with pytest.raises(RuntimeError, match='simulated policy init failure'):
+        AsyncEvaluator(
+            input_cfg=cfg_pair,
+            run_dir=tmp_path / 'partial_init_fail',
+            seed=0,
+            device='cpu',
+            evaluator_env_num=1,
+            n_evaluator_episode=1,
+            env_manager_type='base',
+            eval_mode='bot',
+        )
+    assert closed_flags['env_closed'] is True
+
+
+@pytest.mark.unittest
+def test_elo_evaluator_promotion_uses_post_refit_champion_score(tmp_path):
+    from lzero.worker.elo_rating import PlayerEntry
+    from lzero.worker.head_to_head import MatchSummary
+
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    run_dir = tmp_path / 'champ_score_align'
+    elo_eval = AsyncEloEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=0,
+        device='cpu',
+        evaluator_env_num=1,
+        games_per_opponent=10,
+        opponents_per_eval=4,
+        promotion_win_rate=0.55,
+        promotion_elo_margin=50.0,
+    )
+    try:
+        p100 = elo_eval.dirs.elo_rungs_dir / 'iter_100.pth.tar'
+        p200 = elo_eval.dirs.elo_rungs_dir / 'iter_200.pth.tar'
+        _save_dummy_ckpt(elo_eval.candidate_policy, p100, train_iter=100)
+        _save_dummy_ckpt(elo_eval.candidate_policy, p200, train_iter=200)
+
+        elo_eval.ladder.register_player(
+            PlayerEntry('iter_100', kind='checkpoint', ckpt_path=str(p100), train_iter=100, active=True)
+        )
+        elo_eval.ladder.register_player(
+            PlayerEntry('iter_200', kind='checkpoint', ckpt_path=str(p200), train_iter=200, active=True)
+        )
+        elo_eval.ladder.record_match('iter_100', 'bot:random', wins_a=8, draws=0, losses_a=2)
+        elo_eval.ladder.record_match('iter_200', 'bot:random', wins_a=8, draws=0, losses_a=2)
+        elo_eval.ladder.record_match('iter_200', 'iter_100', wins_a=6, draws=0, losses_a=4)
+        elo_eval.ladder.fit_ratings()
+        assert elo_eval.ladder.get_champion().player_id == 'iter_200'
+
+        # iter_300 beats pre-refit champion iter_200 (8-2 -> 80%), loses to iter_100 (4-6 -> 40%),
+        # and beats random (9-1 -> 90%). After refit, iter_100 overtakes iter_200 as true champion,
+        # and iter_300 is slightly above iter_100 (< +50 Elo) while having LOST 4-6 to iter_100 ->
+        # must NOT falsely promote via beat_champion using stale iter_200's 80% score!
+        outcomes = {
+            'bot:random': (9, 0, 1),
+            'iter_100': (4, 0, 6),
+            'iter_200': (8, 0, 2),
+        }
+
+        def _fake_play_match(player_a, player_b, num_games, seed):
+            w, d, l = outcomes[player_b.player_id]
+            return MatchSummary(
+                player_a=player_a.player_id,
+                player_b=player_b.player_id,
+                wins_a=w,
+                draws=d,
+                losses_a=l,
+                p1_wins=w,
+                p2_wins=l,
+                total_steps=100,
+                elapsed_sec=0.01,
+                map_seeds=[1] * num_games,
+            )
+
+        elo_eval.runner.play_match = _fake_play_match
+        res = elo_eval.evaluate_loaded_candidate(train_iter=300, envstep=3000)
+
+        assert elo_eval.ladder.get_elo('iter_100') > elo_eval.ladder.get_elo('iter_200')
+        assert res['win_rate_vs_champion'] == pytest.approx(0.4, abs=1e-6)
+        assert res['promoted'] is False
+    finally:
+        elo_eval.close()
+
+
+@pytest.mark.unittest
 def test_async_evaluator_both_mode_resume_desync_skips_duplicate_elo(tmp_path):
     cfg_pair = _make_tiny_galcon_async_cfg()
     run_dir = tmp_path / 'both_desync'

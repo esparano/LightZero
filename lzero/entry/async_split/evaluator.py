@@ -358,6 +358,18 @@ class AsyncEvaluator:
                 self.evaluator.close()
             except Exception:
                 pass
+        else:
+            if self.evaluator_env is not None:
+                try:
+                    self.evaluator_env.close()
+                except Exception:
+                    pass
+            if self.tb_logger is not None:
+                try:
+                    self.tb_logger.flush()
+                    self.tb_logger.close()
+                except Exception:
+                    pass
         if self.elo_evaluator is not None:
             try:
                 self.elo_evaluator.close()
