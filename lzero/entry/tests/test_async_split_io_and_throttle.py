@@ -209,3 +209,43 @@ def test_publish_weights_rejects_non_finite_without_overwriting_existing(tmp_pat
     loaded = torch.load(weights_path, map_location='cpu', weights_only=False)
     assert loaded['train_iter'] == 10
     assert torch.allclose(loaded['model']['w'], torch.tensor([1.0, 2.0]))
+
+
+@pytest.mark.unittest
+def test_weight_watcher_detects_atomic_replace_with_identical_mtime_and_size(tmp_path):
+    """WeightWatcher must detect an atomically replaced file even when mtime_ns and size match."""
+    import os
+
+    weights_path = tmp_path / 'weights' / 'latest_weights.pt'
+    src_model = torch.nn.Linear(4, 2)
+    dst_model = torch.nn.Linear(4, 2)
+
+    with torch.no_grad():
+        src_model.weight.fill_(1.0)
+        src_model.bias.fill_(0.5)
+    publish_weights(weights_path, src_model.state_dict(), train_iter=1, envstep=10)
+    st1 = weights_path.stat()
+
+    watcher = WeightWatcher(weights_path)
+    meta1 = watcher.poll_and_load(dst_model)
+    assert meta1 is not None and meta1['train_iter'] == 1
+    assert torch.allclose(dst_model.weight, torch.ones_like(dst_model.weight))
+    assert not watcher.has_update()
+
+    # Publish updated weights via atomic replace, then force identical mtime_ns to simulate
+    # coarse filesystem timestamp granularity (e.g. Linux COARSE timer ticks).
+    with torch.no_grad():
+        src_model.weight.fill_(2.5)
+        src_model.bias.fill_(-0.25)
+    publish_weights(weights_path, src_model.state_dict(), train_iter=2, envstep=20)
+    os.utime(weights_path, ns=(st1.st_atime_ns, st1.st_mtime_ns))
+    st2 = weights_path.stat()
+    assert st2.st_mtime_ns == st1.st_mtime_ns
+    assert st2.st_size == st1.st_size
+    assert st2.st_ino != st1.st_ino
+
+    assert watcher.has_update() is True
+    meta2 = watcher.poll_and_load(dst_model)
+    assert meta2 is not None and meta2['train_iter'] == 2
+    assert torch.allclose(dst_model.weight, torch.full_like(dst_model.weight, 2.5))
+    assert not watcher.has_update()

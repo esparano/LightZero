@@ -299,6 +299,7 @@ class WeightWatcher:
         self.weights_path = Path(weights_path)
         self.last_mtime_ns: Optional[int] = None
         self.last_size: Optional[int] = None
+        self.last_ino: Optional[int] = None
         self.last_version: int = -1
         self.last_meta: Dict[str, Any] = {'train_iter': 0, 'version': -1, 'envstep': 0}
 
@@ -309,7 +310,11 @@ class WeightWatcher:
             return False
         if self.last_mtime_ns is None:
             return True
-        return st.st_mtime_ns != self.last_mtime_ns or st.st_size != self.last_size
+        return (
+            st.st_mtime_ns != self.last_mtime_ns
+            or st.st_size != self.last_size
+            or st.st_ino != self.last_ino
+        )
 
     def poll_and_load(
         self,
@@ -335,12 +340,18 @@ class WeightWatcher:
             return None
 
         version = int(payload.get('version', payload.get('train_iter', 0)))
-        if not force and version <= self.last_version and self.last_mtime_ns == st.st_mtime_ns:
+        if (
+            not force
+            and version <= self.last_version
+            and self.last_mtime_ns == st.st_mtime_ns
+            and self.last_ino == st.st_ino
+        ):
             return None
 
         model.load_state_dict(payload['model'])
         self.last_mtime_ns = st.st_mtime_ns
         self.last_size = st.st_size
+        self.last_ino = st.st_ino
         self.last_version = version
         meta = {k: v for k, v in payload.items() if k != 'model'}
         meta.setdefault('train_iter', version)
