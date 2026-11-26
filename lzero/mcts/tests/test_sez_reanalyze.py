@@ -27,6 +27,8 @@ def _build_tiny_galcon_setup(
     policy_target_type: str = 'completed_q',
     num_unroll_steps: int = 2,
     batch_size: int = 4,
+    reanalyze_noise: bool = False,
+    symmetric_augment: bool = False,
 ):
     mc = EasyDict(copy.deepcopy(_galcon_main_cfg))
     cc = EasyDict(copy.deepcopy(_galcon_create_cfg))
@@ -48,10 +50,10 @@ def _build_tiny_galcon_setup(
     mc.policy.lstm_horizon_len = max(1, num_unroll_steps)
     mc.policy.reanalyze_ratio = reanalyze_ratio
     mc.policy.reanalyze_outdated = True
-    mc.policy.reanalyze_noise = False
+    mc.policy.reanalyze_noise = reanalyze_noise
     mc.policy.policy_target_type = policy_target_type
-    mc.policy.symmetric_augment_x = False
-    mc.policy.symmetric_augment_y = False
+    mc.policy.symmetric_augment_x = symmetric_augment
+    mc.policy.symmetric_augment_y = symmetric_augment
     mc.policy.model.observation_shape = (40, 4, 4)
     mc.policy.model.image_channel = 40
     mc.policy.model.action_space_size = 4 * 4 * 4 * 4 + 1
@@ -202,7 +204,17 @@ def _make_stub_segment(action_space_size: int, k: int, seg_len: int, mcts_ctree:
     return seg
 
 
-def _make_stub_buffer(action_space_size: int, k: int, seg_len: int, mcts_ctree: bool, reanalyze_ratio: float, num_unroll_steps: int = 1, batch_size: int = 2):
+def _make_stub_buffer(
+    action_space_size: int,
+    k: int,
+    seg_len: int,
+    mcts_ctree: bool,
+    reanalyze_ratio: float,
+    num_unroll_steps: int = 1,
+    batch_size: int = 2,
+    reanalyze_noise: bool = False,
+    root_noise_weight: float = 0.0,
+):
     buf_cfg = EasyDict(
         dict(
             device='cpu',
@@ -226,10 +238,10 @@ def _make_stub_buffer(action_space_size: int, k: int, seg_len: int, mcts_ctree: 
             pb_c_init=1.25,
             value_delta_max=0.01,
             root_dirichlet_alpha=0.3,
-            root_noise_weight=0.0,
+            root_noise_weight=root_noise_weight,
             reanalyze_ratio=reanalyze_ratio,
             reanalyze_outdated=True,
-            reanalyze_noise=False,
+            reanalyze_noise=reanalyze_noise,
             policy_target_type='completed_q',
             completed_q_c_visit=50.0,
             completed_q_c_scale=1.0,
@@ -471,3 +483,116 @@ def test_sez_buffer_deepcopy_and_short_root_sampled_actions_bounds():
     policy = EasyDict(_target_model=_DeterministicShiftModel(action_space_size, preferred_action=3))
     train_data = buf.sample(1, policy)
     assert train_data[1][2].shape == (1, 2, k)
+
+
+@pytest.mark.unittest
+@pytest.mark.parametrize('mcts_ctree', [True, False])
+def test_galcon_sez_reanalyze_with_4x_symmetry_augmentation(mcts_ctree):
+    """Partial reanalyze preserves integer dtype, shape, and legal-action alignment on 4x symmetry-augmented Galcon segments."""
+    cfg, policy, buf, env = _build_tiny_galcon_setup(
+        mcts_ctree=mcts_ctree,
+        reanalyze_ratio=0.5,
+        policy_target_type='completed_q',
+        num_unroll_steps=2,
+        batch_size=4,
+        reanalyze_noise=False,
+        symmetric_augment=True,
+    )
+    buf.reflect_fn = GalconEnv.reflect_game_segment
+
+    segs, metas = _collect_segments(cfg, policy, env, num_episodes=1, steps_per_ep=6)
+    buf.push_game_segments((segs, metas))
+    assert buf.get_num_of_game_segments() == 4
+    initial_dtypes = [np.asarray(seg.root_sampled_actions[0]).dtype for seg in buf.game_segment_buffer]
+    # Reflected segments (indices 1..3) are stored as integer arrays by GalconEnv.reflect_game_segment.
+    for ref_dtype in initial_dtypes[1:]:
+        assert np.issubdtype(ref_dtype, np.integer)
+
+    expected_item_shape = (4, 1) if mcts_ctree else (4,)
+    for _ in range(3):
+        train_data = buf.sample(4, policy)
+        sampled_actions = train_data[0][2]
+        target_policies = train_data[1][2]
+        assert sampled_actions.dtype != object
+        assert np.all(sampled_actions == np.rint(sampled_actions))
+        assert sampled_actions.shape == ((4, 3, 4, 1) if mcts_ctree else (4, 3, 4))
+        assert target_policies.shape == (4, 3, 4)
+        out = policy.learn_mode.forward(train_data)
+        assert np.isfinite(out['total_loss'])
+
+    # Verify every stored segment retains its original dtype/shape (int64 for reflected copies) and legal actions after in-place write-back.
+    for seg, init_dtype in zip(buf.game_segment_buffer, initial_dtypes):
+        for t in range(len(seg)):
+            stored = np.asarray(seg.root_sampled_actions[t])
+            assert stored.dtype == init_dtype
+            assert stored.shape == expected_item_shape
+            legal_set = set(np.nonzero(seg.action_mask_segment[t])[0].tolist())
+            probs = np.asarray(seg.child_visit_segment[t], dtype=np.float64)
+            assert np.all(np.isfinite(probs))
+            assert np.isclose(probs.sum(), 1.0, atol=1e-5)
+            for act, prob in zip(stored.reshape(-1), probs):
+                if prob > 0:
+                    assert int(act) in legal_set
+
+    # Verify non-reanalyzed readback after in-place updates still learns cleanly.
+    buf._cfg.reanalyze_ratio = 0.0
+    train_data_non_re = buf.sample(4, policy)
+    out_non_re = policy.learn_mode.forward(train_data_non_re)
+    assert np.isfinite(out_non_re['total_loss'])
+
+
+@pytest.mark.unittest
+@pytest.mark.parametrize('mcts_ctree', [True, False])
+def test_reanalyze_with_dirichlet_noise_and_sparse_legal_actions(mcts_ctree):
+    """reanalyze_noise=True works cleanly for both CTree and PTree, including when len(legal_actions) < K."""
+    action_space_size = 10
+    k = 4
+    seg_len = 4
+    # Strictly fewer legal actions (2) than K (4), testing Dirichlet noise clamping/padding.
+    legal_actions = [5, 7]
+    stale_actions = [0, 1, 2, 3]
+    buf = _make_stub_buffer(
+        action_space_size=action_space_size,
+        k=k,
+        seg_len=seg_len,
+        mcts_ctree=mcts_ctree,
+        reanalyze_ratio=0.5,
+        num_unroll_steps=1,
+        batch_size=2,
+        reanalyze_noise=True,
+        root_noise_weight=0.25,
+    )
+    seg = _make_stub_segment(action_space_size, k, seg_len, mcts_ctree, legal_actions, stale_actions)
+    buf.push_game_segments(([seg], [{'priorities': np.ones(seg_len, dtype=np.float32), 'done': True, 'unroll_plus_td_steps': 1}]))
+    policy = EasyDict(_target_model=_DeterministicShiftModel(action_space_size, preferred_action=7))
+
+    train_data = buf.sample(2, policy)
+    re_acts = train_data[0][2][0]
+    re_masks = train_data[0][3][0]
+    re_pols = train_data[1][2][0]
+    assert np.issubdtype(re_acts.dtype, np.integer)
+    for u in range(2):
+        if re_masks[u] > 0:
+            probs = np.asarray(re_pols[u], dtype=np.float64)
+            assert np.all(np.isfinite(probs))
+            assert np.all(probs >= 0.0)
+            assert np.isclose(probs.sum(), 1.0, atol=1e-5)
+            for act, prob in zip(np.asarray(re_acts[u]).reshape(-1), probs):
+                if prob > 0:
+                    assert int(act) in legal_actions
+
+    # End-to-end Galcon SEZ sample + learn with reanalyze_noise=True (policy default).
+    cfg, galcon_policy, galcon_buf, env = _build_tiny_galcon_setup(
+        mcts_ctree=mcts_ctree,
+        reanalyze_ratio=0.5,
+        policy_target_type='completed_q',
+        num_unroll_steps=2,
+        batch_size=4,
+        reanalyze_noise=True,
+        symmetric_augment=False,
+    )
+    segs, metas = _collect_segments(cfg, galcon_policy, env, num_episodes=2, steps_per_ep=6)
+    galcon_buf.push_game_segments((segs, metas))
+    galcon_batch = galcon_buf.sample(4, galcon_policy)
+    out = galcon_policy.learn_mode.forward(galcon_batch)
+    assert np.isfinite(out['total_loss'])

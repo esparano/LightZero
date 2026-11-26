@@ -350,6 +350,15 @@ Experiment Backlog / TODOs
     - Two-player self_play_mode is untested (to_play sign-flipping TODOs in game_buffer_unizero; missing eval to_play=-1->1 remap and 4x symmetry augmentation).
     - Tradeoff: slower MCTS sims (Transformer KV-cache) and less 2D spatial inductive bias than SEZ conv dynamics.
 [ ] Try reanalyze
+[ ] Experiment with increasing replay_buffer_size from 40k (10k raw) to 160k (40k raw with 4x symmetry):
+    - Motivation: Current 40k buffer holds only ~100-115 raw games (~109s turnover at 91.6 envsteps/s). Growing to 160k (~430-460 raw games) increases random-map diversity, reduces catastrophic forgetting/overfitting, and fixes the 10x discrepancy vs. the comment in galcon_sez_sp_mode_config_SIMPLE*.py.
+    - Associated parameters to adjust / consider alongside 160k buffer:
+      - Policy staleness & reanalyze: 4x larger buffer quadruples transition lifespan before eviction (~550 -> ~2,200 updates at max_replay_ratio=0.055; ~5,000 updates at 0.125). Once data lives 2k+ updates, pair with testing reanalyze_ratio=0.05-0.25 (after >=5k iter warmup), reanalyze_noise=False (override default True), reanalyze_outdated=True, use_root_value=False (no-op while td_steps=max_episode_steps), and target_update_freq=100.
+      - Actor/learner balance if reanalyze_ratio > 0: Current (B, 4097) policy_logits.tolist() MCTS marshalling adds ~0.5-1.2s/iter even at reanalyze_ratio=0.10, so either reduce CPU actors (e.g., 10 -> 4-6) to keep replay_ratio from collapsing, or optimize the C++/Python logits marshalling in mcts_ctree_sampled.py first (note: async_split auto-caps prefetch_workers to 1 when reanalyze_ratio > 0).
+      - Replay ratio (--max-replay-ratio / update_per_collect): With 4x more map diversity in the buffer, test raising --max-replay-ratio (e.g., 0.055 -> 0.08-0.125) if learner throughput allows.
+      - Priority sampling (use_priority): Consider testing use_priority=True (alpha=0.6, beta=0.4) instead of uniform sampling so training focuses on high-error transitions across the deeper 160k buffer.
+      - Actor lag & target sharpness: Keep --publish-every 10 (or lower) to minimize actor weight lag on top of longer buffer residency; with policy_target_type='completed_q' + reanalyze, watch policy_entropy_avg (logged value is step-5 entropy / 6) and lower completed_q_c_scale (1.0 -> 0.25-0.5) if entropy collapses.
+      - RAM / checkpoint snapshot footprint: 4x larger buffer grows replay_buffer.pkl from ~586 MB to ~2.3 GB (and ~4x RAM + ~5-6s save/load time on graceful SIGTERM shutdown/resume; verify it stays well within cli.py's 30s shutdown timeout).
 [ ] [Low Priority] Bump grad_clip_value from 0.5 to 2.0 (so typical batches aren't clipped):
     - Typical pre-clip total_grad_norm_before_clip_avg sits around ~0.9-1.1, so 0.5 clips almost every batch into per-batch gradient normalization.
     - Under AdamW, steady ~2x scaling largely cancels out via the running RMS denominator, so expected impact is small — best rolled into a future fresh config series rather than spending a standalone A/B run.
