@@ -1,3 +1,5 @@
+import copy
+import threading
 from typing import Any, List, Tuple
 
 import numpy as np
@@ -47,6 +49,24 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
 
         self.value_support = DiscreteSupport(*self._cfg.model.value_support_range)
         self.reward_support = DiscreteSupport(*self._cfg.model.reward_support_range)
+        self._segment_update_lock = threading.Lock()
+
+    def _get_segment_update_lock(self) -> threading.Lock:
+        """Return the per-buffer lock guarding paired (child_visit, root_sampled_actions) updates."""
+        lock = getattr(self, '_segment_update_lock', None)
+        if lock is None:
+            lock = threading.Lock()
+            self._segment_update_lock = lock
+        return lock
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop('_segment_update_lock', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._segment_update_lock = threading.Lock()
 
     def sample(self, batch_size: int, policy: Any) -> List[Any]:
         """
@@ -75,8 +95,11 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             policy_non_re_context, self._cfg.model.num_of_sampled_actions
         )
 
-        if self._cfg.reanalyze_ratio > 0:
+        batch_target_policies_re = []
+        if policy_re_context is not None:
             # target policy
+            assert (self._cfg.reanalyze_ratio > 0 and self._cfg.reanalyze_outdated is True), \
+                "in sampled efficientzero, if self._cfg.reanalyze_ratio>0, you must set self._cfg.reanalyze_outdated=True"
             batch_target_policies_re, root_sampled_actions = self._compute_target_policy_reanalyzed(
                 policy_re_context, policy._target_model
             )
@@ -85,29 +108,17 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             # use the latest root_sampled_actions after the reanalyze process,
             # because the batch_target_policies_re is corresponding to the latest root_sampled_actions
             # ==============================================================
-
-            assert (self._cfg.reanalyze_ratio > 0 and self._cfg.reanalyze_outdated is True), \
-                "in sampled effiicientzero, if self._cfg.reanalyze_ratio>0, you must set self._cfg.reanalyze_outdated=True"
             # current_batch = [obs_list, action_list, root_sampled_actions_list, mask_list, batch_index_list, weights_list, make_time_list]
-            if self._cfg.model.continuous_action_space:
-                current_batch[2][:int(batch_size * self._cfg.reanalyze_ratio)] = root_sampled_actions.reshape(
-                    int(batch_size * self._cfg.reanalyze_ratio), self._cfg.num_unroll_steps + 1,
-                    self._cfg.model.num_of_sampled_actions, self._cfg.model.action_space_size
-                )
-            else:
-                current_batch[2][:int(batch_size * self._cfg.reanalyze_ratio)] = root_sampled_actions.reshape(
-                    int(batch_size * self._cfg.reanalyze_ratio), self._cfg.num_unroll_steps + 1,
-                    self._cfg.model.num_of_sampled_actions, 1
-                )
+            reanalyze_num = batch_target_policies_re.shape[0]
+            current_batch[2][:reanalyze_num] = root_sampled_actions.reshape(
+                (reanalyze_num,) + current_batch[2].shape[1:]
+            )
 
-        if 0 < self._cfg.reanalyze_ratio < 1:
-            try:
-                batch_target_policies = np.concatenate([batch_target_policies_re, batch_target_policies_non_re])
-            except Exception as error:
-                print(error)
-        elif self._cfg.reanalyze_ratio == 1:
+        if policy_re_context is not None and policy_non_re_context is not None:
+            batch_target_policies = np.concatenate([batch_target_policies_re, batch_target_policies_non_re], axis=0)
+        elif policy_re_context is not None:
             batch_target_policies = batch_target_policies_re
-        elif self._cfg.reanalyze_ratio == 0:
+        else:
             batch_target_policies = batch_target_policies_non_re
 
         target_batch = [batch_value_prefixs, batch_target_values, batch_target_policies]
@@ -136,6 +147,9 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         batch_size = len(batch_index_list)
         obs_list, action_list, mask_list = [], [], []
         root_sampled_actions_list = []
+        reanalyze_num = int(batch_size * reanalyze_ratio)
+        non_re_child_visit_snapshots = []
+        seg_lock = self._get_segment_update_lock()
         # prepare the inputs of a batch
         for i in range(batch_size):
             game = game_lst[i]
@@ -147,9 +161,31 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                                               self._cfg.num_unroll_steps]
             actions_tmp = actions_slice.tolist() if hasattr(actions_slice, 'tolist') else list(actions_slice)
 
-            # NOTE: self._cfg.num_unroll_steps + 1
-            root_sampled_actions_tmp = game.root_sampled_actions[pos_in_game_segment:pos_in_game_segment +
-                                                                 self._cfg.num_unroll_steps + 1]
+            if reanalyze_ratio > 0:
+                # Snapshot root_sampled_actions (and the needed unroll window of child_visit_segment
+                # for non-reanalyzed rows) together under seg_lock so concurrent reanalyze updates
+                # cannot cause a torn read.
+                with seg_lock:
+                    # NOTE: self._cfg.num_unroll_steps + 1
+                    root_sampled_actions_slice = game.root_sampled_actions[
+                        pos_in_game_segment:pos_in_game_segment + self._cfg.num_unroll_steps + 1
+                    ]
+                    root_sampled_actions_tmp = [
+                        np.array(a, copy=True) if isinstance(a, np.ndarray) else copy.deepcopy(a)
+                        for a in root_sampled_actions_slice
+                    ]
+                    if i >= reanalyze_num:
+                        cv = game.child_visit_segment
+                        end_idx = min(pos_in_game_segment + self._cfg.num_unroll_steps + 1, len(cv))
+                        non_re_child_visit_snapshots.append({
+                            t: (cv[t].copy() if isinstance(cv[t], np.ndarray) else copy.deepcopy(cv[t]))
+                            for t in range(pos_in_game_segment, end_idx)
+                        })
+            else:
+                # NOTE: self._cfg.num_unroll_steps + 1
+                root_sampled_actions_tmp = list(
+                    game.root_sampled_actions[pos_in_game_segment:pos_in_game_segment + self._cfg.num_unroll_steps + 1]
+                )
 
             # add mask for invalid actions (out of trajectory), 1 for valid, 0 for invalid
            
@@ -261,7 +297,6 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         if self._cfg.reanalyze_outdated is True, batch_index_list is sorted according to its generated env_steps
         0: reanalyze_num -> reanalyzed policy, reanalyze_num:end -> non reanalyzed policy
         """
-        reanalyze_num = int(batch_size * reanalyze_ratio)
         # reanalyzed policy
         if reanalyze_num > 0:
             # obtain the context of reanalyzed policy targets
@@ -277,11 +312,25 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             policy_non_re_context = self._prepare_policy_non_reanalyzed_context(
                 batch_index_list[reanalyze_num:], game_lst[reanalyze_num:], pos_in_game_segment_list[reanalyze_num:]
             )
+            # Replace live child_visit references with the lock-consistent snapshots taken alongside root_sampled_actions.
+            if reanalyze_ratio > 0:
+                policy_non_re_context[1] = non_re_child_visit_snapshots
         else:
             policy_non_re_context = None
 
         context = reward_value_context, policy_re_context, policy_non_re_context, current_batch
         return context
+
+    def _prepare_policy_reanalyzed_context(
+            self, batch_index_list: List[Any], game_segment_list: List[Any], pos_in_game_segment_list: List[int]
+    ) -> List[Any]:
+        """Extend base reanalyze context with segment ``root_sampled_actions`` so in-place updates stay aligned."""
+        policy_re_context = super()._prepare_policy_reanalyzed_context(
+            batch_index_list, game_segment_list, pos_in_game_segment_list
+        )
+        root_sampled_actions_segments = [game_segment.root_sampled_actions for game_segment in game_segment_list]
+        policy_re_context.append(root_sampled_actions_segments)
+        return policy_re_context
 
     def _compute_target_reward_value(self, reward_value_context: List[Any], model: Any) -> List[np.ndarray]:
         """
@@ -360,7 +409,7 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                 _, value_prefix_pool, policy_logits_pool, latent_state_roots, reward_hidden_state_roots = concat_output(
                     network_output, data_type='efficientzero'
                 )
-                value_prefix_pool = value_prefix_pool.squeeze().tolist()
+                value_prefix_pool = np.asarray(value_prefix_pool).reshape(-1).tolist()
                 policy_logits_pool = policy_logits_pool.tolist()
                 # generate the noises for the root nodes
                 noises = [
@@ -392,8 +441,7 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                     else:
                         roots.prepare_no_noise(value_prefix_pool, policy_logits_pool, to_play)
                     # do MCTS for a new policy with the recent target model
-                    MCTSPtree.roots(self._cfg
-                                    ).search(roots, model, latent_state_roots, reward_hidden_state_roots, to_play)
+                    MCTSPtree(self._cfg).search(roots, model, latent_state_roots, reward_hidden_state_roots, to_play)
 
                 roots_values = roots.get_values()
                 value_list = np.array(roots_values)
@@ -505,7 +553,7 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             - batch_target_policies_re
         """
         if policy_re_context is None:
-            return []
+            return [], []
         target_type = self._cfg.get('policy_target_type', 'visit_count')
         if target_type not in ('visit_count', 'completed_q'):
             raise ValueError(
@@ -518,8 +566,19 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             )
         batch_target_policies_re = []
 
-        policy_obs_list, policy_mask, pos_in_game_segment_list, batch_index_list, child_visits, root_values, game_segment_lens, action_mask_segment, \
-        to_play_segment = policy_re_context  # noqa
+        if len(policy_re_context) == 10:
+            (
+                policy_obs_list, policy_mask, pos_in_game_segment_list, batch_index_list,
+                child_visits, root_values, game_segment_lens, action_mask_segment,
+                to_play_segment, root_sampled_actions_segments
+            ) = policy_re_context
+        else:
+            (
+                policy_obs_list, policy_mask, pos_in_game_segment_list, batch_index_list,
+                child_visits, root_values, game_segment_lens, action_mask_segment,
+                to_play_segment
+            ) = policy_re_context
+            root_sampled_actions_segments = None
         # transition_batch_size = game_segment_batch_size * (self._cfg.num_unroll_steps + 1)
         transition_batch_size = len(policy_obs_list)
         game_segment_batch_size = len(pos_in_game_segment_list)
@@ -573,7 +632,7 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             )
 
             raw_values_pool = np.asarray(raw_values_pool).reshape(-1).tolist()
-            value_prefix_pool = value_prefix_pool.squeeze().tolist()
+            value_prefix_pool = np.asarray(value_prefix_pool).reshape(-1).tolist()
             policy_logits_pool = policy_logits_pool.tolist()
             # noises are not necessary for reanalyze
             noises = [
@@ -606,7 +665,7 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                 else:
                     roots.prepare_no_noise(value_prefix_pool, policy_logits_pool, to_play)
                 # do MCTS for a new policy with the recent target model
-                MCTSPtree.roots(self._cfg).search(roots, model, latent_state_roots, reward_hidden_state_roots, to_play)
+                MCTSPtree(self._cfg).search(roots, model, latent_state_roots, reward_hidden_state_roots, to_play)
 
             roots_legal_actions_list = legal_actions
             roots_distributions = roots.get_distributions()
@@ -622,13 +681,21 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             # fix reanalyze in sez
             # ==============================================================
             roots_sampled_actions = roots.get_sampled_actions()
-            try:
-                root_sampled_actions = np.array([action.value for action in roots_sampled_actions])
-            except Exception:
-                root_sampled_actions = np.array([action for action in roots_sampled_actions])
-            
+            root_sampled_actions = np.asarray([
+                [action.value if hasattr(action, 'value') else action for action in row]
+                for row in roots_sampled_actions
+            ])
+
+            seg_lock = self._get_segment_update_lock()
+            rsa_segments_iter = (
+                root_sampled_actions_segments
+                if root_sampled_actions_segments is not None
+                else [None] * len(pos_in_game_segment_list)
+            )
             policy_index = 0
-            for state_index, child_visit, root_value in zip(pos_in_game_segment_list, child_visits, root_values):
+            for state_index, child_visit, root_value, root_sampled_actions_seg in zip(
+                pos_in_game_segment_list, child_visits, root_values, rsa_segments_iter
+            ):
                 target_policies = []
                 for current_index in range(state_index, state_index + self._cfg.num_unroll_steps + 1):
                     distributions = roots_distributions[policy_index]
@@ -650,15 +717,11 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                             )
                         else:
                             # Update the data in game segment:
-                            # after the reanalyze search, new target policies and root values are obtained
-                            # the target policies and root values are stored in the gamesegment, specifically, ``child_visit_segment`` and ``root_value_segment``
-                            # we replace the data at the corresponding location with the latest search results to keep the most up-to-date targets
+                            # after the reanalyze search, new target policies, root values, and sampled actions are obtained.
+                            # Update all three atomically under seg_lock so subsequent non-reanalyzed samples never
+                            # pair refreshed child_visit distributions with stale root_sampled_actions.
                             if use_completed_q:
                                 sampled_row = root_sampled_actions[policy_index]
-                                if sampled_row.dtype == object:
-                                    sampled_row = np.array(
-                                        [a.value if hasattr(a, 'value') else a for a in sampled_row]
-                                    )
                                 distributions = compute_completed_q_policy(
                                     visit_counts=distributions,
                                     child_q_values=roots_child_q_values[policy_index],
@@ -668,22 +731,31 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                                     c_visit=float(self._cfg.get('completed_q_c_visit', 50.0)),
                                     c_scale=float(self._cfg.get('completed_q_c_scale', 1.0)),
                                 )
-                            sim_num = sum(distributions)
-                            child_visit[current_index] = [visit_count/sim_num for visit_count in distributions]
-                            root_value[current_index] = searched_value
-                            if self._cfg.action_type == 'fixed_action_space':
-                                sum_visits = sum(distributions)
-                                policy = [visit_count / sum_visits for visit_count in distributions]
-                                target_policies.append(policy)
+                            sim_num = float(sum(distributions))
+                            if sim_num > 0:
+                                policy = [float(visit_count) / sim_num for visit_count in distributions]
                             else:
-                                # for board games / varied action space:
-                                # distributions is already K-length (one per sampled action),
-                                # so just normalize and use directly.
-                                # Do NOT use legal_action as an array index — for large/sparse
-                                # action spaces (e.g. Galcon) the action ID >> num_of_sampled_actions.
-                                sum_visits = sum(distributions)
-                                policy = [visit_count / sum_visits for visit_count in distributions]
-                                target_policies.append(policy)
+                                policy = [1.0 / len(distributions) for _ in distributions]
+
+                            with seg_lock:
+                                if root_sampled_actions_seg is not None:
+                                    if current_index < len(root_sampled_actions_seg):
+                                        existing_sampled = root_sampled_actions_seg[current_index]
+                                        new_sampled = np.asarray(root_sampled_actions[policy_index]).copy()
+                                        if hasattr(existing_sampled, 'shape') and new_sampled.shape != existing_sampled.shape:
+                                            new_sampled = new_sampled.reshape(existing_sampled.shape)
+                                        if hasattr(existing_sampled, 'dtype') and np.issubdtype(
+                                            existing_sampled.dtype, np.integer
+                                        ):
+                                            new_sampled = np.rint(new_sampled).astype(existing_sampled.dtype)
+                                        child_visit[current_index] = policy
+                                        root_value[current_index] = searched_value
+                                        root_sampled_actions_seg[current_index] = new_sampled
+                                else:
+                                    child_visit[current_index] = policy
+                                    root_value[current_index] = searched_value
+
+                            target_policies.append(policy)
 
                     policy_index += 1
 
