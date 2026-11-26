@@ -9,7 +9,10 @@
 - **Running TensorBoard on WSL:**
   Always pass `--load_fast=false --host 0.0.0.0` (the default Rust data server can hang in WSL), and verify the port is listening (`ss -tlnp | grep 6006` or the `TensorBoard ... at http://` log line) **before** giving the user the URL.
   Always link TensorBoard as a clean Markdown hyperlink (not a raw wall-of-text URL) using the `?pinnedCards=...#timeseries` format so key `*_iter/` + async metrics auto-pin:
-  `[Open TensorBoard (Pinned Key Metrics)](http://localhost:6006/?pinnedCards=%5B%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22evaluator_iter/eval_episode_return_mean%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22evaluator_iter/eval/episode_length%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/value_loss_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/policy_loss_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/consistency_loss_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/policy_entropy_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/action0_taken_rate_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/policy_action0_prob_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22async_learner/actor_learner_balance%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22async_learner/replay_ratio%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22async_learner/ingested_envsteps%22%7D%5D#timeseries)`
+  `[Open TensorBoard (Pinned Key Metrics)](http://localhost:6006/?pinnedCards=%5B%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22elo_iter/rating%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22elo_iter/win_rate_vs_champion%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22evaluator_iter/eval_episode_return_mean%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22evaluator_iter/eval/episode_length%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/value_loss_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/policy_loss_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/consistency_loss_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/policy_entropy_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/action0_taken_rate_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/policy_action0_prob_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22async_learner/actor_learner_balance%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22async_learner/replay_ratio%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22async_learner/ingested_envsteps%22%7D%5D#timeseries)`
+- **Elo Checkpoint-Ladder Evaluation & Offline Tournaments (`lzero.entry.async_split`):**
+  - Live async runs support `--eval-mode {bot,elo_ladder,both}` on both `evaluator` and `launch` (default `bot`). In `elo_ladder`/`both`, `AsyncEloEvaluator` runs paired side-swapped matches on matched map seeds, fits joint Bradley-Terry MLE ratings anchored at `bot:random = 0.0`, logs `elo_iter/*` & `elo_step/*` to `log/elo_evaluator/`, persists rungs/state under `elo_ladder/` (full `--resume` support), and saves `ckpt/elo_ckpt_best.pth.tar`.
+  - Standalone offline tournaments run via `python3 -m lzero.entry.async_split tournament --config <cfg> --ckpt-dir <dir> --mode {ladder,round_robin}` (supports repeatable `--ckpt-dir`, cross-config `label=ckpt@cfg` specs, `--resume`, and `--write-tb`).
 - **Rebuilding C++ / Cython MCTS (`ctree`) extensions:**
   Whenever you edit any `.cpp`, `.h`, or `.pyx` file under `lzero/mcts/ctree/`, you **must** recompile before running tests or training:
   ```bash
@@ -18,7 +21,7 @@
 
 ## 2. Regression Test Suite
 
-Run the full Galcon + SampledEfficientZero regression suite (78 tests, ~7s) after changes:
+Run the full Galcon + SampledEfficientZero + Elo ladder regression suite after changes:
 ```bash
 /home/evan/miniconda3/envs/lightzero/bin/pytest \
   zoo/board_games/galcon/envs/ \
@@ -29,7 +32,9 @@ Run the full Galcon + SampledEfficientZero regression suite (78 tests, ~7s) afte
   lzero/mcts/tests/test_sez_mcts_search.py \
   lzero/mcts/tests/test_game_segment_pad_over.py \
   lzero/policy/tests/test_sampled_efficientzero_policy_learn_step.py \
-  lzero/policy/tests/test_galcon_sez_integration.py -q
+  lzero/policy/tests/test_galcon_sez_integration.py \
+  lzero/worker/tests/test_elo_rating.py \
+  lzero/entry/tests/test_async_split_elo_ladder.py -q
 ```
 
 ## 3. Git & Review Workflow

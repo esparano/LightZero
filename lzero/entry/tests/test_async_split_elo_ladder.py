@@ -1,0 +1,512 @@
+# -*- coding: utf-8 -*-
+"""CPU-only unit and end-to-end tests for paired head-to-head matches, live
+AsyncEloEvaluator / AsyncEvaluator elo_ladder & both modes, and offline
+checkpoint tournaments on tiny Galcon.
+"""
+
+import copy
+import os
+from pathlib import Path
+from typing import List, Tuple
+
+import pytest
+import torch
+from ding.config import compile_config
+from ding.envs import BaseEnvTimestep, get_vec_env_setting
+from ding.policy import create_policy
+
+from lzero.entry.async_split import (
+    AsyncEloEvaluator,
+    AsyncEvaluator,
+    OfflineTournament,
+    discover_checkpoints_in_dir,
+    parse_checkpoint_spec,
+)
+from lzero.entry.async_split.cli import build_parser
+from lzero.entry.async_split.io_utils import (
+    AsyncSplitDirs,
+    atomic_torch_save,
+    cpu_state_dict,
+    detect_existing_run_artifacts,
+    publish_weights,
+)
+from lzero.entry.tests.test_async_split_e2e import _make_tiny_galcon_async_cfg
+from lzero.worker.head_to_head import (
+    EnvBotMatchPlayer,
+    HeadToHeadRunner,
+    PolicyMatchPlayer,
+    _extract_winner_player,
+)
+
+
+def _read_tb_tags(log_dir: Path) -> List[str]:
+    from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
+
+    tags = set()
+    for ef in sorted(log_dir.glob('events.out.tfevents.*')):
+        for event in EventFileLoader(str(ef)).Load():
+            if not event.HasField('summary'):
+                continue
+            for val in event.summary.value:
+                tags.add(val.tag)
+    return sorted(tags)
+
+
+def _save_dummy_ckpt(policy, path: Path, train_iter: int, perturb: float = 0.0) -> Path:
+    sd = cpu_state_dict(policy._model.state_dict())
+    if perturb != 0.0:
+        for k, v in sd.items():
+            if torch.is_tensor(v) and v.is_floating_point():
+                sd[k] = v + perturb
+    return atomic_torch_save(
+        {'model': sd, 'train_iter': int(train_iter), 'envstep': int(train_iter * 10), 'last_iter': int(train_iter)},
+        path,
+    )
+
+
+@pytest.mark.unittest
+def test_head_to_head_paired_map_seeds_and_bots():
+    main_cfg, create_cfg = _make_tiny_galcon_async_cfg()
+    main_cfg.env.map_seed = None  # Random maps so pair seed matching is genuinely tested
+    main_cfg.env.max_episode_steps = 12
+    compiled = compile_config(
+        copy.deepcopy(main_cfg), seed=0, env=None, auto=True, create_cfg=copy.deepcopy(create_cfg), save_cfg=False
+    )
+    env_fn, collector_env_cfg, _ = get_vec_env_setting(compiled.env)
+    runner = HeadToHeadRunner(env_fn=env_fn, env_cfg=collector_env_cfg[0], env_num=2)
+    try:
+        bot_rand = EnvBotMatchPlayer('random')
+        bot_pass = EnvBotMatchPlayer('pass')
+        summary = runner.play_match(bot_rand, bot_pass, num_games=6, seed=42)
+        assert summary.total_games == 6
+        assert len(summary.map_seeds) == 6
+        # Duplicate-bridge invariant: first 3 games (A=P1) and next 3 games (A=P2) use identical map seeds
+        assert sorted(summary.map_seeds[:3]) == sorted(summary.map_seeds[3:])
+        assert len(set(summary.map_seeds[:3])) >= 2
+        assert summary.total_steps > 0
+        # Active expansion (random) beats pure pass on Galcon
+        assert summary.win_rate_a >= 0.5
+    finally:
+        runner.close()
+
+
+@pytest.mark.unittest
+def test_head_to_head_policy_vs_bot_and_policy_vs_policy():
+    main_cfg, create_cfg = _make_tiny_galcon_async_cfg()
+    main_cfg.policy.device = 'cpu'
+    compiled = compile_config(
+        copy.deepcopy(main_cfg), seed=0, env=None, auto=True, create_cfg=copy.deepcopy(create_cfg), save_cfg=False
+    )
+    env_fn, collector_env_cfg, _ = get_vec_env_setting(compiled.env)
+    policy_a = create_policy(copy.deepcopy(compiled.policy), model=None, enable_field=['learn', 'eval'])
+    policy_b = create_policy(copy.deepcopy(compiled.policy), model=None, enable_field=['learn', 'eval'])
+
+    runner = HeadToHeadRunner(env_fn=env_fn, env_cfg=collector_env_cfg[0], env_num=2)
+    try:
+        pa = PolicyMatchPlayer('iter_0', policy_a, compiled.policy)
+        pb = PolicyMatchPlayer('iter_10', policy_b, compiled.policy)
+        bot = EnvBotMatchPlayer('random')
+
+        s_bot = runner.play_match(pa, bot, num_games=4, seed=7)
+        assert s_bot.total_games == 4
+        assert s_bot.wins_a + s_bot.draws + s_bot.losses_a == 4
+
+        s_pvp = runner.play_match(pa, pb, num_games=4, seed=11)
+        assert s_pvp.total_games == 4
+        assert s_pvp.wins_a + s_pvp.draws + s_pvp.losses_a == 4
+    finally:
+        runner.close()
+
+
+@pytest.mark.unittest
+def test_async_elo_evaluator_live_promotion_resume_and_tb(tmp_path):
+    run_dir = tmp_path / 'elo_live_run'
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    dirs = AsyncSplitDirs.from_root(run_dir)
+    dirs.ensure_exists()
+
+    elo_eval = AsyncEloEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=123,
+        device='cpu',
+        evaluator_env_num=2,
+        games_per_opponent=2,
+        opponents_per_eval=3,
+        max_ladder_size=4,
+        min_iter_gap=0,
+    )
+    try:
+        # 1. Publish iter_0 weights and evaluate -> promotes seed rung & saves elo_ckpt_best.pth.tar
+        publish_weights(
+            dirs.latest_weights_path,
+            elo_eval.candidate_policy._model.state_dict(),
+            train_iter=0,
+            envstep=0,
+        )
+        res0 = elo_eval.eval_once_if_updated()
+        assert res0 is not None
+        assert res0['candidate_id'] == 'iter_0'
+        assert res0['promoted'] is True
+        assert res0['is_new_best'] is True
+        assert (dirs.elo_rungs_dir / 'iter_0.pth.tar').is_file()
+        assert (dirs.ckpt_dir / 'elo_ckpt_best.pth.tar').is_file()
+        assert dirs.elo_state_path.is_file()
+        assert any('elo_ladder/state.json' in item for item in detect_existing_run_artifacts(dirs))
+
+        # 2. Publish iter_2 weights -> evaluates against both bot:random and iter_0
+        st = dirs.latest_weights_path.stat()
+        publish_weights(
+            dirs.latest_weights_path,
+            elo_eval.candidate_policy._model.state_dict(),
+            train_iter=2,
+            envstep=40,
+        )
+        os.utime(dirs.latest_weights_path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000))
+        res2 = elo_eval.eval_once_if_updated()
+        assert res2 is not None
+        assert res2['train_iter'] == 2
+        opps_played = {m['opponent_id'] for m in res2['matches']}
+        assert {'bot:random', 'iter_0'}.issubset(opps_played)
+
+        saved_best_elo = elo_eval.ladder.best_elo
+        saved_match_count = len(elo_eval.ladder.matches)
+    finally:
+        elo_eval.close()
+
+    # Verify TensorBoard logged Elo tags
+    tb_tags = _read_tb_tags(dirs.log_dir / 'elo_evaluator')
+    assert 'elo_iter/rating' in tb_tags
+    assert 'elo_iter/rating_std' in tb_tags
+    assert 'elo_iter/best_rating' in tb_tags
+    assert 'elo_step/rating' in tb_tags
+
+    # 3. Resume in a fresh AsyncEloEvaluator instance
+    elo_eval_resumed = AsyncEloEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=123,
+        device='cpu',
+        evaluator_env_num=2,
+        games_per_opponent=2,
+        opponents_per_eval=3,
+        max_ladder_size=4,
+        min_iter_gap=0,
+        resume=True,
+    )
+    try:
+        assert elo_eval_resumed._last_eval_iter == 2
+        assert elo_eval_resumed._num_evals == 2
+        assert len(elo_eval_resumed.ladder.matches) == saved_match_count
+        assert elo_eval_resumed.ladder.best_elo == pytest.approx(saved_best_elo, abs=1e-6)
+        # Same iter_2 weights must NOT be re-evaluated after resume
+        assert elo_eval_resumed.eval_once_if_updated() is None
+
+        # Publish iter_4 -> resumes cleanly
+        st = dirs.latest_weights_path.stat()
+        publish_weights(
+            dirs.latest_weights_path,
+            elo_eval_resumed.candidate_policy._model.state_dict(),
+            train_iter=4,
+            envstep=80,
+        )
+        os.utime(dirs.latest_weights_path, ns=(st.st_atime_ns, st.st_mtime_ns + 4_000_000))
+        res4 = elo_eval_resumed.eval_once_if_updated()
+        assert res4 is not None
+        assert res4['train_iter'] == 4
+        assert elo_eval_resumed._num_evals == 3
+    finally:
+        elo_eval_resumed.close()
+
+
+@pytest.mark.unittest
+def test_async_evaluator_modes_elo_ladder_and_both(tmp_path):
+    cfg_pair = _make_tiny_galcon_async_cfg()
+
+    # Mode 1: elo_ladder
+    run_elo = tmp_path / 'mode_elo_ladder'
+    dirs_elo = AsyncSplitDirs.from_root(run_elo)
+    dirs_elo.ensure_exists()
+    ev_elo = AsyncEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_elo,
+        seed=0,
+        device='cpu',
+        evaluator_env_num=2,
+        eval_mode='elo_ladder',
+        elo_games_per_opponent=2,
+        elo_opponents_per_eval=2,
+    )
+    try:
+        publish_weights(dirs_elo.latest_weights_path, ev_elo.policy._model.state_dict(), train_iter=1, envstep=10)
+        out = ev_elo.eval_once_if_updated()
+        assert out is not None
+        assert 'elo_result' in out
+        assert (dirs_elo.ckpt_dir / 'elo_ckpt_best.pth.tar').is_file()
+        assert not (dirs_elo.ckpt_dir / 'WM_ckpt_best.pth.tar').is_file()
+    finally:
+        ev_elo.close()
+
+    # Mode 2: both (runs bot eval AND elo_ladder eval on the same weight snapshot)
+    run_both = tmp_path / 'mode_both'
+    dirs_both = AsyncSplitDirs.from_root(run_both)
+    dirs_both.ensure_exists()
+    ev_both = AsyncEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_both,
+        seed=0,
+        device='cpu',
+        evaluator_env_num=2,
+        n_evaluator_episode=2,
+        env_manager_type='base',
+        eval_mode='both',
+        elo_games_per_opponent=2,
+        elo_opponents_per_eval=2,
+    )
+    try:
+        publish_weights(dirs_both.latest_weights_path, ev_both.policy._model.state_dict(), train_iter=1, envstep=10)
+        out = ev_both.eval_once_if_updated()
+        assert out is not None
+        assert 'elo_result' in out
+        assert (dirs_both.ckpt_dir / 'WM_ckpt_best.pth.tar').is_file()
+        assert (dirs_both.ckpt_dir / 'elo_ckpt_best.pth.tar').is_file()
+        assert dirs_both.evaluator_state_path.is_file()
+        assert dirs_both.elo_state_path.is_file()
+    finally:
+        ev_both.close()
+
+
+@pytest.mark.unittest
+def test_offline_tournament_discovery_ladder_resume_and_round_robin(tmp_path):
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    cfg_pair[0].policy.device = 'cpu'
+    compiled = compile_config(
+        copy.deepcopy(cfg_pair[0]), seed=0, env=None, auto=True, create_cfg=copy.deepcopy(cfg_pair[1]), save_cfg=False
+    )
+    policy = create_policy(copy.deepcopy(compiled.policy), model=None, enable_field=['learn', 'eval'])
+
+    ckpt_dir = tmp_path / 'run_a' / 'ckpt'
+    ckpt_dir.mkdir(parents=True)
+    for idx, it in enumerate((0, 100, 200, 300)):
+        _save_dummy_ckpt(policy, ckpt_dir / f'iteration_{it}.pth.tar', train_iter=it, perturb=0.01 * idx)
+
+    # Test discovery with every_n and max_checkpoints
+    all_specs = discover_checkpoints_in_dir(ckpt_dir)
+    assert [s.train_iter for s in all_specs] == [0, 100, 200, 300]
+
+    sub_every = discover_checkpoints_in_dir(ckpt_dir, every_n=2)
+    assert [s.train_iter for s in sub_every] == [0, 200, 300]
+
+    sub_max = discover_checkpoints_in_dir(ckpt_dir, max_checkpoints=3)
+    assert len(sub_max) == 3
+    assert sub_max[0].train_iter == 0 and sub_max[-1].train_iter == 300
+
+    # Test parse_checkpoint_spec with label=path@config
+    parsed = parse_checkpoint_spec(f'custom_a={ckpt_dir / "iteration_100.pth.tar"}@{tmp_path / "dummy_cfg.py"}')
+    assert len(parsed) == 1
+    assert parsed[0].player_id == 'custom_a'
+    assert parsed[0].config_path == (tmp_path / 'dummy_cfg.py').resolve()
+
+    # Run ladder/Swiss tournament on 3 checkpoints + bot:random
+    specs_3 = all_specs[:3]
+    out_ladder = tmp_path / 'tourn_ladder'
+    t1 = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=specs_3,
+        output_dir=out_ladder,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=2,
+        seed=5,
+        device='cpu',
+        env_num=2,
+        write_tb=True,
+    )
+    res1 = t1.run()
+    assert res1['matches_played'] >= 3
+    assert (out_ladder / 'tournament_state.json').is_file()
+    assert 'bot:random' in res1['leaderboard_text']
+    tb_tags = _read_tb_tags(out_ladder / 'tb')
+    assert 'tournament_iter/rating' in tb_tags
+
+    # Resume same ladder tournament with same num_rounds=2 -> must be a 0-match no-op!
+    total_before = res1['total_matches']
+    t1_ladder_resume = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=specs_3,
+        output_dir=out_ladder,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='ladder',
+        num_rounds=2,
+        seed=5,
+        device='cpu',
+        env_num=2,
+        resume=True,
+    )
+    res_noop = t1_ladder_resume.run()
+    assert res_noop['matches_played'] == 0
+    assert res_noop['total_matches'] == total_before
+
+    # Resume same tournament switching to mode='round_robin' -> finishes only unplayed pairs
+    t1_resume = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=specs_3,
+        output_dir=out_ladder,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='round_robin',
+        seed=5,
+        device='cpu',
+        env_num=2,
+        resume=True,
+    )
+    res_rr = t1_resume.run()
+    # 4 participants (bot:random + 3 ckpts) => C(4, 2) = 6 total unique pairs
+    assert res_rr['total_matches'] == 6
+    assert res_rr['matches_played'] == 6 - total_before
+
+
+@pytest.mark.unittest
+def test_extract_winner_player_lightzero_self_play_invariants():
+    # Standard LightZero self_play_mode env without info['winner'] (e.g. TicTacToe, Connect4, Chess):
+    # timestep.reward is from acting_player's perspective (+1 if acting_player won),
+    # while info['eval_episode_return'] is from Player 1's perspective (-1 if Player 2 won).
+    ts_p2_wins_on_p2_turn = BaseEnvTimestep(obs={}, reward=1.0, done=True, info={'eval_episode_return': -1.0})
+    assert _extract_winner_player(ts_p2_wins_on_p2_turn, acting_player=2) == 2
+
+    ts_p1_wins_on_p2_turn = BaseEnvTimestep(obs={}, reward=-1.0, done=True, info={'eval_episode_return': 1.0})
+    assert _extract_winner_player(ts_p1_wins_on_p2_turn, acting_player=2) == 1
+
+    ts_draw = BaseEnvTimestep(obs={}, reward=0.0, done=True, info={'eval_episode_return': 0.0})
+    assert _extract_winner_player(ts_draw, acting_player=1) == -1
+
+    # Explicit info['winner'] (Galcon) always takes precedence
+    ts_explicit = BaseEnvTimestep(obs={}, reward=-1.0, done=True, info={'winner': 2, 'eval_episode_return': -1.0})
+    assert _extract_winner_player(ts_explicit, acting_player=1) == 2
+
+
+@pytest.mark.unittest
+def test_parse_checkpoint_spec_edge_cases_and_bot_id_collision(tmp_path):
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    tricky_dir = tmp_path / 'run_lr=1e-4@exp'
+    tricky_dir.mkdir(parents=True)
+    ckpt = tricky_dir / 'WM_ckpt_best.pth.tar'
+    ckpt.write_bytes(b'placeholder')
+
+    # Paths containing '=' and '@' must parse cleanly without misinterpreting as label/config
+    parsed = parse_checkpoint_spec(str(ckpt))
+    assert len(parsed) == 1
+    assert parsed[0].ckpt_path == ckpt.resolve()
+    assert parsed[0].config_path is None
+    assert parsed[0].player_id == 'WM_ckpt_best'
+
+    # Explicit collision with reserved bot ID must fail loudly instead of silently dropping checkpoint
+    bot_collision = parse_checkpoint_spec(f'bot:random={ckpt}')
+    with pytest.raises(ValueError, match='collides with reserved bot player ID'):
+        OfflineTournament(
+            default_input_cfg=cfg_pair,
+            checkpoints=bot_collision,
+            output_dir=tmp_path / 'tourn_collision',
+            anchor_bots=('random',),
+            device='cpu',
+            env_num=1,
+        )
+
+
+@pytest.mark.unittest
+def test_async_evaluator_both_mode_resume_desync_skips_duplicate_elo(tmp_path):
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    run_dir = tmp_path / 'both_desync'
+    dirs = AsyncSplitDirs.from_root(run_dir)
+    dirs.ensure_exists()
+
+    ev1 = AsyncEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=0,
+        device='cpu',
+        evaluator_env_num=2,
+        n_evaluator_episode=2,
+        env_manager_type='base',
+        eval_mode='both',
+        elo_games_per_opponent=2,
+        elo_opponents_per_eval=2,
+    )
+    try:
+        publish_weights(dirs.latest_weights_path, ev1.policy._model.state_dict(), train_iter=5, envstep=50)
+        res1 = ev1.eval_once_if_updated()
+        assert res1 is not None and 'elo_result' in res1
+    finally:
+        ev1.close()
+
+    # Simulate crash right before evaluator_state.json was written (elo_ladder/state.json is at iter 5)
+    dirs.evaluator_state_path.unlink()
+
+    ev2 = AsyncEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=0,
+        device='cpu',
+        evaluator_env_num=2,
+        n_evaluator_episode=2,
+        env_manager_type='base',
+        eval_mode='both',
+        elo_games_per_opponent=2,
+        elo_opponents_per_eval=2,
+        resume=True,
+    )
+    try:
+        res2 = ev2.eval_once_if_updated()
+        assert res2 is not None
+        # Elo evaluator must NOT duplicate iter_5 as iter_5_r2!
+        assert 'elo_result' not in res2
+        assert 'iter_5_r2' not in ev2.elo_evaluator.ladder.players
+        assert ev2.elo_evaluator._num_evals == 1
+    finally:
+        ev2.close()
+
+
+@pytest.mark.unittest
+def test_cli_parses_elo_evaluator_launch_and_tournament_args():
+    parser = build_parser()
+
+    eval_args = parser.parse_args([
+        'evaluator',
+        '--eval-mode', 'elo_ladder',
+        '--elo-games-per-opponent', '12',
+        '--elo-opponents-per-eval', '5',
+        '--elo-max-ladder-size', '12',
+        '--elo-promotion-win-rate', '0.6',
+        '--elo-promotion-margin', '40',
+        '--elo-anchor-bots', 'random,fixed',
+    ])
+    assert eval_args.eval_mode == 'elo_ladder'
+    assert eval_args.elo_games_per_opponent == 12
+    assert eval_args.elo_anchor_bots == 'random,fixed'
+
+    launch_args = parser.parse_args([
+        'launch',
+        '--num-actors', '2',
+        '--eval-mode', 'both',
+        '--elo-games-per-opponent', '8',
+    ])
+    assert launch_args.eval_mode == 'both'
+    assert launch_args.elo_games_per_opponent == 8
+
+    tourn_args = parser.parse_args([
+        'tournament',
+        '--ckpt-dir', 'data_sez/run1/ckpt',
+        '--mode', 'ladder',
+        '--num-rounds', '4',
+        '--games-per-pair', '10',
+        '--anchor-bots', 'random',
+        '--write-tb',
+        '--resume',
+    ])
+    assert tourn_args.command == 'tournament'
+    assert tourn_args.ckpt_dir == ['data_sez/run1/ckpt']
+    assert tourn_args.mode == 'ladder'
+    assert tourn_args.write_tb is True
+    assert tourn_args.resume is True

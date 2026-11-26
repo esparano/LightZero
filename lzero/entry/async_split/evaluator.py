@@ -13,7 +13,7 @@ import signal
 import time
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 from ding.config import compile_config
@@ -26,6 +26,7 @@ from tensorboardX import SummaryWriter
 
 from lzero.worker import MuZeroEvaluator as Evaluator
 
+from .elo_evaluator import AsyncEloEvaluator
 from .io_utils import (
     AsyncSplitDirs,
     WeightWatcher,
@@ -41,7 +42,15 @@ def _ding_exp_name(root_dir: Path) -> str:
 
 
 class AsyncEvaluator:
-    """Standalone evaluator worker polling ``latest_weights.pt``."""
+    """Standalone evaluator worker polling ``latest_weights.pt``.
+
+    Supports three ``eval_mode`` settings:
+    - ``'bot'`` (default): standard ``MuZeroEvaluator`` against ``bot_action_type``.
+    - ``'elo_ladder'``: ``AsyncEloEvaluator`` running paired head-to-head matches
+      against a persistent checkpoint ladder + anchor bot with Bradley-Terry MLE Elo.
+    - ``'both'``: runs both bot evaluation and Elo ladder evaluation on each new
+      weight snapshot.
+    """
 
     def __init__(
         self,
@@ -57,7 +66,19 @@ class AsyncEvaluator:
         min_iter_gap: int = 0,
         poll_interval: float = 1.0,
         resume: bool = False,
+        eval_mode: str = 'bot',
+        elo_games_per_opponent: int = 10,
+        elo_opponents_per_eval: int = 4,
+        elo_max_ladder_size: int = 10,
+        elo_promotion_win_rate: float = 0.55,
+        elo_promotion_margin: float = 50.0,
+        elo_periodic_promote_every: int = 0,
+        elo_anchor_bots: Optional[Sequence[str] | str] = ('random',),
+        elo_prior_draws: float = 0.1,
     ) -> None:
+        if eval_mode not in {'bot', 'elo_ladder', 'both'}:
+            raise ValueError(f"eval_mode must be 'bot', 'elo_ladder', or 'both', got {eval_mode!r}")
+        self.eval_mode = str(eval_mode)
         self.dirs = AsyncSplitDirs.from_root(run_dir)
         self.dirs.ensure_exists()
         self.min_iter_gap = max(0, int(min_iter_gap))
@@ -67,6 +88,41 @@ class AsyncEvaluator:
         self._closed = False
         self._last_eval_iter: Optional[int] = None
         self._num_evals = 0
+        self.elo_evaluator: Optional[AsyncEloEvaluator] = None
+        self.evaluator: Optional[Evaluator] = None
+        self.evaluator_env = None
+        self.tb_logger = None
+        self.policy = None
+
+        if self.eval_mode in {'elo_ladder', 'both'}:
+            self.elo_evaluator = AsyncEloEvaluator(
+                input_cfg=input_cfg,
+                run_dir=run_dir,
+                seed=seed,
+                device=device,
+                evaluator_env_num=evaluator_env_num,
+                games_per_opponent=elo_games_per_opponent,
+                opponents_per_eval=elo_opponents_per_eval,
+                max_ladder_size=elo_max_ladder_size,
+                promotion_win_rate=elo_promotion_win_rate,
+                promotion_elo_margin=elo_promotion_margin,
+                periodic_promote_every=elo_periodic_promote_every,
+                anchor_bots=elo_anchor_bots,
+                prior_draws=elo_prior_draws,
+                num_simulations=num_simulations,
+                min_iter_gap=min_iter_gap,
+                poll_interval=poll_interval,
+                resume=resume,
+            )
+
+        if self.eval_mode == 'elo_ladder':
+            self.cfg = self.elo_evaluator.cfg
+            self.create_cfg = self.elo_evaluator.create_cfg
+            self.policy = self.elo_evaluator.candidate_policy
+            self.weight_watcher = self.elo_evaluator.weight_watcher
+            self._last_eval_iter = self.elo_evaluator._last_eval_iter
+            self._num_evals = self.elo_evaluator._num_evals
+            return
 
         cfg = EasyDict(copy.deepcopy(input_cfg[0]))
         create_cfg = EasyDict(copy.deepcopy(input_cfg[1]))
@@ -182,6 +238,20 @@ class AsyncEvaluator:
 
     def eval_once_if_updated(self, force: bool = False) -> Optional[Dict[str, Any]]:
         """Poll ``latest_weights.pt`` and run evaluation if a new eligible weight version exists."""
+        if self.eval_mode == 'elo_ladder':
+            elo_result = self.elo_evaluator.eval_once_if_updated(force=force)
+            if elo_result is None:
+                return None
+            self._last_eval_iter = self.elo_evaluator._last_eval_iter
+            self._num_evals = self.elo_evaluator._num_evals
+            return {
+                'train_iter': elo_result['train_iter'],
+                'envstep': elo_result['envstep'],
+                'stop_flag': False,
+                'episode_info': {},
+                'elo_result': elo_result,
+            }
+
         meta = self.weight_watcher.poll_and_load(
             self.policy._model, device=self.cfg.policy.device, force=force
         )
@@ -206,18 +276,36 @@ class AsyncEvaluator:
             train_iter=train_iter,
             envstep=envstep,
         )
+        elo_result = None
+        if self.eval_mode == 'both' and self.elo_evaluator is not None:
+            already_evaluated_in_elo = (
+                not force
+                and self.elo_evaluator._last_eval_iter is not None
+                and train_iter <= self.elo_evaluator._last_eval_iter
+            )
+            if not already_evaluated_in_elo:
+                elo_result = self.elo_evaluator.evaluate_loaded_candidate(
+                    train_iter=train_iter,
+                    envstep=envstep,
+                    model_state_dict=self.policy._model.state_dict(),
+                )
         self._last_eval_iter = train_iter
         self._num_evals += 1
         self._save_evaluator_state()
-        return {
+        out: Dict[str, Any] = {
             'train_iter': train_iter,
             'envstep': envstep,
             'stop_flag': bool(stop_flag),
             'episode_info': episode_info,
         }
+        if elo_result is not None:
+            out['elo_result'] = elo_result
+        return out
 
     def request_stop(self, *_args: Any) -> None:
         self._stop_requested = True
+        if self.elo_evaluator is not None:
+            self.elo_evaluator.request_stop()
 
     def run(
         self,
@@ -261,7 +349,13 @@ class AsyncEvaluator:
         if self._closed:
             return
         self._closed = True
-        try:
-            self.evaluator.close()
-        except Exception:
-            pass
+        if self.evaluator is not None:
+            try:
+                self.evaluator.close()
+            except Exception:
+                pass
+        if self.elo_evaluator is not None:
+            try:
+                self.elo_evaluator.close()
+            except Exception:
+                pass
