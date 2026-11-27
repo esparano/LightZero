@@ -3,7 +3,7 @@
 Watches ``weights/latest_weights.pt``, evaluates updated policies using
 LightZero's ``MuZeroEvaluator`` (with ``GalconEnv`` automatically placed in
 ``eval_mode`` via ``get_vec_env_setting``), logs standard TensorBoard metrics,
-and atomically saves ``WM_ckpt_best.pth.tar`` on improvement.
+and atomically saves ``ckpt_best.pth.tar`` on improvement or tie.
 """
 
 import copy

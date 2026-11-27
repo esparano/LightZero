@@ -164,7 +164,7 @@ def test_galcon_async_split_e2e_cpu_smoke(tmp_path):
     2. Actor syncs weights, collects self-play Galcon episodes, and writes atomic segment batch.
     3. Learner ingests segments with 4x Galcon symmetry augmentation, trains, and publishes updated weights.
     4. Actor reloads updated weights (parameters match learner).
-    5. Evaluator polls updated weights, evaluates in eval_mode, and saves WM_ckpt_best.pth.tar.
+    5. Evaluator polls updated weights, evaluates in eval_mode, and saves ckpt_best.pth.tar.
     """
     run_dir = tmp_path / 'galcon_async_e2e'
     cfg_pair = _make_tiny_galcon_async_cfg()
@@ -247,12 +247,12 @@ def test_galcon_async_split_e2e_cpu_smoke(tmp_path):
             assert k1 == k2
             assert torch.allclose(p1.cpu(), p2.cpu())
 
-        # 6. Evaluator detects iter-2 weights, runs 2 eval episodes, and saves WM_ckpt_best.pth.tar
+        # 6. Evaluator detects iter-2 weights, runs 2 eval episodes, and saves ckpt_best.pth.tar
         eval_result = evaluator.eval_once_if_updated()
         assert eval_result is not None
         assert eval_result['train_iter'] == 2
         assert eval_result['envstep'] == learner.total_ingested_envsteps
-        best_ckpt = evaluator.dirs.ckpt_dir / 'WM_ckpt_best.pth.tar'
+        best_ckpt = evaluator.dirs.ckpt_dir / 'ckpt_best.pth.tar'
         assert best_ckpt.is_file()
         saved_payload = torch.load(str(best_ckpt), map_location='cpu', weights_only=False)
         assert 'model' in saved_payload

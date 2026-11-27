@@ -78,6 +78,7 @@ def test_find_latest_checkpoint_numeric_order_and_detect_artifacts(tmp_path):
         'iteration_9000.pth.tar',
         'iteration_99000.pth.tar',
         'iteration_100000.pth.tar',
+        'ckpt_best.pth.tar',
         'WM_ckpt_best.pth.tar',
         '.iteration_999999.pth.tar.tmp.123',
     ):
@@ -87,6 +88,7 @@ def test_find_latest_checkpoint_numeric_order_and_detect_artifacts(tmp_path):
     assert latest is not None
     assert latest.name == 'iteration_100000.pth.tar'
     assert parse_checkpoint_iter(latest) == 100000
+    assert parse_checkpoint_iter(dirs.ckpt_dir / 'ckpt_best.pth.tar') is None
     assert parse_checkpoint_iter(dirs.ckpt_dir / 'WM_ckpt_best.pth.tar') is None
 
     artifacts = detect_existing_run_artifacts(dirs)
@@ -279,9 +281,9 @@ def test_async_split_graceful_restart_recovers_full_state_and_monotonic_tb(tmp_p
         # Earlier iteration_2 checkpoint must remain untouched
         assert (learner2.dirs.ckpt_dir / 'iteration_2.pth.tar').stat().st_mtime_ns == iter2_mtime_before
 
-        # Evaluator evaluates iter 5, but must NOT overwrite WM_ckpt_best if historical max is higher
+        # Evaluator evaluates iter 5, but must NOT overwrite ckpt_best if historical max is higher
         evaluator2.evaluator._max_episode_return = 999.0
-        best_ckpt = evaluator2.dirs.ckpt_dir / 'WM_ckpt_best.pth.tar'
+        best_ckpt = evaluator2.dirs.ckpt_dir / 'ckpt_best.pth.tar'
         best_before = torch.load(str(best_ckpt), map_location='cpu', weights_only=False)
         st = learner2.dirs.latest_weights_path.stat()
         os.utime(learner2.dirs.latest_weights_path, ns=(st.st_atime_ns, st.st_mtime_ns + 3_000_000))

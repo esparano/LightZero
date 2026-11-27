@@ -440,11 +440,6 @@ class MuZeroEvaluator(ISerialEvaluator):
 
             duration = self._timer.value
             episode_return = eval_monitor.get_episode_return()
-            mean_episode_return = np.mean(episode_return)
-            if mean_episode_return >= self._max_episode_return:
-                if save_ckpt_fn:
-                    save_ckpt_fn('WM_ckpt_best.pth.tar')
-                self._max_episode_return = mean_episode_return
             info = {
                 'train_iter': train_iter,
                 'ckpt_name': f'iteration_{train_iter}.pth.tar',
@@ -484,7 +479,7 @@ class MuZeroEvaluator(ISerialEvaluator):
 
             # Check for new best performance and save checkpoint.
             mean_episode_return = np.mean(episode_return)
-            if mean_episode_return > self._max_episode_return:
+            if mean_episode_return >= self._max_episode_return:
                 if save_ckpt_fn:
                     save_ckpt_fn('ckpt_best.pth.tar')
                 self._max_episode_return = mean_episode_return
