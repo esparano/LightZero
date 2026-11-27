@@ -4,7 +4,9 @@ Usage examples:
     python3 -m lzero.entry.async_split learner --config zoo/board_games/galcon/config/galcon_sez_sp_mode_config_SIMPLE.py --run-dir data_sez/galcon_async_run1
     python3 -m lzero.entry.async_split actor --config ... --run-dir data_sez/galcon_async_run1 --actor-id actor_0 --device cpu
     python3 -m lzero.entry.async_split evaluator --config ... --run-dir data_sez/galcon_async_run1 --device cpu --n-episode 20
-    python3 -m lzero.entry.async_split launch --config ... --run-dir data_sez/galcon_async_run1 --num-actors 2
+    python3 -m lzero.entry.async_split evaluator --config ... --run-dir data_sez/galcon_async_run1 --eval-mode elo_ladder --elo-games-per-opponent 10
+    python3 -m lzero.entry.async_split launch --config ... --run-dir data_sez/galcon_async_run1 --num-actors 2 --eval-mode elo_ladder
+    python3 -m lzero.entry.async_split tournament --config ... --ckpt-dir data_sez/galcon_async_run1/ckpt --games-per-pair 10
 """
 
 import argparse
@@ -27,6 +29,12 @@ from .io_utils import (
     load_config_from_py,
 )
 from .learner import AsyncLearner
+from .tournament import (
+    CheckpointSpec,
+    OfflineTournament,
+    discover_checkpoints_in_dir,
+    parse_checkpoint_spec,
+)
 
 DEFAULT_GALCON_CONFIG = 'zoo/board_games/galcon/config/galcon_sez_sp_mode_config_SIMPLE.py'
 _THREAD_ENV_VARS = ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS')
@@ -175,7 +183,134 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument(
         '--resume',
         action='store_true',
-        help='Resume evaluator state (best return and last evaluated iteration) from --run-dir.',
+        help='Resume evaluator state (best return, Elo ladder, and last evaluated iteration) from --run-dir.',
+    )
+    p_eval.add_argument(
+        '--eval-mode',
+        default='bot',
+        choices=['bot', 'elo_ladder', 'both'],
+        help="Evaluation mode: 'bot' (standard bot eval), 'elo_ladder' (Bradley-Terry checkpoint ladder), or 'both'.",
+    )
+    p_eval.add_argument(
+        '--elo-games-per-opponent',
+        type=int,
+        default=10,
+        help='Paired games per ladder opponent in elo_ladder/both mode (even number recommended).',
+    )
+    p_eval.add_argument(
+        '--elo-opponents-per-eval',
+        type=int,
+        default=4,
+        help='Max active ladder rungs played per evaluated checkpoint.',
+    )
+    p_eval.add_argument(
+        '--elo-max-ladder-size',
+        type=int,
+        default=10,
+        help='Max active checkpoint rungs retained in the ladder before pruning crowded middle rungs.',
+    )
+    p_eval.add_argument(
+        '--elo-promotion-win-rate',
+        type=float,
+        default=0.55,
+        help='Head-to-head score threshold vs current champion to promote a checkpoint to the ladder.',
+    )
+    p_eval.add_argument(
+        '--elo-promotion-margin',
+        type=float,
+        default=50.0,
+        help='Fitted Elo gain over current champion that also triggers ladder promotion.',
+    )
+    p_eval.add_argument(
+        '--elo-periodic-promote-every',
+        type=int,
+        default=0,
+        help='Optional periodic promotion fallback every N evals (0 disables; strength-gated only).',
+    )
+    p_eval.add_argument(
+        '--elo-anchor-bots',
+        default='random',
+        help="Comma-separated anchor bots (first is pinned to 0.0 Elo; default 'random').",
+    )
+    p_eval.add_argument(
+        '--elo-prior-draws',
+        type=float,
+        default=0.1,
+        help='Per-pair virtual draw prior for Bradley-Terry MLE (keeps 100%/0% sweeps finite).',
+    )
+
+    # --- tournament ---
+    p_tourn = sub.add_parser(
+        'tournament',
+        help='Run a standalone offline Bradley-Terry Elo tournament over saved checkpoints.',
+    )
+    p_tourn.add_argument('--config', default=DEFAULT_GALCON_CONFIG, help='Default LightZero Python config.')
+    p_tourn.add_argument(
+        '--ckpt-dir',
+        action='append',
+        default=[],
+        help='Checkpoint directory containing iteration_<N>.pth.tar files (repeatable).',
+    )
+    p_tourn.add_argument(
+        '--checkpoints',
+        nargs='*',
+        default=[],
+        help='Explicit checkpoint specs: path, label=path, or label=path@config.py (globs supported).',
+    )
+    p_tourn.add_argument(
+        '--every-n',
+        type=int,
+        default=1,
+        help='When scanning --ckpt-dir, take every Nth checkpoint (always keeps first and last).',
+    )
+    p_tourn.add_argument(
+        '--max-checkpoints',
+        type=int,
+        default=None,
+        help='When scanning --ckpt-dir, cap to at most K evenly spaced checkpoints.',
+    )
+    p_tourn.add_argument(
+        '--anchor-bots',
+        default='random',
+        help="Comma-separated anchor bots (first is pinned to 0.0 Elo; default 'random').",
+    )
+    p_tourn.add_argument(
+        '--mode',
+        default='ladder',
+        choices=['ladder', 'round_robin'],
+        help="Tournament schedule: 'ladder' (chronological chain + Swiss rounds) or 'round_robin'.",
+    )
+    p_tourn.add_argument(
+        '--num-rounds',
+        type=int,
+        default=6,
+        help='Total rounds for ladder/Swiss mode (Round 1 = chronological chain, Rounds 2+ = nearest-Elo Swiss).',
+    )
+    p_tourn.add_argument(
+        '--games-per-pair',
+        type=int,
+        default=10,
+        help='Paired games per head-to-head match (even number recommended).',
+    )
+    p_tourn.add_argument(
+        '--output-dir',
+        default=None,
+        help='Directory to write tournament_state.json (and optional TensorBoard curve).',
+    )
+    p_tourn.add_argument('--seed', type=int, default=0, help='Base random seed.')
+    p_tourn.add_argument('--device', default='cpu', choices=['cpu', 'cuda', 'auto'], help='Inference device.')
+    p_tourn.add_argument('--env-num', type=int, default=None, help='Parallel environments for batched MCTS.')
+    p_tourn.add_argument('--num-simulations', type=int, default=None, help='Override MCTS num_simulations.')
+    p_tourn.add_argument('--prior-draws', type=float, default=0.1, help='Bradley-Terry per-pair virtual draw prior.')
+    p_tourn.add_argument(
+        '--resume',
+        action='store_true',
+        help='Resume an existing tournament in --output-dir without replaying finished pairs.',
+    )
+    p_tourn.add_argument(
+        '--write-tb',
+        action='store_true',
+        help='Write checkpoint Elo vs train_iter curve to <output-dir>/tb.',
     )
 
     # --- launch ---
@@ -213,6 +348,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument('--eval-env-num', type=int, default=None)
     p_launch.add_argument('--eval-n-episode', type=int, default=None)
     p_launch.add_argument('--eval-bot', default=None)
+    p_launch.add_argument('--eval-mode', default='bot', choices=['bot', 'elo_ladder', 'both'])
+    p_launch.add_argument('--elo-games-per-opponent', type=int, default=10)
+    p_launch.add_argument('--elo-opponents-per-eval', type=int, default=4)
+    p_launch.add_argument('--elo-max-ladder-size', type=int, default=10)
+    p_launch.add_argument('--elo-promotion-win-rate', type=float, default=0.55)
+    p_launch.add_argument('--elo-promotion-margin', type=float, default=50.0)
+    p_launch.add_argument('--elo-periodic-promote-every', type=int, default=0)
+    p_launch.add_argument('--elo-anchor-bots', default='random')
+    p_launch.add_argument('--elo-prior-draws', type=float, default=0.1)
     p_launch.add_argument('--eval-min-iter-gap', type=int, default=500)
     p_launch.add_argument('--no-evaluator', action='store_true')
     p_launch.add_argument('--env-manager', default=None, choices=['base', 'subprocess'])
@@ -436,6 +580,18 @@ def _run_launch(args: argparse.Namespace) -> int:
                 eval_cmd += ['--n-episode', str(args.eval_n_episode)]
             if args.eval_bot is not None:
                 eval_cmd += ['--bot-action-type', args.eval_bot]
+            if args.eval_mode != 'bot':
+                eval_cmd += [
+                    '--eval-mode', args.eval_mode,
+                    '--elo-games-per-opponent', str(args.elo_games_per_opponent),
+                    '--elo-opponents-per-eval', str(args.elo_opponents_per_eval),
+                    '--elo-max-ladder-size', str(args.elo_max_ladder_size),
+                    '--elo-promotion-win-rate', str(args.elo_promotion_win_rate),
+                    '--elo-promotion-margin', str(args.elo_promotion_margin),
+                    '--elo-periodic-promote-every', str(args.elo_periodic_promote_every),
+                    '--elo-anchor-bots', str(args.elo_anchor_bots),
+                    '--elo-prior-draws', str(args.elo_prior_draws),
+                ]
             if args.env_manager is not None:
                 eval_cmd += ['--env-manager', args.env_manager]
             _spawn('evaluator', eval_cmd)
@@ -476,7 +632,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _run_launch(args)
 
     main_cfg, create_cfg = load_config_from_py(args.config)
-    run_dir = _resolve_run_dir(args.run_dir, main_cfg)
+    run_dir = _resolve_run_dir(getattr(args, 'run_dir', None), main_cfg)
 
     if args.command == 'actor':
         actor = SelfPlayActor(
@@ -539,8 +695,70 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             min_iter_gap=args.min_iter_gap,
             poll_interval=args.poll_interval,
             resume=args.resume,
+            eval_mode=args.eval_mode,
+            elo_games_per_opponent=args.elo_games_per_opponent,
+            elo_opponents_per_eval=args.elo_opponents_per_eval,
+            elo_max_ladder_size=args.elo_max_ladder_size,
+            elo_promotion_win_rate=args.elo_promotion_win_rate,
+            elo_promotion_margin=args.elo_promotion_margin,
+            elo_periodic_promote_every=args.elo_periodic_promote_every,
+            elo_anchor_bots=args.elo_anchor_bots,
+            elo_prior_draws=args.elo_prior_draws,
         )
         evaluator.run(max_evals=args.max_evals, max_idle_seconds=args.max_idle_seconds)
+        return 0
+
+    if args.command == 'tournament':
+        specs: List[CheckpointSpec] = []
+        multi_dir = len(args.ckpt_dir) > 1
+        for ckpt_dir in args.ckpt_dir:
+            dir_path = Path(ckpt_dir).resolve()
+            prefix = dir_path.parent.name if (multi_dir and dir_path.name == 'ckpt') else (
+                dir_path.name if multi_dir else None
+            )
+            specs.extend(
+                discover_checkpoints_in_dir(
+                    ckpt_dir=dir_path,
+                    prefix=prefix,
+                    every_n=args.every_n,
+                    max_checkpoints=args.max_checkpoints,
+                )
+            )
+        for raw_spec in args.checkpoints:
+            specs.extend(parse_checkpoint_spec(raw_spec))
+
+        out_dir = args.output_dir
+        if not out_dir:
+            if args.ckpt_dir:
+                out_dir = str(Path(args.ckpt_dir[0]).resolve().parent / 'elo_tournament')
+            else:
+                out_dir = str(Path(str(main_cfg.exp_name)) / 'elo_tournament')
+
+        if not specs:
+            if not args.resume or not (Path(out_dir).resolve() / 'tournament_state.json').is_file():
+                parser.error(
+                    'tournament requires at least one checkpoint via --ckpt-dir or --checkpoints '
+                    '(or --resume pointing at an --output-dir with an existing tournament_state.json).'
+                )
+
+        tournament = OfflineTournament(
+            default_input_cfg=(main_cfg, create_cfg),
+            checkpoints=specs,
+            output_dir=out_dir,
+            anchor_bots=args.anchor_bots,
+            games_per_pair=args.games_per_pair,
+            mode=args.mode,
+            num_rounds=args.num_rounds,
+            seed=args.seed,
+            device=args.device,
+            env_num=args.env_num,
+            num_simulations=args.num_simulations,
+            prior_draws=args.prior_draws,
+            resume=args.resume,
+            write_tb=args.write_tb,
+        )
+        result = tournament.run()
+        print(result['leaderboard_text'])
         return 0
 
     parser.error(f'Unknown command: {args.command}')

@@ -35,6 +35,9 @@ class AsyncSplitDirs:
     learner_state_path: Path
     replay_buffer_path: Path
     evaluator_state_path: Path
+    elo_ladder_dir: Path
+    elo_rungs_dir: Path
+    elo_state_path: Path
     segments_dir: Path
     incoming_dir: Path
     processed_dir: Path
@@ -45,6 +48,7 @@ class AsyncSplitDirs:
         root = Path(root_dir).resolve()
         weights_dir = root / 'weights'
         ckpt_dir = root / 'ckpt'
+        elo_ladder_dir = root / 'elo_ladder'
         segments_dir = root / 'segments'
         return cls(
             root_dir=root,
@@ -54,6 +58,9 @@ class AsyncSplitDirs:
             learner_state_path=ckpt_dir / 'learner_state.json',
             replay_buffer_path=ckpt_dir / 'replay_buffer.pkl',
             evaluator_state_path=ckpt_dir / 'evaluator_state.json',
+            elo_ladder_dir=elo_ladder_dir,
+            elo_rungs_dir=elo_ladder_dir / 'rungs',
+            elo_state_path=elo_ladder_dir / 'state.json',
             segments_dir=segments_dir,
             incoming_dir=segments_dir / 'incoming',
             processed_dir=segments_dir / 'processed',
@@ -110,7 +117,7 @@ def atomic_json_save(payload: Dict[str, Any], target_path: os.PathLike | str) ->
     tmp_path = _atomic_tmp_path(target)
     try:
         with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, indent=2, sort_keys=True)
+            json.dump(payload, f, indent=2, sort_keys=True, allow_nan=False)
         os.replace(str(tmp_path), str(target))
     except Exception:
         if tmp_path.exists():
@@ -242,7 +249,9 @@ def detect_existing_run_artifacts(
             preview = ', '.join(ckpt_files[:3])
             suffix = f' (+{len(ckpt_files) - 3} more)' if len(ckpt_files) > 3 else ''
             found.append(f'ckpt/{preview}{suffix}')
-    log_subdirs = ('learner', 'evaluator') if include_evaluator_logs else ('learner',)
+    if include_evaluator_logs and dirs.elo_state_path.is_file():
+        found.append(str(dirs.elo_state_path.relative_to(dirs.root_dir)))
+    log_subdirs = ('learner', 'evaluator', 'elo_evaluator') if include_evaluator_logs else ('learner',)
     for sub in log_subdirs:
         sub_dir = dirs.log_dir / sub
         if sub_dir.is_dir():
@@ -250,6 +259,26 @@ def detect_existing_run_artifacts(
             if tb_events:
                 found.append(f'log/{sub}/ ({len(tb_events)} TensorBoard event file(s))')
     return found
+
+
+def load_model_state_dict(
+    ckpt_path: os.PathLike | str,
+    device: str = 'cpu',
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Load a model ``state_dict`` and optional metadata from a LightZero checkpoint.
+
+    Supports:
+    - Standard LightZero / DI-engine checkpoints (``{'model': state_dict, ...}``)
+    - AsyncSplit weight snapshots (``{'model': state_dict, 'train_iter': ..., ...}``)
+    - Raw PyTorch ``state_dict`` files (mapping parameter names to tensors)
+    """
+    payload = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+    if isinstance(payload, dict) and 'model' in payload and isinstance(payload['model'], dict):
+        meta = {k: v for k, v in payload.items() if k not in {'model', 'optimizer', 'target_model'}}
+        return payload['model'], meta
+    if isinstance(payload, dict) and len(payload) > 0 and all(isinstance(v, torch.Tensor) for v in payload.values()):
+        return payload, {}
+    raise ValueError(f'Unrecognized checkpoint format at {ckpt_path}')
 
 
 def find_non_finite_tensors(state_dict: Dict[str, Any]) -> List[str]:
