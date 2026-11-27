@@ -5,10 +5,14 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from zoo.board_games.galcon.envs.galcon_env import GalconEnv, Planet
 from zoo.board_games.galcon.envs.rule_bot import (
+    CPP_BOT_TYPES,
+    GalconCppBot,
     GalconFixedPolicyBot,
     GalconMCTSBot,
     GalconPassBot,
     GalconRandomBot,
+    HAS_CPP_BOTS,
+    build_galcon_bot,
 )
 
 # Run all tests: 
@@ -176,3 +180,64 @@ class TestGalconRuleBots:
         val_expensive = _eval_after_send(49.0)
         assert val_cheap > val_expensive + 0.05
 
+    @pytest.mark.skipif(not HAS_CPP_BOTS, reason="C++ bots_bridge requires g++ on Linux/WSL")
+    @pytest.mark.parametrize("bot_type", CPP_BOT_TYPES)
+    def test_cpp_bots_return_legal_actions_and_step(self, bot_type: str) -> None:
+        for allow_redir in (False, True):
+            cfg = EasyDict(self.cfg)
+            cfg.map_seed = 42
+            cfg.num_planets = 8
+            cfg.max_episode_steps = 20
+            cfg.enable_fleet_redirection = allow_redir
+            cfg.bot_action_type = bot_type
+            env = GalconEnv(cfg)
+            env.reset()
+
+            for _ in range(10):
+                action = env.bot_action()
+                assert action in env.legal_actions, f"{bot_type} (redir={allow_redir}) returned illegal action {action}"
+                _, _, done, _ = env.step(action)
+                if done:
+                    break
+
+    @pytest.mark.skipif(not HAS_CPP_BOTS, reason="C++ bots_bridge requires g++ on Linux/WSL")
+    def test_cpp_bots_reset_memory_across_episodes_and_work_in_h2h(self) -> None:
+        from lzero.worker.head_to_head import EnvBotMatchPlayer, HeadToHeadRunner
+
+        cfg = EasyDict(self.cfg)
+        cfg.map_seed = 17
+        cfg.num_planets = 8
+        cfg.max_episode_steps = 60
+        env = GalconEnv(cfg)
+        env.reset()
+
+        bot = build_galcon_bot(env, 'sparky')
+        assert isinstance(bot, GalconCppBot)
+        a1 = bot.get_action()
+        assert a1 in env.legal_actions
+        env.step(a1)
+        a2 = bot.get_action()
+        assert a2 in env.legal_actions
+
+        # Resetting env on the same seed must auto-reset BotMemory and yield identical first action.
+        env.reset()
+        a1_repeat = bot.get_action()
+        assert a1_repeat == a1
+
+        # Verify EnvBotMatchPlayer caches stateful C++ bots and completes paired matches cleanly.
+        runner = HeadToHeadRunner(
+            env_fn=GalconEnv,
+            env_cfg=EasyDict(cfg),
+            env_num=2,
+        )
+        try:
+            summary = runner.play_match(
+                EnvBotMatchPlayer('waffle'),
+                EnvBotMatchPlayer('sparkyn'),
+                num_games=2,
+                seed=7,
+            )
+            assert summary.total_games == 2
+            assert summary.wins_a + summary.losses_a + summary.draws == 2
+        finally:
+            runner.close()

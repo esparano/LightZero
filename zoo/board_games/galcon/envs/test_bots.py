@@ -102,3 +102,24 @@ class TestGalconBots:
         while not done:
             _, _, done, info = env2.step(fixed_p1.get_action())
         assert float(info['eval_episode_return']) < 0.0
+
+    def test_cpp_bots_beat_fixed_bot_in_eval_mode(self) -> None:
+        from zoo.board_games.galcon.envs.rule_bot import GalconCppBot, HAS_CPP_BOTS
+
+        if not HAS_CPP_BOTS:
+            pytest.skip("C++ bots_bridge requires g++ on Linux/WSL")
+
+        for bot_type in ('waffle', 'waffleopt', 'sparky', 'sparkyn'):
+            cfg = EasyDict(self.cfg)
+            cfg.battle_mode = 'eval_mode'
+            cfg.bot_action_type = 'fixed'
+            cfg.map_seed = 100
+            cfg.max_episode_steps = 200
+            env = GalconEnv(cfg)
+            env.reset()
+            p1_bot = GalconCppBot(env, bot_type=bot_type)
+            done = False
+            info = {}
+            while not done:
+                _, _, done, info = env.step(p1_bot.get_action())
+            assert float(info['eval_episode_return']) > 0.0, f"{bot_type} failed to beat fixed bot on seed 100"

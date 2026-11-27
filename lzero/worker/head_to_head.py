@@ -180,37 +180,19 @@ class PolicyMatchPlayer(MatchPlayer):
 
 
 def _build_env_bot(env: Any, bot_type: str) -> Optional[Any]:
-    """Instantiate a built-in rule bot bound to ``env`` when supported.
+    """Instantiate a built-in rule or C++ bot bound to ``env`` when supported.
 
-    On Galcon, supports ``'random'``, ``'fixed'``, ``'pass'``, ``'mcts'`` (tournament-tuned
-    64-simulation pure C++ MCTS), and parameterized simulation budgets such as
-    ``'mcts:16'``, ``'mcts:32'``, ``'mcts:64'``, ``'mcts:128'`` (or ``'mcts64'``).
+    On Galcon, supports ``'random'``, ``'fixed'``, ``'pass'``, ``'mcts'`` / ``'mcts:<sims>'``,
+    and the C++ bot ports ``'waffle'``, ``'waffleopt'``, ``'sparky'``, ``'sparkyn'``,
+    ``'greedy'``, ``'expand'``, ``'pressure'``, ``'arcade'``, ``'counter'``.
     """
     bot_key = str(bot_type).strip().lower()
     env_cfg = getattr(env, 'cfg', None)
     env_id = str(env_cfg.get('env_id', '')).lower() if isinstance(env_cfg, dict) else ''
     if env_id == 'galcon' or (hasattr(env, 'pass_action') and hasattr(env, 'planets')):
-        from zoo.board_games.galcon.envs.rule_bot import (
-            GalconFixedPolicyBot,
-            GalconMCTSBot,
-            GalconPassBot,
-            GalconRandomBot,
-        )
+        from zoo.board_games.galcon.envs.rule_bot import build_galcon_bot
 
-        if bot_key == 'random':
-            return GalconRandomBot(env)
-        if bot_key == 'fixed':
-            return GalconFixedPolicyBot(env)
-        if bot_key == 'pass':
-            return GalconPassBot(env)
-        if bot_key == 'mcts':
-            return GalconMCTSBot(env)
-        if bot_key.startswith('mcts:') or (bot_key.startswith('mcts') and bot_key[4:].isdigit()):
-            sims_str = bot_key.split(':', 1)[1] if ':' in bot_key else bot_key[4:]
-            if not sims_str.isdigit() or int(sims_str) < 1:
-                raise ValueError(f'Invalid Galcon MCTS bot_type: {bot_type!r} (expected mcts or mcts:<sims>)')
-            return GalconMCTSBot(env, num_simulations=int(sims_str))
-        raise ValueError(f'Unsupported Galcon bot_type: {bot_type!r}')
+        return build_galcon_bot(env, bot_key)
 
     if bot_key == 'random':
         return None  # Fallback to uniform random over action_mask
@@ -220,16 +202,33 @@ def _build_env_bot(env: Any, bot_type: str) -> Optional[Any]:
 
 
 class EnvBotMatchPlayer(MatchPlayer):
-    """Built-in rule-bot player (e.g. Galcon ``random``, ``fixed``, ``pass``, ``mcts``, ``mcts:128``).
+    """Built-in rule/C++ bot player (e.g. Galcon ``random``, ``mcts:16``, ``waffle``, ``sparky``).
 
-    On Galcon, invokes canonical rule bots directly (independent of
+    On Galcon, invokes canonical bots directly (independent of
     ``prob_random_action_in_bot`` / ``prob_pass_action_in_bot``) so Elo anchors
-    stay consistent across configs.
+    stay consistent across configs. Caches per-env bot instances so stateful C++
+    bots (Waffle, Sparky, etc.) preserve ``BotMemory`` across ticks of an episode.
     """
 
     def __init__(self, bot_type: str, player_id: Optional[str] = None) -> None:
         self.bot_type = str(bot_type).strip().lower()
+        self._env_bots: Dict[int, Tuple[int, Optional[Any]]] = {}
         super().__init__(player_id=player_id or f'bot:{self.bot_type}', frame_stack_num=1)
+
+    def _get_env_bot(self, env_id: int, env: Any) -> Optional[Any]:
+        cached = self._env_bots.get(env_id)
+        if cached is not None and cached[0] == id(env):
+            return cached[1]
+        bot = _build_env_bot(env, self.bot_type)
+        self._env_bots[env_id] = (id(env), bot)
+        return bot
+
+    def reset(self, env_ids: Optional[Sequence[int]] = None) -> None:
+        ids = list(self._env_bots.keys()) if env_ids is None else list(env_ids)
+        for eid in ids:
+            cached = self._env_bots.get(eid)
+            if cached is not None and cached[1] is not None and hasattr(cached[1], 'reset'):
+                cached[1].reset()
 
     def select_actions(
         self,
@@ -243,7 +242,7 @@ class EnvBotMatchPlayer(MatchPlayer):
         actions: Dict[int, int] = {}
         for idx, env_id in enumerate(env_ids):
             env = envs[env_id]
-            bot = _build_env_bot(env, self.bot_type)
+            bot = self._get_env_bot(env_id, env)
             if bot is not None:
                 actions[env_id] = int(bot.get_action())
             elif self.bot_type == 'random':

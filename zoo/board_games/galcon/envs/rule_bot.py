@@ -46,4 +46,37 @@ class GalconFixedPolicyBot:
         return int(self.env.pass_action)
 
 
+from zoo.board_games.galcon.envs.cpp_bots import (  # noqa: E402, F401
+    CPP_BOT_KINDS,
+    CPP_BOT_TYPES,
+    GalconCppBot,
+    HAS_CPP_BOTS,
+)
 from zoo.board_games.galcon.envs.mcts_bot import GalconMCTSBot, GalconMCTSSearch  # noqa: E402, F401
+
+
+def build_galcon_bot(env, bot_type: str):
+    """Instantiate any built-in Galcon bot bound to ``env``.
+
+    Supports:
+    - Rule / search bots: ``'random'``, ``'fixed'``, ``'pass'``, ``'mcts'``, ``'mcts:<sims>'``
+    - Custom C++ bot ports: ``'waffle'``, ``'waffleopt'``, ``'sparky'``, ``'sparkyn'``,
+      ``'greedy'``, ``'expand'``, ``'pressure'``, ``'arcade'``, ``'counter'``
+    """
+    key = str(bot_type).strip().lower()
+    if key == 'random':
+        return GalconRandomBot(env)
+    if key == 'fixed':
+        return GalconFixedPolicyBot(env)
+    if key == 'pass':
+        return GalconPassBot(env)
+    if key == 'mcts':
+        return GalconMCTSBot(env)
+    if key.startswith('mcts:') or (key.startswith('mcts') and key[4:].isdigit()):
+        sims_str = key.split(':', 1)[1] if ':' in key else key[4:]
+        if not sims_str.isdigit() or int(sims_str) < 1:
+            raise ValueError(f'Invalid Galcon MCTS bot_type: {bot_type!r} (expected mcts or mcts:<sims>)')
+        return GalconMCTSBot(env, num_simulations=int(sims_str))
+    if key in CPP_BOT_KINDS:
+        return GalconCppBot(env, bot_type=key)
+    raise ValueError(f'Unsupported Galcon bot_action_type: {bot_type!r}')

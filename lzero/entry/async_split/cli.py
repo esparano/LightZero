@@ -233,8 +233,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_eval.add_argument(
         '--elo-anchor-bots',
-        default='random,mcts:16',
-        help="Comma-separated anchor bots (first is pinned to 0.0 Elo; supports mcts and mcts:<sims>; default 'random,mcts:16').",
+        default='random,expand,sparky,waffleopt',
+        help=(
+            "Comma-separated anchor bots (first is pinned to 0.0 Elo; supports mcts/mcts:<sims> "
+            "and C++ bots waffle, waffleopt, sparky, sparkyn, greedy, expand, pressure, arcade, counter; "
+            "default 'random,expand,sparky,waffleopt')."
+        ),
     )
     p_eval.add_argument(
         '--elo-prior-draws',
@@ -275,8 +279,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_tourn.add_argument(
         '--anchor-bots',
-        default='random,mcts:16',
-        help="Comma-separated anchor bots (first is pinned to 0.0 Elo; supports mcts and mcts:<sims>; default 'random,mcts:16').",
+        default='random,expand,sparky,waffleopt',
+        help=(
+            "Comma-separated anchor bots (first is pinned to 0.0 Elo; supports mcts/mcts:<sims> "
+            "and C++ bots waffle, waffleopt, sparky, sparkyn, greedy, expand, pressure, arcade, counter; "
+            "default 'random,expand,sparky,waffleopt')."
+        ),
     )
     p_tourn.add_argument(
         '--mode',
@@ -359,7 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument('--elo-promotion-win-rate', type=float, default=0.55)
     p_launch.add_argument('--elo-promotion-margin', type=float, default=50.0)
     p_launch.add_argument('--elo-periodic-promote-every', type=int, default=0)
-    p_launch.add_argument('--elo-anchor-bots', default='random,mcts:16')
+    p_launch.add_argument('--elo-anchor-bots', default='random,expand,sparky,waffleopt')
     p_launch.add_argument('--elo-prior-draws', type=float, default=0.1)
     p_launch.add_argument('--eval-min-iter-gap', type=int, default=500)
     p_launch.add_argument('--no-evaluator', action='store_true')
