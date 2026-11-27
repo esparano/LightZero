@@ -576,7 +576,7 @@ class SampledEfficientZeroMCTSCtree(object):
                         network_output.latent_state,
                         network_output.policy_logits,
                         self.value_inverse_scalar_transform_handle(network_output.value),
-                        self.value_inverse_scalar_transform_handle(network_output.value_prefix),
+                        self.reward_inverse_scalar_transform_handle(network_output.value_prefix),
                     ]
                 )
                 network_output.reward_hidden_state = (

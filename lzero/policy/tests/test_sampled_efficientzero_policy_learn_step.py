@@ -267,25 +267,34 @@ class TestSampledEfficientZeroPolicyLearn:
         buffer.push_game_segments(([seg1, seg2], [meta1, meta2]))
         train_data = buffer.sample(batch_size=2, policy=policy_on)
 
-        # Spy on value_inverse_scalar_transform_handle to collect exact per-step tensors
-        recorded = []
-        orig_handle = policy_on.value_inverse_scalar_transform_handle
+        # Spy on value/reward inverse scalar transform handles to collect exact per-step tensors
+        recorded_vals = []
+        recorded_vprefixes = []
+        orig_value_handle = policy_on.value_inverse_scalar_transform_handle
+        orig_reward_handle = policy_on.reward_inverse_scalar_transform_handle
 
-        def _spy_handle(tensor):
-            out = orig_handle(tensor)
-            recorded.append(out.detach().clone())
+        def _spy_value_handle(tensor):
+            out = orig_value_handle(tensor)
+            recorded_vals.append(out.detach().clone())
             return out
 
-        policy_on.value_inverse_scalar_transform_handle = _spy_handle
+        def _spy_reward_handle(tensor):
+            out = orig_reward_handle(tensor)
+            recorded_vprefixes.append(out.detach().clone())
+            return out
+
+        policy_on.value_inverse_scalar_transform_handle = _spy_value_handle
+        policy_on.reward_inverse_scalar_transform_handle = _spy_reward_handle
 
         out_on = policy_on._forward_learn(train_data)
         out_off = policy_off._forward_learn(train_data)
 
-        # Calls order: root value, then for each unroll step (value_prefix, value)
+        # Calls: root value + U unroll values via value handle; U unroll value_prefixes via reward handle
         U = cfg_on.num_unroll_steps
-        assert len(recorded) == 1 + 2 * U
-        expected_vals = torch.cat([recorded[0]] + [recorded[2 + 2 * k] for k in range(U)], dim=0)
-        expected_vprefixes = torch.cat([recorded[1 + 2 * k] for k in range(U)], dim=0)
+        assert len(recorded_vals) == 1 + U
+        assert len(recorded_vprefixes) == U
+        expected_vals = torch.cat(recorded_vals, dim=0)
+        expected_vprefixes = torch.cat(recorded_vprefixes, dim=0)
 
         assert np.isclose(out_on['predicted_values'], expected_vals.mean().item(), atol=1e-6)
         assert np.isclose(out_on['predicted_value_prefixs'], expected_vprefixes.mean().item(), atol=1e-6)

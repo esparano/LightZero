@@ -585,7 +585,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
 
             if self._cfg.monitor_extra_statistics:
                 with torch.no_grad():
-                    predicted_value_prefixs_sum = predicted_value_prefixs_sum + self.value_inverse_scalar_transform_handle(
+                    predicted_value_prefixs_sum = predicted_value_prefixs_sum + self.reward_inverse_scalar_transform_handle(
                         value_prefix.detach()
                     ).mean()
                     predicted_values_sum = predicted_values_sum + self.value_inverse_scalar_transform_handle(
