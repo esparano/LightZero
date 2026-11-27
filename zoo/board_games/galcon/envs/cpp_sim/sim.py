@@ -23,8 +23,9 @@ DEFAULT_FLEET_SPEED = 40.0
 DEFAULT_TICK_DT = 0.25
 DEFAULT_MAX_TICKS = 240  # 60 seconds at 4 ticks/sec
 SHIP_RADIUS = 6.0
-PLANET_SETTLE_DELTA = 0.5
-MIN_PLANET_GAP = 2.0 * SHIP_RADIUS + PLANET_SETTLE_DELTA  # 12.5
+PLANET_SETTLE_PADDING = 8.0 + math.sqrt(0.5)  # Real G2 planets_settle per-planet padding (~8.707)
+PLANET_SETTLE_DELTA = 2.0 * PLANET_SETTLE_PADDING - 2.0 * SHIP_RADIUS  # 4 + sqrt(2) ~= 5.4142
+MIN_PLANET_GAP = 2.0 * SHIP_RADIUS + PLANET_SETTLE_DELTA  # 16 + sqrt(2) ~= 17.4142
 DEFAULT_MAP_WIDTH = 480.0
 DEFAULT_MAP_HEIGHT = 320.0
 DEFAULT_NUM_PLAYERS = 2
@@ -192,7 +193,7 @@ def planet_radius_from_production(production: float) -> float:
 
 def _axis_bounds(radius: float, span: float) -> Tuple[float, float]:
     """Legal symmetric ``[lo, hi]`` planet-center bounds along one map axis."""
-    margin = float(radius) + SHIP_RADIUS
+    margin = float(radius) + PLANET_SETTLE_PADDING
     if span - 2.0 * margin >= 0.0:
         return margin, span - margin
     fallback = float(radius) + 2.0

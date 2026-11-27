@@ -206,8 +206,10 @@ class GalconEnv(BaseEnv):
     # TODO: For now, fleet radius is just a constant.
     DUMMY_FLEET_RADIUS = 10.0
     SHIP_RADIUS = 6.0
-    # Leave an extra bit of space between planets (beyond 2 * SHIP_RADIUS) so that ships can always fit through
-    PLANETS_SETTLE_DELTA = 0.5
+    # Real Galcon 2 planets_settle padding per planet: 8 + sqrt(0.5) (~8.707 px),
+    # giving a minimum surface-to-surface gap of 2 * (8 + sqrt(0.5)) = 16 + sqrt(2) (~17.414 px).
+    PLANETS_SETTLE_PADDING = 8.0 + math.sqrt(0.5)
+    PLANETS_SETTLE_DELTA = 2.0 * PLANETS_SETTLE_PADDING - 2.0 * SHIP_RADIUS  # 4 + sqrt(2) ~= 5.4142
     # Number of attempts to settle planets (usually finishes in 1 or 2 attempts, and it will break early if successful)
     MAX_SETTLE_ATTEMPTS = 100
 
@@ -577,6 +579,17 @@ class GalconEnv(BaseEnv):
             map_seed = self._resolve_map_seed()
         rng = np.random.RandomState(map_seed)
 
+        # Clamp all planets within map boundaries before checking overlaps (matches G2 planets_settle)
+        for i in range(0, len(self.planets), 2):
+            p_i = self.planets[i]
+            margin_x = p_i.radius + self.PLANETS_SETTLE_PADDING
+            margin_y = p_i.radius + self.PLANETS_SETTLE_PADDING
+            p_i.x = max(-self.grid_max_x + margin_x, min(self.grid_max_x - margin_x, p_i.x))
+            p_i.y = max(-self.grid_max_y + margin_y, min(self.grid_max_y - margin_y, p_i.y))
+            p_odd = self.planets[i + 1]
+            p_odd.x = -p_i.x
+            p_odd.y = -p_i.y
+
         # Run relaxation simulation to settle the positions of neutral planets
         for attempt_num in range(self.MAX_SETTLE_ATTEMPTS):
             moved = False
@@ -621,9 +634,9 @@ class GalconEnv(BaseEnv):
                 p_i.x += dx
                 p_i.y += dy
 
-                # Keep within map boundaries
-                margin_x = p_i.radius + self.SHIP_RADIUS
-                margin_y = p_i.radius + self.SHIP_RADIUS
+                # Keep within map boundaries (matching G2 planets_settle edge padding)
+                margin_x = p_i.radius + self.PLANETS_SETTLE_PADDING
+                margin_y = p_i.radius + self.PLANETS_SETTLE_PADDING
                 p_i.x = max(-self.grid_max_x + margin_x, min(self.grid_max_x - margin_x, p_i.x))
                 p_i.y = max(-self.grid_max_y + margin_y, min(self.grid_max_y - margin_y, p_i.y))
 

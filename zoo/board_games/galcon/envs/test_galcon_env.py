@@ -1395,3 +1395,37 @@ class TestGalconEnv:
             assert r_cpp.fleets[fid_c].units[0] == r_py.fleets[fid].units[0]
             assert r_cpp.fleets[fid_c].unit_headings[0] == r_py.fleets[fid].unit_headings[0]
 
+    def test_settle_planets_uses_g2_padding_gap(self) -> None:
+        """Both GalconEnv and GalconSim map generators settle planets with G2's
+        2 * (8 + sqrt(0.5)) = 16 + sqrt(2) (~17.414 px) minimum surface-to-surface gap.
+        """
+        import math
+        from zoo.board_games.galcon.envs.cpp_sim.sim import MIN_PLANET_GAP, generate_galcon_map
+
+        expected_gap = 2.0 * (8.0 + math.sqrt(0.5))
+        assert MIN_PLANET_GAP == pytest.approx(expected_gap, abs=1e-9)
+        assert 2.0 * GalconEnv.SHIP_RADIUS + GalconEnv.PLANETS_SETTLE_DELTA == pytest.approx(expected_gap, abs=1e-9)
+
+        cfg = EasyDict(GalconEnv.default_config())
+        cfg.update(dict(num_planets=8, grid_max_x=200.0, grid_max_y=125.0, grid_square_size=25.0))
+        env = GalconEnv(cfg)
+        for seed in range(20):
+            env.map_seed = seed
+            env.reset()
+            for i in range(len(env.planets)):
+                p_i = env.planets[i]
+                assert abs(p_i.x) <= env.grid_max_x - (p_i.radius + GalconEnv.PLANETS_SETTLE_PADDING) + 1e-6
+                assert abs(p_i.y) <= env.grid_max_y - (p_i.radius + GalconEnv.PLANETS_SETTLE_PADDING) + 1e-6
+                for j in range(i + 1, len(env.planets)):
+                    p_j = env.planets[j]
+                    dist = math.hypot(p_i.x - p_j.x, p_i.y - p_j.y)
+                    assert dist >= p_i.radius + p_j.radius + expected_gap - 1e-4
+
+        for seed in range(10):
+            planets = generate_galcon_map(seed=seed, num_planets=16, width=480.0, height=320.0)
+            for i in range(len(planets)):
+                for j in range(i + 1, len(planets)):
+                    p_i, p_j = planets[i], planets[j]
+                    dist = math.hypot(p_i.x - p_j.x, p_i.y - p_j.y)
+                    assert dist >= p_i.radius + p_j.radius + expected_gap - 1e-4
+
