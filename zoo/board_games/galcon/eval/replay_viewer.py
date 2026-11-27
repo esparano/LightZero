@@ -47,16 +47,10 @@ BUNDLED_ASSETS_DIR = Path(__file__).with_name("assets")
 
 BUNDLED_SHIP_SKINS: Tuple[Tuple[str, str, str], ...] = (
     ("classic", "Classic Hollow", "ship-classic.png"),
-    ("solid", "Solid Dart", "ship-solid.png"),
-    ("chevron", "Chevron", "ship-chevron.png"),
-    ("triforce", "Triforce", "ship-triforce.png"),
 )
 
 G2_SHIP_SKINS: Tuple[Tuple[str, str, str], ...] = (
     ("classic", "G2 Classic (ship-0)", "ship-0.png"),
-    ("solid", "G2 Solid (ship-1)", "ship-1.png"),
-    ("chevron", "G2 Chevron (ship-7)", "ship-7.png"),
-    ("triforce", "G2 Triforce (ship-4)", "ship-4.png"),
 )
 
 DEFAULT_G2_DATA_DIRS: Tuple[Path, ...] = (

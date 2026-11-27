@@ -44,7 +44,7 @@
         </p>
       </div>
 
-      <!-- Mode Switch + Skin Picker -->
+      <!-- Mode Switch -->
       <div class="flex flex-wrap items-center gap-2 text-xs">
         <div class="inline-flex rounded-lg border border-[var(--border,#334155)] bg-[var(--card,#111827)] p-0.5">
           <button id="modeFull" class="px-2.5 py-1 rounded-md font-medium transition seg-active">
@@ -54,16 +54,6 @@
             Before (4 Hz) vs After (20 Hz)
           </button>
         </div>
-
-        <label class="flex items-center gap-1.5 text-[var(--muted-foreground,#94a3b8)]">
-          <span>Ship Skin</span>
-          <select id="skinSelect" class="px-2 py-1 rounded-lg bg-[var(--card,#111827)] text-[var(--foreground,#e2e8f0)] border border-[var(--border,#334155)] text-xs font-mono">
-            <option value="classic" selected>Classic Hollow</option>
-            <option value="solid">Solid Dart</option>
-            <option value="chevron">Chevron</option>
-            <option value="triforce">Triforce</option>
-          </select>
-        </label>
       </div>
     </div>
 
@@ -290,7 +280,6 @@
     const elBtnNext = document.getElementById('btnNext');
     const elBtnRestart = document.getElementById('btnRestart');
     const elSpeed = document.getElementById('speedSelect');
-    const elSkin = document.getElementById('skinSelect');
     const elChkSmooth = document.getElementById('chkSmooth');
     const elChkArcs = document.getElementById('chkArcs');
     const elChkExplosions = document.getElementById('chkExplosions');
@@ -342,7 +331,6 @@
 
     elModeFull.onclick = () => setViewMode('full');
     elModeCompare.onclick = () => setViewMode('compare');
-    elSkin.onchange = () => { currentSkin = elSkin.value; renderAll(); };
 
     function buildTabs() {
       elTabs.innerHTML = '';

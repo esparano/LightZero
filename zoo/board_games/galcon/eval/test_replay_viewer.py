@@ -123,15 +123,14 @@ def test_immediate_planet_drop_and_hostile_vs_friendly_hits():
 
 
 def test_bundled_original_sprites_load_by_default():
-    """Repo-bundled original ship and spark PNG sprites exist and encode into RGBA data URIs."""
-    for fname in ("ship-classic.png", "ship-solid.png", "ship-chevron.png", "ship-triforce.png", "spark.png", "spark-glow.png"):
+    """Repo-bundled original ship-classic and spark PNG sprites exist and encode into RGBA data URIs."""
+    for fname in ("ship-classic.png", "spark.png", "spark-glow.png"):
         assert (BUNDLED_ASSETS_DIR / fname).is_file(), f"Missing bundled asset {fname}"
 
     sprites = load_g2_sprites()
-    assert set(sprites["ships"].keys()) == {"classic", "solid", "chevron", "triforce"}
-    for skin in sprites["ships"].values():
-        assert skin["p1"].startswith("data:image/png;base64,")
-        assert skin["p2"].startswith("data:image/png;base64,")
+    assert set(sprites["ships"].keys()) == {"classic"}
+    assert sprites["ships"]["classic"]["p1"].startswith("data:image/png;base64,")
+    assert sprites["ships"]["classic"]["p2"].startswith("data:image/png;base64,")
     assert sprites["fx"]["spark_hostile"].startswith("data:image/png;base64,")
     assert sprites["fx"]["spark_glow"].startswith("data:image/png;base64,")
 
