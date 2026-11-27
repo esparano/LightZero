@@ -92,7 +92,7 @@ class TestGalconEnv:
                                    env.PRODUCTION_TO_SHIPS_PER_SECOND_DIVISOR * env.tick_seconds)
 
         assert len(env.fleets) == 1
-        assert env.planets[0].ships == source_ships_before * (1 - env.send_ratio) + expected_produced_ships
+        assert np.isclose(env.planets[0].ships, source_ships_before * (1 - env.send_ratio) + expected_produced_ships)
         assert env.fleets[0].owner == GalconEnv.PLAYER_1
         assert env.fleets[0].source == 0
         assert env.fleets[0].target == 1
@@ -408,7 +408,10 @@ class TestGalconEnv:
         env._advance_one_tick()
 
         assert len(env.fleets) == 0
-        assert np.isclose(neutral_planet.ships, 25.0)
+        # Under C++ sub-tick physics (5 substeps), the fleet lands on substep 1 and the newly captured
+        # planet produces gradually across the remaining 4 substeps: 25.0 + (4/5) * (50/50 * 0.25) = 25.20.
+        expected_ships = 25.2 if env.use_cpp_sim else 25.0
+        assert np.isclose(neutral_planet.ships, expected_ships)
         assert neutral_planet.owner == GalconEnv.PLAYER_1
         assert neutral_planet.neutral is False
 
@@ -999,3 +1002,79 @@ class TestGalconEnv:
         assert len(env.fleets) == 1
         assert env.fleets[-1].ships == 2.0
         assert p1.ships == pytest.approx(3.9)
+
+    def test_use_cpp_sim_defaults_to_true_and_gates_legacy_mode(self) -> None:
+        """GalconEnv uses calibrated multi-ship C++ physics by default and cleanly gates legacy mode."""
+        # Default (use_cpp_sim=True): launches multi-unit physical flock (50 ships -> int(sqrt(17*50)) = 29 units)
+        env_cpp = GalconEnv(self.cfg)
+        assert env_cpp.use_cpp_sim is True
+        env_cpp.reset()
+        sx, sy = env_cpp._world_to_grid(env_cpp.planets[0].x, env_cpp.planets[0].y)
+        tx, ty = env_cpp._world_to_grid(env_cpp.planets[1].x, env_cpp.planets[1].y)
+        act = env_cpp.encode_action(sx, sy, tx, ty)
+        env_cpp.step(act)
+        assert len(env_cpp.fleets) == 1
+        fl_cpp = env_cpp.fleets[0]
+        assert fl_cpp.num_units == 29
+        assert fl_cpp.units is not None and len(fl_cpp.units) == 29
+        assert fl_cpp.unit_headings is not None and len(fl_cpp.unit_headings) == 29
+
+        # Explicit opt-out (use_cpp_sim=False): legacy single-point fleet + pre-landing production
+        cfg_legacy = EasyDict(self.cfg)
+        cfg_legacy.use_cpp_sim = False
+        env_legacy = GalconEnv(cfg_legacy)
+        assert env_legacy.use_cpp_sim is False
+        env_legacy.reset()
+        env_legacy.step(act)
+        assert len(env_legacy.fleets) == 1
+        fl_leg = env_legacy.fleets[0]
+        assert fl_leg.units is None
+        assert fl_leg.radius == env_legacy.DUMMY_FLEET_RADIUS
+
+        # Verify legacy neutral capture still gives exact 25.0 (no post-capture sub-tick production)
+        neutral_p = env_legacy.planets[2]
+        neutral_p.owner = GalconEnv.PLAYER_NEUTRAL
+        neutral_p.neutral = True
+        neutral_p.production = 50.0
+        neutral_p.ships = 15.0
+        env_legacy.fleets.clear()
+        env_legacy.fleets.append(Fleet(
+            id=200,
+            owner=GalconEnv.PLAYER_1,
+            ships=40.0,
+            x=neutral_p.x,
+            y=neutral_p.y + neutral_p.radius + 1.0,
+            source=0,
+            target=2,
+            radius=env_legacy.DUMMY_FLEET_RADIUS,
+        ))
+        env_legacy._advance_one_tick()
+        assert np.isclose(neutral_p.ships, 25.0)
+        assert neutral_p.owner == GalconEnv.PLAYER_1
+
+    def test_cpp_sim_render_draws_multi_ship_flocks(self, tmp_path) -> None:
+        """Rendering with active multi-ship C++ flocks produces valid RGB frames and GIF output."""
+        cfg = EasyDict(self.cfg)
+        cfg.update(dict(
+            battle_mode='self_play_mode',
+            use_cpp_sim=True,
+            max_episode_steps=6,
+            render_mode='image_savefile_mode',
+            replay_path=str(tmp_path),
+            replay_format='gif',
+            replay_name_suffix='cpp_flock',
+        ))
+        env = GalconEnv(cfg)
+        env.reset()
+
+        sx, sy = env._world_to_grid(env.planets[0].x, env.planets[0].y)
+        tx, ty = env._world_to_grid(env.planets[1].x, env.planets[1].y)
+        send_act = env.encode_action(sx, sy, tx, ty)
+        ts = env.step(send_act)
+        assert len(env.fleets) == 1 and env.fleets[0].num_units > 1
+        while not ts.done:
+            ts = env.step(env.pass_action)
+
+        gifs = list(tmp_path.glob('*.gif'))
+        assert len(gifs) == 1 and gifs[0].stat().st_size > 0
+

@@ -22,6 +22,16 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning) 
 
 from zoo.board_games.galcon.envs.rule_bot import GalconFixedPolicyBot, GalconRandomBot, GalconPassBot
+from zoo.board_games.galcon.envs.cpp_sim import (
+    BASE_ITEM_USERS,
+    DEFAULT_PHYSICS_SUBSTEPS,
+    GalconSim as _CppSimFallback,
+    HAS_FAST_SIM_CPP,
+    SPAWN_AREA_RADIUS,
+    physical_ship_count,
+    step_physics_cpp,
+)
+from zoo.board_games.galcon.envs.cpp_sim.sim import _spawn_hash_u01
 
 
 @dataclass
@@ -46,6 +56,9 @@ class Fleet:
     source: int
     target: int
     radius: float
+    num_units: int = 1
+    units: Optional[List[List[float]]] = None
+    unit_headings: Optional[List[List[float]]] = None
 
 
 @ENV_REGISTRY.register('galcon')
@@ -134,6 +147,9 @@ class GalconEnv(BaseEnv):
         neutral_max_production = 100,
         fleet_top_k=3,
         enable_fleet_redirection=False,
+        # Use calibrated multi-ship C++17 Galcon 2 physics engine (falls back to bit-exact Python sim if g++ unavailable).
+        use_cpp_sim=True,
+        physics_substeps=DEFAULT_PHYSICS_SUBSTEPS,
         # TODO: settings for home ships, home prod, etc.
         # TODO: Base some of these settings (max_expected_ships, max_expected_production, etc. on these other settings)
         # Used for normalizing ship counts, the largest "blob" of ships we are likely to see (on any planet, grid cell, or fleet)
@@ -197,6 +213,8 @@ class GalconEnv(BaseEnv):
         self.grid_cell_count = self.grid_width * self.grid_height
         self.pair_action_count = self.grid_cell_count * self.grid_cell_count
         self.enable_fleet_redirection = bool(self.cfg.get('enable_fleet_redirection', False))
+        self.use_cpp_sim = bool(self.cfg.get('use_cpp_sim', True))
+        self.physics_substeps = max(1, int(self.cfg.get('physics_substeps', DEFAULT_PHYSICS_SUBSTEPS)))
         self.total_num_actions = (
             2 * self.pair_action_count + 1 if self.enable_fleet_redirection else self.pair_action_count + 1
         )
@@ -592,6 +610,10 @@ class GalconEnv(BaseEnv):
             return
 
         ships_to_send = self._ships_to_send(source.ships)
+        if self.use_cpp_sim:
+            self._spawn_cpp_fleet(source, target, ships_to_send)
+            return
+
         source.ships -= ships_to_send
         source.ships = max(0.0, source.ships)
 
@@ -611,8 +633,109 @@ class GalconEnv(BaseEnv):
         )
         self._next_fleet_id += 1
 
+    def _spawn_cpp_fleet(self, source: Planet, target: Planet, ships_to_send: float) -> None:
+        """Launch a multi-unit physical fleet matching calibrated Galcon 2 spawn geometry."""
+        total_planet_ships = sum(max(0.0, p.ships) for p in self.planets)
+        item_count = (
+            BASE_ITEM_USERS
+            + len(self.planets)
+            + len(self.fleets)
+            + sum(max(1, f.num_units) for f in self.fleets)
+        )
+        parts = physical_ship_count(ships_to_send, total_planet_ships, item_count)
+        if parts <= 0:
+            return
+
+        source.ships = max(0.0, source.ships - ships_to_send)
+
+        dx = target.x - source.x
+        dy = target.y - source.y
+        raw_d = math.hypot(dx, dy)
+        d = raw_d if raw_d > 1e-6 else 1e-6
+        hx0 = (dx / d) if raw_d > 1e-6 else 1.0
+        hy0 = (dy / d) if raw_d > 1e-6 else 0.0
+        spawn_r = source.radius + self.SHIP_RADIUS
+        sx = source.x + hx0 * spawn_r
+        sy = source.y + hy0 * spawn_r
+
+        fid = self._next_fleet_id
+        self._next_fleet_id += 1
+
+        if parts == 1:
+            units = [[sx, sy]]
+            unit_headings = [[hx0, hy0]]
+            cx, cy, fl_radius = sx, sy, self.SHIP_RADIUS
+        else:
+            two_pi = 2.0 * math.pi
+            seed_base = (fid * 1000003) & 0xFFFFFFFF
+            spawn_disc_r = SPAWN_AREA_RADIUS * math.sqrt(float(parts))
+            units = []
+            unit_headings = []
+            sum_x = 0.0
+            sum_y = 0.0
+            tx, ty = target.x, target.y
+            for j in range(parts):
+                u1 = _spawn_hash_u01((seed_base + j * 2 + 1) & 0xFFFFFFFF)
+                u2 = _spawn_hash_u01((seed_base + j * 2 + 2) & 0xFFFFFFFF)
+                r = spawn_disc_r * math.sqrt(u1)
+                ang = two_pi * u2
+                xj = sx + r * math.cos(ang)
+                yj = sy + r * math.sin(ang)
+                units.append([xj, yj])
+                sum_x += xj
+                sum_y += yj
+                hdx = tx - xj
+                hdy = ty - yj
+                hd2 = hdx * hdx + hdy * hdy
+                if hd2 > 1e-12:
+                    hd = math.sqrt(hd2)
+                    unit_headings.append([hdx / hd, hdy / hd])
+                else:
+                    unit_headings.append([hx0, hy0])
+            cx = sum_x / float(parts)
+            cy = sum_y / float(parts)
+            max_d2 = max((u[0] - cx) ** 2 + (u[1] - cy) ** 2 for u in units)
+            fl_radius = math.sqrt(max_d2) + self.SHIP_RADIUS
+
+        self.fleets.append(
+            Fleet(
+                id=fid,
+                owner=source.owner,
+                ships=float(ships_to_send),
+                x=float(cx),
+                y=float(cy),
+                source=source.id,
+                target=target.id,
+                radius=float(fl_radius),
+                num_units=parts,
+                units=units,
+                unit_headings=unit_headings,
+            )
+        )
+
+    def _advance_one_tick_cpp(self) -> None:
+        """Advance multi-ship C++17 (or bit-exact Python fallback) physics in-place on self.planets & self.fleets."""
+        adapter = object.__new__(_CppSimFallback)
+        adapter.planets = {p.id: p for p in self.planets}
+        adapter.fleets = {f.id: f for f in self.fleets}
+        adapter.tick_dt = self.tick_seconds
+        adapter.fleet_speed = self.fleet_speed
+        adapter.physics_substeps = self.physics_substeps
+
+        if HAS_FAST_SIM_CPP:
+            step_physics_cpp(adapter)
+        else:
+            adapter._step_physics_python()
+
+        for p in self.planets:
+            p.neutral = (p.owner == self.PLAYER_NEUTRAL)
+        self.fleets = [f for f in self.fleets if f.id in adapter.fleets]
+
     def _advance_one_tick(self) -> None:
-        # TODO: some day, move fleets and adjust production gradually (produce in between fleets landing)
+        if self.use_cpp_sim:
+            self._advance_one_tick_cpp()
+            return
+        # Legacy point-fleet tick update
         self._produce_ships()
         self._move_fleets()
 
@@ -1283,51 +1406,89 @@ class GalconEnv(BaseEnv):
 
         # ---- draw fleets ----
         for fleet in self.fleets:
-            target_planet = self.planets[fleet.target]
-            dx = target_planet.x - fleet.x
-            dy = target_planet.y - fleet.y
-            dist = math.hypot(dx, dy)
+            f_color = owner_color(fleet.owner)
+            if fleet.units and len(fleet.units) > 1:
+                # Multi-ship C++ flock: draw each physical ship oriented along its live heading
+                headings = fleet.unit_headings
+                has_headings = headings is not None and len(headings) == len(fleet.units)
+                target_planet = self.planets[fleet.target]
+                unit_size = 4.2
+                for idx_u, (ux, uy) in enumerate(fleet.units):
+                    if has_headings:
+                        hx, hy = headings[idx_u]
+                        u_ang = math.atan2(hy, hx)
+                    else:
+                        u_ang = math.atan2(target_planet.y - uy, target_planet.x - ux)
+                    tip = np.array([ux + unit_size * math.cos(u_ang),
+                                    uy + unit_size * math.sin(u_ang)])
+                    left = np.array([ux + unit_size * 0.65 * math.cos(u_ang + math.radians(140)),
+                                     uy + unit_size * 0.65 * math.sin(u_ang + math.radians(140))])
+                    right = np.array([ux + unit_size * 0.65 * math.cos(u_ang - math.radians(140)),
+                                      uy + unit_size * 0.65 * math.sin(u_ang - math.radians(140))])
+                    ax.add_patch(Polygon(
+                        [tip, left, right],
+                        closed=True,
+                        color=f_color,
+                        alpha=0.88,
+                        zorder=5,
+                    ))
 
-            if dist < 1e-6:
-                angle = 0.0
+                ax.text(
+                    fleet.x, fleet.y,
+                    str(int(fleet.ships)),
+                    color=COLOR_TEXT,
+                    fontsize=15,
+                    ha='center', va='center',
+                    fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.15', facecolor=COLOR_BG, alpha=0.55, edgecolor='none'),
+                    zorder=6,
+                )
             else:
-                angle = math.atan2(dy, dx)
+                target_planet = self.planets[fleet.target]
+                if fleet.unit_headings and len(fleet.unit_headings) >= 1:
+                    hx, hy = fleet.unit_headings[0]
+                    angle = math.atan2(hy, hx)
+                else:
+                    dx = target_planet.x - fleet.x
+                    dy = target_planet.y - fleet.y
+                    dist = math.hypot(dx, dy)
+                    angle = 0.0 if dist < 1e-6 else math.atan2(dy, dx)
 
-            # Triangle size proportional to ship count, capped for readability
-            tri_size = max(4.0, min(14.0, 4.0 + fleet.ships / 15.0))
+                # Triangle size proportional to ship count, capped for readability
+                tri_size = max(4.0, min(14.0, 4.0 + fleet.ships / 15.0))
 
-            # Triangle pointing in direction of travel:
-            #   tip at the front, two base corners behind
-            tip = np.array([fleet.x + tri_size * math.cos(angle),
-                            fleet.y + tri_size * math.sin(angle)])
-            left_angle = angle + math.radians(140)
-            right_angle = angle - math.radians(140)
-            left  = np.array([fleet.x + tri_size * 0.65 * math.cos(left_angle),
-                               fleet.y + tri_size * 0.65 * math.sin(left_angle)])
-            right = np.array([fleet.x + tri_size * 0.65 * math.cos(right_angle),
-                               fleet.y + tri_size * 0.65 * math.sin(right_angle)])
+                # Triangle pointing in direction of travel:
+                #   tip at the front, two base corners behind
+                tip = np.array([fleet.x + tri_size * math.cos(angle),
+                                fleet.y + tri_size * math.sin(angle)])
+                left_angle = angle + math.radians(140)
+                right_angle = angle - math.radians(140)
+                left  = np.array([fleet.x + tri_size * 0.65 * math.cos(left_angle),
+                                   fleet.y + tri_size * 0.65 * math.sin(left_angle)])
+                right = np.array([fleet.x + tri_size * 0.65 * math.cos(right_angle),
+                                   fleet.y + tri_size * 0.65 * math.sin(right_angle)])
 
-            triangle = Polygon(
-                [tip, left, right],
-                closed=True,
-                color=owner_color(fleet.owner),
-                alpha=0.9,
-                zorder=5,
-            )
-            ax.add_patch(triangle)
+                triangle = Polygon(
+                    [tip, left, right],
+                    closed=True,
+                    color=f_color,
+                    alpha=0.9,
+                    zorder=5,
+                )
+                ax.add_patch(triangle)
 
-            # Ship count label at the centroid of the triangle
-            centroid_x = (tip[0] + left[0] + right[0]) / 3.0
-            centroid_y = (tip[1] + left[1] + right[1]) / 3.0
-            ax.text(
-                centroid_x, centroid_y,
-                str(int(fleet.ships)),
-                color=COLOR_TEXT,
-                fontsize=20,
-                ha='center', va='center',
-                fontweight='bold',
-                zorder=6,
-            )
+                # Ship count label at the centroid of the triangle
+                centroid_x = (tip[0] + left[0] + right[0]) / 3.0
+                centroid_y = (tip[1] + left[1] + right[1]) / 3.0
+                ax.text(
+                    centroid_x, centroid_y,
+                    str(int(fleet.ships)),
+                    color=COLOR_TEXT,
+                    fontsize=20,
+                    ha='center', va='center',
+                    fontweight='bold',
+                    zorder=6,
+                )
 
         # ---- HUD ----
         p1_ships = int(self._total_ships(self.PLAYER_1))
