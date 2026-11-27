@@ -359,25 +359,36 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                 # so neither legal-action extraction nor target-model inference affects value targets.
                 value_list = [0.0] * transition_batch_size
             elif self._cfg.use_root_value:
-                to_play, action_mask = self._preprocess_to_play_and_action_mask(
-                    game_segment_batch_size, to_play_segment, action_mask_segment, pos_in_game_segment_list
-                )
-                if self._cfg.model.continuous_action_space is True:
-                    # when the action space of the environment is continuous, action_mask[:] is None.
-                    action_mask = [
-                        list(np.ones(self._cfg.model.action_space_size, dtype=np.int8))
-                        for _ in range(transition_batch_size)
-                    ]
-                    # NOTE: in continuous action space env: we set all legal_actions as -1
-                    legal_actions = [
-                        [-1 for _ in range(self._cfg.model.action_space_size)] for _ in range(transition_batch_size)
-                    ]
-                else:
-                    legal_actions = [np.nonzero(action_mask[j])[0].tolist() for j in range(transition_batch_size)]
+                active_count = int(active_indices.size)
+                unroll_stride = self._cfg.num_unroll_steps + 1
+                active_to_play = []
+                active_legal_actions = []
+                for idx in active_indices:
+                    b, k = divmod(int(idx), unroll_stride)
+                    bootstrap_idx = int(pos_in_game_segment_list[b]) + k + int(td_steps_list[idx])
+                    tp_seg = to_play_segment[b]
+                    tp = int(tp_seg[bootstrap_idx]) if bootstrap_idx < len(tp_seg) else -1
+                    active_to_play.append(tp)
+                    if self._cfg.model.continuous_action_space is True:
+                        # NOTE: in continuous action space env: we set all legal_actions as -1
+                        active_legal_actions.append([-1 for _ in range(self._cfg.model.action_space_size)])
+                    else:
+                        am_seg = action_mask_segment[b]
+                        am = (
+                            am_seg[bootstrap_idx]
+                            if bootstrap_idx < len(am_seg)
+                            else np.ones(self._cfg.model.action_space_size, dtype=np.int8)
+                        )
+                        active_legal_actions.append(np.nonzero(am)[0].tolist())
 
-                value_obs_arr = prepare_observation(value_obs_list, self._cfg.model.model_type)
+                active_obs_list = (
+                    value_obs_list
+                    if active_count == transition_batch_size
+                    else [value_obs_list[idx] for idx in active_indices]
+                )
+                value_obs_arr = prepare_observation(active_obs_list, self._cfg.model.model_type)
                 # split a full batch into slices of mini_infer_size: to save the GPU memory for more GPU actors
-                slices = int(np.ceil(transition_batch_size / self._cfg.mini_infer_size))
+                slices = int(np.ceil(active_count / self._cfg.mini_infer_size))
                 network_output = []
                 for i in range(slices):
                     beg_index = self._cfg.mini_infer_size * i
@@ -393,7 +404,11 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                         [m_output.latent_state, m_output.value, m_output.policy_logits] = to_detach_cpu_numpy(
                             [
                                 m_output.latent_state,
-                                inverse_scalar_transform(m_output.value, self.value_support),
+                                inverse_scalar_transform(
+                                    m_output.value,
+                                    self.value_support,
+                                    categorical_distribution=self._cfg.model.categorical_distribution,
+                                ),
                                 m_output.policy_logits
                             ]
                         )
@@ -414,37 +429,49 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                 # generate the noises for the root nodes
                 noises = [
                     np.random.dirichlet([self._cfg.root_dirichlet_alpha] * self._cfg.model.num_of_sampled_actions
-                                        ).astype(np.float32).tolist() for _ in range(transition_batch_size)
-                ]
+                                        ).astype(np.float32).tolist() for _ in range(active_count)
+                ] if self._cfg.reanalyze_noise else None
 
                 if self._cfg.mcts_ctree:
                     # cpp mcts_tree
                     # prepare the root nodes for MCTS
                     roots = MCTSCtree.roots(
-                        transition_batch_size, legal_actions, self._cfg.model.action_space_size,
+                        active_count, active_legal_actions, self._cfg.model.action_space_size,
                         self._cfg.model.num_of_sampled_actions, self._cfg.model.continuous_action_space
                     )
                     if self._cfg.reanalyze_noise:
-                        roots.prepare(self._cfg.root_noise_weight, noises, value_prefix_pool, policy_logits_pool, to_play)
+                        roots.prepare(
+                            self._cfg.root_noise_weight, noises, value_prefix_pool, policy_logits_pool, active_to_play
+                        )
                     else:
-                        roots.prepare_no_noise(value_prefix_pool, policy_logits_pool, to_play)
+                        roots.prepare_no_noise(value_prefix_pool, policy_logits_pool, active_to_play)
                     # do MCTS for a new policy with the recent target model
-                    MCTSCtree(self._cfg).search(roots, model, latent_state_roots, reward_hidden_state_roots, to_play)
+                    MCTSCtree(self._cfg).search(
+                        roots, model, latent_state_roots, reward_hidden_state_roots, active_to_play
+                    )
                 else:
                     # python mcts_tree
                     roots = MCTSPtree.roots(
-                        transition_batch_size, legal_actions, self._cfg.model.action_space_size,
+                        active_count, active_legal_actions, self._cfg.model.action_space_size,
                         self._cfg.model.num_of_sampled_actions, self._cfg.model.continuous_action_space
                     )
                     if self._cfg.reanalyze_noise:
-                        roots.prepare(self._cfg.root_noise_weight, noises, value_prefix_pool, policy_logits_pool, to_play)
+                        roots.prepare(
+                            self._cfg.root_noise_weight, noises, value_prefix_pool, policy_logits_pool, active_to_play
+                        )
                     else:
-                        roots.prepare_no_noise(value_prefix_pool, policy_logits_pool, to_play)
+                        roots.prepare_no_noise(value_prefix_pool, policy_logits_pool, active_to_play)
                     # do MCTS for a new policy with the recent target model
-                    MCTSPtree(self._cfg).search(roots, model, latent_state_roots, reward_hidden_state_roots, to_play)
+                    MCTSPtree(self._cfg).search(
+                        roots, model, latent_state_roots, reward_hidden_state_roots, active_to_play
+                    )
 
-                roots_values = roots.get_values()
-                value_list = np.array(roots_values)
+                active_values = np.asarray(roots.get_values(), dtype=np.float64)
+                if active_count == transition_batch_size:
+                    value_list = active_values
+                else:
+                    value_list = np.zeros(transition_batch_size, dtype=active_values.dtype)
+                    value_list[active_indices] = active_values
             else:
                 # use_root_value=False: legal_actions/to_play are unused and only unmasked bootstrap
                 # observations contribute to value targets.
@@ -463,7 +490,13 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                     m_output = model.initial_inference(m_obs)
                     if not model.training:
                         [m_output.value] = to_detach_cpu_numpy(
-                            [inverse_scalar_transform(m_output.value, self.value_support)]
+                            [
+                                inverse_scalar_transform(
+                                    m_output.value,
+                                    self.value_support,
+                                    categorical_distribution=self._cfg.model.categorical_distribution,
+                                )
+                            ]
                         )
                     network_output.append(m_output)
 
@@ -582,109 +615,151 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         # transition_batch_size = game_segment_batch_size * (self._cfg.num_unroll_steps + 1)
         transition_batch_size = len(policy_obs_list)
         game_segment_batch_size = len(pos_in_game_segment_list)
+        k_sampled = self._cfg.model.num_of_sampled_actions
+        policy_mask_arr = np.asarray(policy_mask, dtype=np.int64)
+        active_indices = np.flatnonzero(policy_mask_arr)
+        active_count = int(active_indices.size)
 
-        to_play, action_mask = self._preprocess_to_play_and_action_mask(
-            game_segment_batch_size, to_play_segment, action_mask_segment, pos_in_game_segment_list
-        )
-        if self._cfg.model.continuous_action_space is True:
-            # when the action space of the environment is continuous, action_mask[:] is None.
-            action_mask = [
-                # Is this correct?
-                list(np.ones(self._cfg.model.action_space_size, dtype=np.int8)) for _ in range(transition_batch_size)
-            ]
-            # NOTE: in continuous action space env, we set all legal_actions as -1
-            legal_actions = [
-                [-1 for _ in range(self._cfg.model.action_space_size)] for _ in range(transition_batch_size)
-            ]
+        if self._cfg.model.continuous_action_space:
+            root_sampled_actions = np.zeros(
+                (transition_batch_size, k_sampled, self._cfg.model.action_space_size), dtype=np.float32
+            )
+        elif self._cfg.mcts_ctree:
+            root_sampled_actions = np.zeros((transition_batch_size, k_sampled, 1), dtype=np.int64)
         else:
-            legal_actions = [np.nonzero(action_mask[j])[0].tolist() for j in range(transition_batch_size)]
+            root_sampled_actions = np.zeros((transition_batch_size, k_sampled), dtype=np.int64)
+
+        roots_distributions = [None] * transition_batch_size
+        roots_values = [0.0] * transition_batch_size
+        roots_child_q_values = [None] * transition_batch_size if use_completed_q else None
+        raw_values_pool = [0.0] * transition_batch_size
+        policy_logits_pool = [None] * transition_batch_size
 
         with torch.no_grad():
-            policy_obs_list = prepare_observation(policy_obs_list, self._cfg.model.model_type)
-            # split a full batch into slices of mini_infer_size: to save the GPU memory for more GPU actors
-            slices = np.ceil(transition_batch_size / self._cfg.mini_infer_size).astype(np.int_)
-            network_output = []
-            for i in range(slices):
-                beg_index = self._cfg.mini_infer_size * i
-                end_index = self._cfg.mini_infer_size * (i + 1)
-                m_obs = torch.from_numpy(policy_obs_list[beg_index:end_index]).to(self._cfg.device).float()
-
-                m_output = model.initial_inference(m_obs)
-
-                if not model.training:
-                    # if not in training, obtain the scalars of the value/reward
-                    [m_output.latent_state, m_output.value, m_output.policy_logits] = to_detach_cpu_numpy(
-                        [
-                            m_output.latent_state,
-                            inverse_scalar_transform(m_output.value, self.value_support),
-                            m_output.policy_logits
-                        ]
-                    )
-                    m_output.reward_hidden_state = (
-                        m_output.reward_hidden_state[0].detach().cpu().numpy(),
-                        m_output.reward_hidden_state[1].detach().cpu().numpy()
-                    )
-
-                network_output.append(m_output)
-
-            raw_values_pool, value_prefix_pool, policy_logits_pool, latent_state_roots, reward_hidden_state_roots = concat_output(
-                network_output, data_type='efficientzero'
-            )
-
-            raw_values_pool = np.asarray(raw_values_pool).reshape(-1).tolist()
-            value_prefix_pool = np.asarray(value_prefix_pool).reshape(-1).tolist()
-            policy_logits_pool = policy_logits_pool.tolist()
-            # noises are not necessary for reanalyze
-            noises = [
-                np.random.dirichlet([self._cfg.root_dirichlet_alpha] * self._cfg.model.num_of_sampled_actions
-                                    ).astype(np.float32).tolist() for _ in range(transition_batch_size)
-            ]
-            if self._cfg.mcts_ctree:
-                # ==============================================================
-                # sampled related core code
-                # ==============================================================
-                # cpp mcts_tree
-                roots = MCTSCtree.roots(
-                    transition_batch_size, legal_actions, self._cfg.model.action_space_size,
-                    self._cfg.model.num_of_sampled_actions, self._cfg.model.continuous_action_space
+            if active_count > 0:
+                to_play, action_mask = self._preprocess_to_play_and_action_mask(
+                    game_segment_batch_size, to_play_segment, action_mask_segment, pos_in_game_segment_list
                 )
-                if self._cfg.reanalyze_noise:
-                    roots.prepare(self._cfg.root_noise_weight, noises, value_prefix_pool, policy_logits_pool, to_play)
+                active_to_play = [to_play[idx] for idx in active_indices]
+                if self._cfg.model.continuous_action_space is True:
+                    # NOTE: in continuous action space env, we set all legal_actions as -1
+                    active_legal_actions = [
+                        [-1 for _ in range(self._cfg.model.action_space_size)] for _ in range(active_count)
+                    ]
                 else:
-                    roots.prepare_no_noise(value_prefix_pool, policy_logits_pool, to_play)
-                # do MCTS for a new policy with the recent target model
-                MCTSCtree(self._cfg).search(roots, model, latent_state_roots, reward_hidden_state_roots, to_play)
-            else:
-                # python mcts_tree
-                roots = MCTSPtree.roots(
-                    transition_batch_size, legal_actions, self._cfg.model.action_space_size,
-                    self._cfg.model.num_of_sampled_actions, self._cfg.model.continuous_action_space
-                )
-                if self._cfg.reanalyze_noise:
-                    roots.prepare(self._cfg.root_noise_weight, noises, value_prefix_pool, policy_logits_pool, to_play)
-                else:
-                    roots.prepare_no_noise(value_prefix_pool, policy_logits_pool, to_play)
-                # do MCTS for a new policy with the recent target model
-                MCTSPtree(self._cfg).search(roots, model, latent_state_roots, reward_hidden_state_roots, to_play)
+                    active_legal_actions = [np.nonzero(action_mask[idx])[0].tolist() for idx in active_indices]
 
-            roots_legal_actions_list = legal_actions
-            roots_distributions = roots.get_distributions()
-            roots_values = roots.get_values()
-            roots_child_q_values = (
-                roots.get_children_q_values(float(self._cfg.discount_factor)) if use_completed_q else None
-            )
+                active_obs_list = (
+                    policy_obs_list
+                    if active_count == transition_batch_size
+                    else [policy_obs_list[idx] for idx in active_indices]
+                )
+                active_obs_arr = prepare_observation(active_obs_list, self._cfg.model.model_type)
+                # split a full batch into slices of mini_infer_size: to save the GPU memory for more GPU actors
+                slices = int(np.ceil(active_count / self._cfg.mini_infer_size))
+                network_output = []
+                for i in range(slices):
+                    beg_index = self._cfg.mini_infer_size * i
+                    end_index = self._cfg.mini_infer_size * (i + 1)
+                    m_obs = torch.from_numpy(active_obs_arr[beg_index:end_index]).to(self._cfg.device).float()
+
+                    m_output = model.initial_inference(m_obs)
+
+                    if not model.training:
+                        # if not in training, obtain the scalars of the value/reward
+                        [m_output.latent_state, m_output.value, m_output.policy_logits] = to_detach_cpu_numpy(
+                            [
+                                m_output.latent_state,
+                                inverse_scalar_transform(
+                                    m_output.value,
+                                    self.value_support,
+                                    categorical_distribution=self._cfg.model.categorical_distribution,
+                                ),
+                                m_output.policy_logits
+                            ]
+                        )
+                        m_output.reward_hidden_state = (
+                            m_output.reward_hidden_state[0].detach().cpu().numpy(),
+                            m_output.reward_hidden_state[1].detach().cpu().numpy()
+                        )
+
+                    network_output.append(m_output)
+
+                active_raw_values, value_prefix_pool, active_policy_logits, latent_state_roots, reward_hidden_state_roots = concat_output(
+                    network_output, data_type='efficientzero'
+                )
+
+                active_raw_values = np.asarray(active_raw_values).reshape(-1).tolist()
+                value_prefix_pool = np.asarray(value_prefix_pool).reshape(-1).tolist()
+                active_policy_logits = active_policy_logits.tolist()
+                # noises are not necessary for reanalyze
+                noises = [
+                    np.random.dirichlet([self._cfg.root_dirichlet_alpha] * k_sampled
+                                        ).astype(np.float32).tolist() for _ in range(active_count)
+                ] if self._cfg.reanalyze_noise else None
+                if self._cfg.mcts_ctree:
+                    # ==============================================================
+                    # sampled related core code
+                    # ==============================================================
+                    # cpp mcts_tree
+                    roots = MCTSCtree.roots(
+                        active_count, active_legal_actions, self._cfg.model.action_space_size,
+                        k_sampled, self._cfg.model.continuous_action_space
+                    )
+                    if self._cfg.reanalyze_noise:
+                        roots.prepare(
+                            self._cfg.root_noise_weight, noises, value_prefix_pool, active_policy_logits, active_to_play
+                        )
+                    else:
+                        roots.prepare_no_noise(value_prefix_pool, active_policy_logits, active_to_play)
+                    # do MCTS for a new policy with the recent target model
+                    MCTSCtree(self._cfg).search(
+                        roots, model, latent_state_roots, reward_hidden_state_roots, active_to_play
+                    )
+                else:
+                    # python mcts_tree
+                    roots = MCTSPtree.roots(
+                        active_count, active_legal_actions, self._cfg.model.action_space_size,
+                        k_sampled, self._cfg.model.continuous_action_space
+                    )
+                    if self._cfg.reanalyze_noise:
+                        roots.prepare(
+                            self._cfg.root_noise_weight, noises, value_prefix_pool, active_policy_logits, active_to_play
+                        )
+                    else:
+                        roots.prepare_no_noise(value_prefix_pool, active_policy_logits, active_to_play)
+                    # do MCTS for a new policy with the recent target model
+                    MCTSPtree(self._cfg).search(
+                        roots, model, latent_state_roots, reward_hidden_state_roots, active_to_play
+                    )
+
+                active_distributions = roots.get_distributions()
+                active_values = roots.get_values()
+                active_child_q_values = (
+                    roots.get_children_q_values(float(self._cfg.discount_factor)) if use_completed_q else None
+                )
+                active_roots_sampled = roots.get_sampled_actions()
+                active_sampled_actions = np.asarray([
+                    [action.value if hasattr(action, 'value') else action for action in row]
+                    for row in active_roots_sampled
+                ])
+                if active_sampled_actions.shape[1:] != root_sampled_actions.shape[1:]:
+                    active_sampled_actions = active_sampled_actions.reshape(
+                        (active_count,) + root_sampled_actions.shape[1:]
+                    )
+
+                for local_i, global_idx in enumerate(active_indices):
+                    roots_distributions[global_idx] = active_distributions[local_i]
+                    roots_values[global_idx] = active_values[local_i]
+                    raw_values_pool[global_idx] = active_raw_values[local_i]
+                    policy_logits_pool[global_idx] = active_policy_logits[local_i]
+                    if use_completed_q:
+                        roots_child_q_values[global_idx] = active_child_q_values[local_i]
+                root_sampled_actions[active_indices] = active_sampled_actions
+
             compute_completed_q_policy = None
             if use_completed_q:
                 from lzero.policy.sampled_efficientzero import compute_completed_q_policy
-
-            # ==============================================================
-            # fix reanalyze in sez
-            # ==============================================================
-            roots_sampled_actions = roots.get_sampled_actions()
-            root_sampled_actions = np.asarray([
-                [action.value if hasattr(action, 'value') else action for action in row]
-                for row in roots_sampled_actions
-            ])
 
             seg_lock = self._get_segment_update_lock()
             rsa_segments_iter = (
