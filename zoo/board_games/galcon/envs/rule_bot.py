@@ -44,3 +44,6 @@ class GalconFixedPolicyBot:
             if action != self.env.pass_action:
                 return int(action)
         return int(self.env.pass_action)
+
+
+from zoo.board_games.galcon.envs.mcts_bot import GalconMCTSBot, GalconMCTSSearch  # noqa: E402, F401

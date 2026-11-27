@@ -21,7 +21,12 @@ from gymnasium import spaces
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning) 
 
-from zoo.board_games.galcon.envs.rule_bot import GalconFixedPolicyBot, GalconRandomBot, GalconPassBot
+from zoo.board_games.galcon.envs.rule_bot import (
+    GalconFixedPolicyBot,
+    GalconMCTSBot,
+    GalconPassBot,
+    GalconRandomBot,
+)
 from zoo.board_games.galcon.envs.cpp_sim import (
     BASE_ITEM_USERS,
     DEFAULT_PHYSICS_SUBSTEPS,
@@ -126,7 +131,15 @@ class GalconEnv(BaseEnv):
     config = dict(
         env_id='Galcon',
         battle_mode='self_play_mode',
-        bot_action_type='random',  # {'random', 'fixed'}
+        bot_action_type='random',  # {'random', 'fixed', 'pass', 'mcts'}
+        # Tournament-tuned pure C++ MCTS bot defaults (~18 ms/move, ~+860 Elo over random)
+        mcts_num_simulations=64,
+        mcts_c_puct=0.5,
+        mcts_max_actions=10,
+        mcts_max_depth=8,
+        mcts_eval_horizon=40,
+        mcts_rollout_ticks=4,
+        mcts_prior_temp=1.5,
         num_planets=8,
         min_send_ships=1,
         send_ratio=0.5,
@@ -289,6 +302,8 @@ class GalconEnv(BaseEnv):
             self.bot = GalconFixedPolicyBot(self)
         elif self.bot_action_type == 'pass':
             self.bot = GalconPassBot(self)
+        elif self.bot_action_type == 'mcts':
+            self.bot = GalconMCTSBot(self)
         else:
             raise ValueError(f'Unsupported Galcon bot_action_type: {self.bot_action_type}')
 
