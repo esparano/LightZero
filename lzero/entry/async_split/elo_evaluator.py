@@ -54,7 +54,7 @@ def _ding_exp_name(root_dir: Path) -> str:
 def _default_anchor_bots_for_env(env_cfg: Optional[Dict[str, Any]]) -> List[str]:
     env_id = str(env_cfg.get('env_id', '')).lower() if isinstance(env_cfg, dict) else ''
     if env_id == 'galcon':
-        return ['random', 'mcts']
+        return ['random', 'mcts:16']
     return ['random']
 
 

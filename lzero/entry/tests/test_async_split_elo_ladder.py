@@ -984,9 +984,9 @@ def test_head_to_head_and_elo_evaluator_support_mcts_anchor_bot(tmp_path):
     AsyncEloEvaluator (default Galcon anchors include both random and mcts), and CLI defaults.
     """
     parser = build_parser()
-    assert parser.parse_args(['evaluator']).elo_anchor_bots == 'random,mcts'
-    assert parser.parse_args(['launch']).elo_anchor_bots == 'random,mcts'
-    assert parser.parse_args(['tournament']).anchor_bots == 'random,mcts'
+    assert parser.parse_args(['evaluator']).elo_anchor_bots == 'random,mcts:16'
+    assert parser.parse_args(['launch']).elo_anchor_bots == 'random,mcts:16'
+    assert parser.parse_args(['tournament']).anchor_bots == 'random,mcts:16'
 
     cfg_pair = _make_tiny_galcon_async_cfg()
     cfg_pair[0].env.max_episode_steps = 12
@@ -1020,7 +1020,7 @@ def test_head_to_head_and_elo_evaluator_support_mcts_anchor_bot(tmp_path):
         min_iter_gap=0,
     )
     try:
-        assert elo_eval.ladder.anchor_bot_types == ['random', 'mcts']
+        assert elo_eval.ladder.anchor_bot_types == ['random', 'mcts:16']
         assert elo_eval.ladder.anchor_id == 'bot:random'
         publish_weights(
             dirs.latest_weights_path,
@@ -1031,11 +1031,11 @@ def test_head_to_head_and_elo_evaluator_support_mcts_anchor_bot(tmp_path):
         res = elo_eval.eval_once_if_updated()
         assert res is not None
         opps_played = {m['opponent_id'] for m in res['matches']}
-        assert {'bot:random', 'bot:mcts'}.issubset(opps_played)
+        assert {'bot:random', 'bot:mcts:16'}.issubset(opps_played)
     finally:
         elo_eval.close()
 
     tb_tags = _read_tb_tags(dirs.log_dir / 'elo_evaluator')
     assert 'elo_iter/win_rate_vs_bot_random' in tb_tags
-    assert 'elo_iter/win_rate_vs_bot_mcts' in tb_tags
+    assert 'elo_iter/win_rate_vs_bot_mcts_16' in tb_tags
 
