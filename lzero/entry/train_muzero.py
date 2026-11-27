@@ -11,7 +11,7 @@ from ding.rl_utils import get_epsilon_greedy_fn
 from ding.utils import get_rank, set_pkg_seed
 from ding.worker import BaseLearner
 from ditk import logging
-from lzero.entry.utils import log_buffer_memory_usage, log_buffer_run_time
+from lzero.entry.utils import load_pretrained_checkpoint, log_buffer_memory_usage, log_buffer_run_time
 from lzero.policy import visit_count_temperature
 from lzero.policy.random_policy import LightZeroRandomPolicy
 from lzero.worker import MuZeroCollector as Collector
@@ -97,7 +97,7 @@ def train_muzero(
 
     # load pretrained model
     if model_path is not None:
-        policy.learn_mode.load_state_dict(torch.load(model_path, map_location=cfg.policy.device))
+        load_pretrained_checkpoint(policy, model_path, cfg.policy.device)
 
     # Create worker components: learner, collector, evaluator, replay buffer, commander.
     tb_logger = SummaryWriter(os.path.join('./{}/log/'.format(cfg.exp_name), 'serial')) if get_rank() == 0 else None

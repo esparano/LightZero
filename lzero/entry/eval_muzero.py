@@ -13,6 +13,7 @@ from ding.envs import get_vec_env_setting
 from ding.policy import create_policy
 from ding.utils import set_pkg_seed
 from ding.worker import BaseLearner
+from lzero.entry.utils import load_pretrained_checkpoint
 from lzero.worker import MuZeroEvaluator
 
 
@@ -59,7 +60,7 @@ def eval_muzero(
 
     # load pretrained model
     if model_path is not None:
-        policy.learn_mode.load_state_dict(torch.load(model_path, map_location=cfg.policy.device))
+        load_pretrained_checkpoint(policy, model_path, cfg.policy.device)
 
     # Create worker components: learner, collector, evaluator, replay buffer, commander.
     tb_logger = SummaryWriter(os.path.join('./{}/log/'.format(cfg.exp_name), 'serial'))

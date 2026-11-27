@@ -972,6 +972,43 @@ def log_buffer_run_time(train_iter: int, buffer: GameBuffer, writer: SummaryWrit
     buffer.reset_runtime_metrics()
 
 
+def load_pretrained_checkpoint(policy: Policy, model_path: str, device: Union[str, torch.device]) -> None:
+    """
+    Overview:
+        Load either a full policy checkpoint (containing ``model``, ``target_model``,
+        and ``optimizer``), a model-only checkpoint (e.g. ``ckpt_best.pth.tar``,
+        legacy ``WM_ckpt_best.pth.tar``, or ``latest_weights.pt`` with
+        ``{'model': state_dict, ...}``), or a raw model ``state_dict`` into ``policy``.
+    """
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    if (
+        isinstance(ckpt, dict)
+        and 'optimizer' in ckpt
+        and hasattr(policy, 'learn_mode')
+        and (getattr(policy, '_target_model', None) is None or 'target_model' in ckpt)
+    ):
+        policy.learn_mode.load_state_dict(ckpt)
+        return
+
+    model_sd = ckpt['model'] if (isinstance(ckpt, dict) and 'model' in ckpt) else ckpt
+    target_module = getattr(policy, '_learn_model', None) or getattr(policy, '_model', None)
+    if target_module is None:
+        raise AttributeError("Policy exposes neither '_learn_model' nor '_model' for checkpoint loading.")
+    target_module.load_state_dict(model_sd)
+    if hasattr(policy, '_target_model') and policy._target_model is not None:
+        target_sd = ckpt['target_model'] if (isinstance(ckpt, dict) and 'target_model' in ckpt) else model_sd
+        policy._target_model.load_state_dict(target_sd)
+    if isinstance(ckpt, dict) and 'optimizer' in ckpt and hasattr(policy, '_optimizer') and policy._optimizer is not None:
+        policy._optimizer.load_state_dict(ckpt['optimizer'])
+    if (
+        isinstance(ckpt, dict)
+        and 'lr_scheduler' in ckpt
+        and hasattr(policy, 'lr_scheduler')
+        and policy.lr_scheduler is not None
+    ):
+        policy.lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
+
+
 # ==============================================================================
 # Example Usage
 # ==============================================================================
