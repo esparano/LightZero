@@ -1193,7 +1193,7 @@ class GalconEnv(BaseEnv):
         if parts == 1:
             units = [[sx, sy]]
             unit_headings = [[hx0, hy0]]
-            cx, cy, fl_radius = sx, sy, self.SHIP_RADIUS
+            cx, cy, fl_radius = sx, sy, 0.0
         else:
             two_pi = 2.0 * math.pi
             seed_base = (fid * 1000003) & 0xFFFFFFFF
@@ -1202,6 +1202,10 @@ class GalconEnv(BaseEnv):
             unit_headings = []
             sum_x = 0.0
             sum_y = 0.0
+            min_x = 1e300
+            max_x = -1e300
+            min_y = 1e300
+            max_y = -1e300
             tx, ty = target.x, target.y
             for j in range(parts):
                 u1 = _spawn_hash_u01((seed_base + j * 2 + 1) & 0xFFFFFFFF)
@@ -1213,6 +1217,14 @@ class GalconEnv(BaseEnv):
                 units.append([xj, yj])
                 sum_x += xj
                 sum_y += yj
+                if xj < min_x:
+                    min_x = xj
+                if xj > max_x:
+                    max_x = xj
+                if yj < min_y:
+                    min_y = yj
+                if yj > max_y:
+                    max_y = yj
                 hdx = tx - xj
                 hdy = ty - yj
                 hd2 = hdx * hdx + hdy * hdy
@@ -1223,8 +1235,7 @@ class GalconEnv(BaseEnv):
                     unit_headings.append([hx0, hy0])
             cx = sum_x / float(parts)
             cy = sum_y / float(parts)
-            max_d2 = max((u[0] - cx) ** 2 + (u[1] - cy) ** 2 for u in units)
-            fl_radius = math.sqrt(max_d2) + self.SHIP_RADIUS
+            fl_radius = ((max_x - min_x) + (max_y - min_y)) / 5.0
 
         self.fleets.append(
             Fleet(

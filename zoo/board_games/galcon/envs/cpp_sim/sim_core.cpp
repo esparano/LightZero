@@ -28,8 +28,15 @@ constexpr double SPAWN_SETTLE_TOL = 0.05;
 constexpr double EPS_DIST2 = 1e-12;
 constexpr double ANTIPODE_DOT_THRESHOLD = -0.995;
 constexpr double PI = 3.14159265358979323846;
-constexpr double DEFAULT_SHIP_TURN_RATE = 4.5;
+// Real Galcon 2 (unit_move @0x453ac0): base angular rate = (pi/32) * 40 = 3.92699 rad/s (225 deg/s);
+// after >1.0s of sustained turning, escalates by +pi/32 rad per tick (= +3.92699 rad/s per sec) and never resets.
+constexpr double DEFAULT_SHIP_TURN_RATE = PI * 40.0 / 32.0;
+constexpr double TURN_ESCALATE_PER_SEC = PI * 40.0 / 32.0;
 constexpr double DEFAULT_SHIP_TURN_MIN_SPEED_FACTOR = 1.0;
+// Real Galcon 2 (unit_move @0x453ac0) stuck-unit jitter rule:
+// if age > 0, |x-px|+|y-py| < travel/15, and (uid + age) % 48 == 0, nudge x,y in [-travel, +travel].
+constexpr double STUCK_DIST_DIVISOR = 15.0;
+constexpr int32_t STUCK_JITTER_MOD = 48;
 
 constexpr int32_t ITEMS_MAX = 4096;
 constexpr int32_t ITEMS_RESERVED = 16;
@@ -492,6 +499,12 @@ static int32_t run_physics_substeps_core(
     double* __restrict__ uy,
     double* __restrict__ uhx,
     double* __restrict__ uhy,
+    double* __restrict__ u_px,
+    double* __restrict__ u_py,
+    int32_t* __restrict__ u_age,
+    int32_t* __restrict__ u_uid,
+    double* __restrict__ u_turn_rate,
+    double* __restrict__ u_turn_clock,
     double tick_dt,
     double fleet_speed,
     int32_t substeps,
@@ -877,12 +890,26 @@ static int32_t run_physics_substeps_core(
             const int32_t end = start + cnt;
             const bool all_alive = (alive_c == cnt);
 
-            // Step 3: Move toward target with heading turn limit + track exact fleet AABB
+            // Step 3: G2 stuck-unit jitter + move toward target with heading turn limit + track exact fleet AABB
             double min_x = 1e300, max_x = -1e300, min_y = 1e300, max_y = -1e300;
+            const double stuck_thresh = sub_step_dist / STUCK_DIST_DIVISOR;
             for (int32_t u = start; u < end; ++u) {
                 if (!all_alive && !u_alive[u]) continue;
                 double x = ux[u];
                 double y = uy[u];
+                if (u_age && u_age[u] > 0) {
+                    if (std::fabs(x - u_px[u]) + std::fabs(y - u_py[u]) < stuck_thresh
+                        && ((u_uid[u] + u_age[u]) % STUCK_JITTER_MOD) == 0) {
+                        const uint32_t hseed = static_cast<uint32_t>(u_uid[u]) * 1000003u
+                                             ^ static_cast<uint32_t>(u_age[u]) * 2654435761u;
+                        x += (spawn_hash_u01(hseed + 1u) * 2.0 - 1.0) * sub_step_dist;
+                        y += (spawn_hash_u01(hseed + 2u) * 2.0 - 1.0) * sub_step_dist;
+                    }
+                }
+                if (u_px) {
+                    u_px[u] = x;
+                    u_py[u] = y;
+                }
                 const double dx = tx - x;
                 const double dy = ty - y;
                 const double dist = dist2d(dx, dy);
@@ -892,9 +919,22 @@ static int32_t run_physics_substeps_core(
                     double hx = uhx[u];
                     double hy = uhy[u];
                     const double dot = hx * des_x + hy * des_y;
-                    if (instant_turn || dot >= cos_max) {
+                    const double u_tr = u_turn_rate ? u_turn_rate[u] : turn_rate;
+                    double u_cos = cos_max;
+                    double u_sin = sin_max;
+                    bool u_instant = instant_turn;
+                    if (u_tr != turn_rate) {
+                        const double u_max_turn = u_tr * sub_dt;
+                        u_instant = (u_tr <= 0.0) || (u_max_turn >= PI);
+                        if (!u_instant) {
+                            u_cos = std::cos(u_max_turn);
+                            u_sin = std::sin(u_max_turn);
+                        }
+                    }
+                    if (u_instant || dot >= u_cos) {
                         hx = des_x;
                         hy = des_y;
+                        if (u_turn_clock) u_turn_clock[u] = 0.0;
                         if (dist <= sub_step_dist) {
                             x = tx;
                             y = ty;
@@ -905,9 +945,9 @@ static int32_t run_physics_substeps_core(
                     } else {
                         const double cross = hx * des_y - hy * des_x;
                         const double turn_sign = (cross >= 0.0) ? 1.0 : -1.0;
-                        const double s_rot = turn_sign * sin_max;
-                        const double nhx = hx * cos_max - hy * s_rot;
-                        const double nhy = hx * s_rot + hy * cos_max;
+                        const double s_rot = turn_sign * u_sin;
+                        const double nhx = hx * u_cos - hy * s_rot;
+                        const double nhy = hx * s_rot + hy * u_cos;
                         const double hn = dist2d(nhx, nhy);
                         if (hn > 0.0) {
                             hx = nhx / hn;
@@ -915,6 +955,13 @@ static int32_t run_physics_substeps_core(
                         } else {
                             hx = des_x;
                             hy = des_y;
+                        }
+                        if (u_turn_clock) {
+                            const double tc = u_turn_clock[u] + sub_dt;
+                            u_turn_clock[u] = tc;
+                            if (tc > 1.0 && u_turn_rate) {
+                                u_turn_rate[u] = u_tr + sub_dt * TURN_ESCALATE_PER_SEC;
+                            }
                         }
                         const double align = hx * des_x + hy * des_y;
                         const double speed_scale =
@@ -928,6 +975,7 @@ static int32_t run_physics_substeps_core(
                     ux[u] = x;
                     uy[u] = y;
                 }
+                if (u_age) ++u_age[u];
                 if (x < min_x) min_x = x;
                 if (x > max_x) max_x = x;
                 if (y < min_y) min_y = y;
@@ -1138,6 +1186,14 @@ static int32_t run_physics_substeps_core(
                                         uy[wp] = uy[u];
                                         uhx[wp] = uhx[u];
                                         uhy[wp] = uhy[u];
+                                        if (u_px) {
+                                            u_px[wp] = u_px[u];
+                                            u_py[wp] = u_py[u];
+                                            u_age[wp] = u_age[u];
+                                            u_uid[wp] = u_uid[u];
+                                            u_turn_rate[wp] = u_turn_rate[u];
+                                            u_turn_clock[wp] = u_turn_clock[u];
+                                        }
                                     }
                                     u_alive[wp] = 1;
                                     ++wp;
@@ -1151,7 +1207,7 @@ static int32_t run_physics_substeps_core(
         }
     } // end ticks loop
 
-    // 6. Compact alive units in-place & compute fleet summaries
+    // 6. Compact alive units in-place & compute fleet summaries (G2 fleets_loop @0x442720)
     int32_t write_pos = 0;
     for (int32_t f = 0; f < n_fleets; ++f) {
         const int32_t old_start = fl_unit_start[f];
@@ -1159,6 +1215,7 @@ static int32_t run_physics_substeps_core(
         const int32_t new_start = write_pos;
         double sum_x = 0.0;
         double sum_y = 0.0;
+        double min_x = 1e300, max_x = -1e300, min_y = 1e300, max_y = -1e300;
         int32_t kept = 0;
 
         if (fl_alive_cnt[f] == old_count && old_count > 0) {
@@ -1167,10 +1224,24 @@ static int32_t run_physics_substeps_core(
                 std::memmove(uy + write_pos, uy + old_start, (size_t)old_count * sizeof(double));
                 std::memmove(uhx + write_pos, uhx + old_start, (size_t)old_count * sizeof(double));
                 std::memmove(uhy + write_pos, uhy + old_start, (size_t)old_count * sizeof(double));
+                if (u_px) {
+                    std::memmove(u_px + write_pos, u_px + old_start, (size_t)old_count * sizeof(double));
+                    std::memmove(u_py + write_pos, u_py + old_start, (size_t)old_count * sizeof(double));
+                    std::memmove(u_age + write_pos, u_age + old_start, (size_t)old_count * sizeof(int32_t));
+                    std::memmove(u_uid + write_pos, u_uid + old_start, (size_t)old_count * sizeof(int32_t));
+                    std::memmove(u_turn_rate + write_pos, u_turn_rate + old_start, (size_t)old_count * sizeof(double));
+                    std::memmove(u_turn_clock + write_pos, u_turn_clock + old_start, (size_t)old_count * sizeof(double));
+                }
             }
             for (int32_t u = new_start; u < new_start + old_count; ++u) {
-                sum_x += ux[u];
-                sum_y += uy[u];
+                const double x = ux[u];
+                const double y = uy[u];
+                sum_x += x;
+                sum_y += y;
+                if (x < min_x) min_x = x;
+                if (x > max_x) max_x = x;
+                if (y < min_y) min_y = y;
+                if (y > max_y) max_y = y;
             }
             kept = old_count;
             write_pos += old_count;
@@ -1183,8 +1254,20 @@ static int32_t run_physics_substeps_core(
                     uy[write_pos] = y;
                     uhx[write_pos] = uhx[u];
                     uhy[write_pos] = uhy[u];
+                    if (u_px) {
+                        u_px[write_pos] = u_px[u];
+                        u_py[write_pos] = u_py[u];
+                        u_age[write_pos] = u_age[u];
+                        u_uid[write_pos] = u_uid[u];
+                        u_turn_rate[write_pos] = u_turn_rate[u];
+                        u_turn_clock[write_pos] = u_turn_clock[u];
+                    }
                     sum_x += x;
                     sum_y += y;
+                    if (x < min_x) min_x = x;
+                    if (x > max_x) max_x = x;
+                    if (y < min_y) min_y = y;
+                    if (y > max_y) max_y = y;
                     ++write_pos;
                     ++kept;
                 }
@@ -1194,24 +1277,15 @@ static int32_t run_physics_substeps_core(
         fl_unit_start[f] = new_start;
         fl_unit_count[f] = kept;
         if (kept > 0) {
-            const double cx = sum_x / (double)kept;
-            const double cy = sum_y / (double)kept;
-            double max_d2 = 0.0;
-            for (int32_t u = new_start; u < new_start + kept; ++u) {
-                const double dx = ux[u] - cx;
-                const double dy = uy[u] - cy;
-                const double d2 = dx * dx + dy * dy;
-                if (d2 > max_d2) max_d2 = d2;
-            }
             fl_out_ships[f] = (double)kept * fl_spu[f];
-            fl_out_cx[f] = cx;
-            fl_out_cy[f] = cy;
-            fl_out_radius[f] = std::sqrt(max_d2) + ship_radius;
+            fl_out_cx[f] = sum_x / (double)kept;
+            fl_out_cy[f] = sum_y / (double)kept;
+            fl_out_radius[f] = (kept > 1) ? (((max_x - min_x) + (max_y - min_y)) / 5.0) : 0.0;
         } else {
             fl_out_ships[f] = 0.0;
             fl_out_cx[f] = 0.0;
             fl_out_cy[f] = 0.0;
-            fl_out_radius[f] = ship_radius;
+            fl_out_radius[f] = 0.0;
         }
     }
 
@@ -1241,6 +1315,12 @@ int32_t run_physics_substeps(
     double* __restrict__ uy,
     double* __restrict__ uhx,
     double* __restrict__ uhy,
+    double* __restrict__ u_px,
+    double* __restrict__ u_py,
+    int32_t* __restrict__ u_age,
+    int32_t* __restrict__ u_uid,
+    double* __restrict__ u_turn_rate,
+    double* __restrict__ u_turn_clock,
     double tick_dt,
     double fleet_speed,
     int32_t substeps,
@@ -1281,6 +1361,7 @@ int32_t run_physics_substeps(
         n_fleets, fl_owner, fl_target_idx, const_cast<double*>(fl_spu), fl_unit_start, fl_unit_count,
         fl_out_ships, fl_out_cx, fl_out_cy, fl_out_radius,
         total_units, ux, uy, uhx, uhy,
+        u_px, u_py, u_age, u_uid, u_turn_rate, u_turn_clock,
         tick_dt, fleet_speed, substeps, ship_radius,
         sep_stiffness, max_sep_push, sep_mode, prod_divisor, obstacle_escape_eps,
         turn_rate, turn_min_speed_factor,
@@ -1332,6 +1413,7 @@ struct SimState {
     // Dynamic scalar state
     int32_t tick;
     int32_t next_fleet_id;
+    int32_t next_uid;
     int32_t done;
     int32_t winner;
 
@@ -1365,6 +1447,12 @@ struct SimState {
     double uy[SIM_MAX_UNITS];
     double uhx[SIM_MAX_UNITS];
     double uhy[SIM_MAX_UNITS];
+    double u_px[SIM_MAX_UNITS];
+    double u_py[SIM_MAX_UNITS];
+    int32_t u_age[SIM_MAX_UNITS];
+    int32_t u_uid[SIM_MAX_UNITS];
+    double u_turn_rate[SIM_MAX_UNITS];
+    double u_turn_clock[SIM_MAX_UNITS];
 
     int32_t find_planet_idx(int32_t planet_id) const {
         for (int32_t i = 0; i < n_planets; ++i) {
@@ -1495,9 +1583,15 @@ struct SimState {
             uy[u_start] = sy;
             uhx[u_start] = hx0;
             uhy[u_start] = hy0;
+            u_px[u_start] = sx;
+            u_py[u_start] = sy;
+            u_age[u_start] = 0;
+            u_uid[u_start] = next_uid++;
+            u_turn_rate[u_start] = turn_rate;
+            u_turn_clock[u_start] = 0.0;
             fl_cx[f] = sx;
             fl_cy[f] = sy;
-            fl_radius[f] = ship_radius;
+            fl_radius[f] = 0.0;
         } else {
             double* const fux = ux + u_start;
             double* const fuy = uy + u_start;
@@ -1640,35 +1734,38 @@ struct SimState {
 
             double sum_x = 0.0;
             double sum_y = 0.0;
+            double min_x = 1e300, max_x = -1e300, min_y = 1e300, max_y = -1e300;
             for (int32_t j = 0; j < parts; ++j) {
                 const double xj = fux[j];
                 const double yj = fuy[j];
                 sum_x += xj;
                 sum_y += yj;
+                if (xj < min_x) min_x = xj;
+                if (xj > max_x) max_x = xj;
+                if (yj < min_y) min_y = yj;
+                if (yj > max_y) max_y = yj;
+                const int32_t ui = u_start + j;
+                u_px[ui] = xj;
+                u_py[ui] = yj;
+                u_age[ui] = 0;
+                u_uid[ui] = next_uid++;
+                u_turn_rate[ui] = turn_rate;
+                u_turn_clock[ui] = 0.0;
                 const double hdx = tx - xj;
                 const double hdy = ty - yj;
                 const double hd2 = hdx * hdx + hdy * hdy;
                 if (hd2 > EPS_DIST2) {
                     const double hd = std::sqrt(hd2);
-                    uhx[u_start + j] = hdx / hd;
-                    uhy[u_start + j] = hdy / hd;
+                    uhx[ui] = hdx / hd;
+                    uhy[ui] = hdy / hd;
                 } else {
-                    uhx[u_start + j] = hx0;
-                    uhy[u_start + j] = hy0;
+                    uhx[ui] = hx0;
+                    uhy[ui] = hy0;
                 }
             }
-            const double cx = sum_x / (double)parts;
-            const double cy = sum_y / (double)parts;
-            double max_d2 = 0.0;
-            for (int32_t j = 0; j < parts; ++j) {
-                const double ddx = fux[j] - cx;
-                const double ddy = fuy[j] - cy;
-                const double dd2 = ddx * ddx + ddy * ddy;
-                if (dd2 > max_d2) max_d2 = dd2;
-            }
-            fl_cx[f] = cx;
-            fl_cy[f] = cy;
-            fl_radius[f] = std::sqrt(max_d2) + ship_radius;
+            fl_cx[f] = sum_x / (double)parts;
+            fl_cy[f] = sum_y / (double)parts;
+            fl_radius[f] = ((max_x - min_x) + (max_y - min_y)) / 5.0;
         }
         n_units += parts;
         return fid;
@@ -1705,6 +1802,7 @@ struct SimState {
             fl_owner, fl_target_idx, fl_spu, fl_unit_start, fl_unit_count,
             fl_ships, fl_cx, fl_cy, fl_radius,
             n_units, ux, uy, uhx, uhy,
+            u_px, u_py, u_age, u_uid, u_turn_rate, u_turn_clock,
             tick_dt, fleet_speed, substeps, ship_radius,
             sep_stiffness, max_sep_push, sep_mode, prod_divisor, obstacle_escape_eps,
             turn_rate, turn_min_speed_factor,
@@ -1774,6 +1872,7 @@ struct SimState {
             fl_owner, fl_target_idx, fl_spu, fl_unit_start, fl_unit_count,
             fl_ships, fl_cx, fl_cy, fl_radius,
             n_units, ux, uy, uhx, uhy,
+            u_px, u_py, u_age, u_uid, u_turn_rate, u_turn_clock,
             tick_dt, fleet_speed, substeps, ship_radius,
             sep_stiffness, max_sep_push, sep_mode, prod_divisor, obstacle_escape_eps,
             turn_rate, turn_min_speed_factor,
@@ -1831,6 +1930,7 @@ static inline void copy_sim_state_fast(const SimState* src, SimState* dst) {
     dst->base_item_users = src->base_item_users;
     dst->tick = src->tick;
     dst->next_fleet_id = src->next_fleet_id;
+    dst->next_uid = src->next_uid;
     dst->done = src->done;
     dst->winner = src->winner;
 
@@ -1869,6 +1969,12 @@ static inline void copy_sim_state_fast(const SimState* src, SimState* dst) {
         std::memcpy(dst->uy, src->uy, (size_t)nu * sizeof(double));
         std::memcpy(dst->uhx, src->uhx, (size_t)nu * sizeof(double));
         std::memcpy(dst->uhy, src->uhy, (size_t)nu * sizeof(double));
+        std::memcpy(dst->u_px, src->u_px, (size_t)nu * sizeof(double));
+        std::memcpy(dst->u_py, src->u_py, (size_t)nu * sizeof(double));
+        std::memcpy(dst->u_age, src->u_age, (size_t)nu * sizeof(int32_t));
+        std::memcpy(dst->u_uid, src->u_uid, (size_t)nu * sizeof(int32_t));
+        std::memcpy(dst->u_turn_rate, src->u_turn_rate, (size_t)nu * sizeof(double));
+        std::memcpy(dst->u_turn_clock, src->u_turn_clock, (size_t)nu * sizeof(double));
     }
 }
 
@@ -1901,6 +2007,12 @@ int32_t step_physics_cpp(
     double* uy,
     double* uhx,
     double* uhy,
+    double* u_px,
+    double* u_py,
+    int32_t* u_age,
+    int32_t* u_uid,
+    double* u_turn_rate,
+    double* u_turn_clock,
     double tick_dt,
     double fleet_speed,
     int32_t substeps,
@@ -1923,6 +2035,7 @@ int32_t step_physics_cpp(
             n_fleets, fl_owner, fl_target_idx, fl_spu, fl_unit_start, fl_unit_count,
             fl_out_ships, fl_out_cx, fl_out_cy, fl_out_radius,
             total_units, ux, uy, uhx, uhy,
+            u_px, u_py, u_age, u_uid, u_turn_rate, u_turn_clock,
             tick_dt, fleet_speed, substeps, ship_radius,
             sep_stiffness, max_sep_push, sep_mode, prod_divisor, obstacle_escape_eps,
             turn_rate, turn_min_speed_factor,
@@ -1965,6 +2078,7 @@ int32_t step_physics_cpp(
         n_fleets, fl_owner, fl_target_idx, fl_spu, fl_unit_start, fl_unit_count,
         fl_out_ships, fl_out_cx, fl_out_cy, fl_out_radius,
         total_units, ux, uy, uhx, uhy,
+        u_px, u_py, u_age, u_uid, u_turn_rate, u_turn_clock,
         tick_dt, fleet_speed, substeps, ship_radius,
         sep_stiffness, max_sep_push, sep_mode, prod_divisor, obstacle_escape_eps,
         turn_rate, turn_min_speed_factor,
@@ -2021,6 +2135,7 @@ SimState* sim_create(
     st->base_item_users = BASE_ITEM_USERS;
     st->tick = 0;
     st->next_fleet_id = 1000;
+    st->next_uid = 0;
     st->done = 0;
     st->winner = 0;
 
@@ -2119,6 +2234,14 @@ int32_t sim_load_fleets(
                     }
                 }
             }
+        }
+        for (int32_t u = 0; u < n_units; ++u) {
+            st->u_px[u] = st->ux[u];
+            st->u_py[u] = st->uy[u];
+            st->u_age[u] = 0;
+            st->u_uid[u] = st->next_uid++;
+            st->u_turn_rate[u] = st->turn_rate;
+            st->u_turn_clock[u] = 0.0;
         }
     }
     return 0;
@@ -2517,6 +2640,7 @@ int32_t sim_update_planets(
     if (clear_fleets) {
         st->n_fleets = 0;
         st->n_units = 0;
+        st->next_uid = 0;
         st->tick = 0;
         st->done = 0;
         st->winner = 0;
@@ -2580,9 +2704,15 @@ int32_t sim_spawn_fleet_exact(
         st->uy[u_start] = sy;
         st->uhx[u_start] = hx0;
         st->uhy[u_start] = hy0;
+        st->u_px[u_start] = sx;
+        st->u_py[u_start] = sy;
+        st->u_age[u_start] = 0;
+        st->u_uid[u_start] = st->next_uid++;
+        st->u_turn_rate[u_start] = st->turn_rate;
+        st->u_turn_clock[u_start] = 0.0;
         st->fl_cx[f] = sx;
         st->fl_cy[f] = sy;
-        st->fl_radius[f] = st->ship_radius;
+        st->fl_radius[f] = 0.0;
     } else {
         double* const fux = st->ux + u_start;
         double* const fuy = st->uy + u_start;
@@ -2595,6 +2725,7 @@ int32_t sim_spawn_fleet_exact(
         const double ty = st->p_y[dst_idx];
         double sum_x = 0.0;
         double sum_y = 0.0;
+        double min_x = 1e300, max_x = -1e300, min_y = 1e300, max_y = -1e300;
         for (int32_t j = 0; j < parts; ++j) {
             const uint32_t uj = static_cast<uint32_t>(j);
             const double u1 = spawn_hash_u01(seed_base + uj * 2u + 1u);
@@ -2607,6 +2738,17 @@ int32_t sim_spawn_fleet_exact(
             fuy[j] = yj;
             sum_x += xj;
             sum_y += yj;
+            if (xj < min_x) min_x = xj;
+            if (xj > max_x) max_x = xj;
+            if (yj < min_y) min_y = yj;
+            if (yj > max_y) max_y = yj;
+            const int32_t ui = u_start + j;
+            st->u_px[ui] = xj;
+            st->u_py[ui] = yj;
+            st->u_age[ui] = 0;
+            st->u_uid[ui] = st->next_uid++;
+            st->u_turn_rate[ui] = st->turn_rate;
+            st->u_turn_clock[ui] = 0.0;
             const double hdx = tx - xj;
             const double hdy = ty - yj;
             const double hd2 = hdx * hdx + hdy * hdy;
@@ -2619,18 +2761,9 @@ int32_t sim_spawn_fleet_exact(
                 fuhy[j] = hy0;
             }
         }
-        const double cx = sum_x / (double)parts;
-        const double cy = sum_y / (double)parts;
-        double max_d2 = 0.0;
-        for (int32_t j = 0; j < parts; ++j) {
-            const double ddx = fux[j] - cx;
-            const double ddy = fuy[j] - cy;
-            const double dd2 = ddx * ddx + ddy * ddy;
-            if (dd2 > max_d2) max_d2 = dd2;
-        }
-        st->fl_cx[f] = cx;
-        st->fl_cy[f] = cy;
-        st->fl_radius[f] = std::sqrt(max_d2) + st->ship_radius;
+        st->fl_cx[f] = sum_x / (double)parts;
+        st->fl_cy[f] = sum_y / (double)parts;
+        st->fl_radius[f] = ((max_x - min_x) + (max_y - min_y)) / 5.0;
     }
 
     st->n_units += parts;
@@ -2678,6 +2811,7 @@ int32_t sim_step_physics_and_read(
         st->fl_owner, st->fl_target_idx, st->fl_spu, st->fl_unit_start, st->fl_unit_count,
         st->fl_ships, st->fl_cx, st->fl_cy, st->fl_radius,
         st->n_units, st->ux, st->uy, st->uhx, st->uhy,
+        st->u_px, st->u_py, st->u_age, st->u_uid, st->u_turn_rate, st->u_turn_clock,
         st->tick_dt, st->fleet_speed, st->substeps, st->ship_radius,
         st->sep_stiffness, st->max_sep_push, st->sep_mode, st->prod_divisor, st->obstacle_escape_eps,
         st->turn_rate, st->turn_min_speed_factor,

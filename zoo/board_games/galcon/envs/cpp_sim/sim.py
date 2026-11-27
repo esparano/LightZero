@@ -46,9 +46,12 @@ SPAWN_AREA_RADIUS = 6.0  # base spawn disc radius; multi-unit fleets scale as SP
 SPAWN_SETTLE_ITERS = 0  # real G2 settles ship overlaps gradually across ticks (verified via 60 Hz spawn probe)
 SPAWN_SETTLE_TOL = 0.05  # early-exit tolerance if launch-tick settling is enabled
 ANTIPODE_DOT_THRESHOLD = -0.995
-ANTIPODE_ESCAPE_TANGENT = 0.05
-SHIP_TURN_RATE = 4.5  # rad/s (calibrated against G2 90-deg & 180-deg redirects: ~0.40s 90-deg, ~9u U-turn overshoot)
+ANTIPODE_ESCAPE_TANGENT = 0.0  # Replaced by G2 stuck-unit jitter rule (unit_move @0x453ac0)
+SHIP_TURN_RATE = math.pi * 40.0 / 32.0  # Real G2 (unit_move @0x453ac0): 3.92699 rad/s (225 deg/s)
+TURN_ESCALATE_PER_SEC = math.pi * 40.0 / 32.0  # Escalation per second after >1.0s sustained turning
 SHIP_TURN_MIN_SPEED_FACTOR = 1.0  # real G2 ships maintain full 40 u/s speed through turns
+STUCK_DIST_DIVISOR = 15.0  # Real G2 (unit_move @0x453ac0): |x-px|+|y-py| < travel / 15
+STUCK_JITTER_MOD = 48  # Real G2 (unit_move @0x453ac0): (uid + age) % 48 == 0
 _GOLDEN_ANGLE = 2.399963229728653  # pi * (3 - sqrt(5))
 _SPAWN_SPIRAL_STEP = 0.05
 _EPS_DIST2 = 1e-12
@@ -802,12 +805,19 @@ class GalconSim:
         fl_uy: List[List[float]] = []
         fl_uhx: List[List[float]] = []
         fl_uhy: List[List[float]] = []
+        fl_upx: List[List[float]] = []
+        fl_upy: List[List[float]] = []
+        fl_uage: List[List[int]] = []
+        fl_uuid: List[List[int]] = []
+        fl_utr: List[List[float]] = []
+        fl_utc: List[List[float]] = []
         fl_alive: List[List[bool]] = []
         fl_alive_cnt: List[int] = []
         fl_tgt_idx: List[int] = []
         fl_spu: List[float] = []
         fl_owner: List[int] = []
 
+        next_uid = int(getattr(self, "_next_uid", 0))
         for fl in fleets:
             if not fl.units:
                 fl.units = _materialize_fleet_units(fl.x, fl.y, fl.num_units)
@@ -815,15 +825,48 @@ class GalconSim:
             fl.num_units = m
             if fl.unit_headings is None or len(fl.unit_headings) != m:
                 fl.unit_headings = _materialize_unit_headings(fl.units, self.planets.get(fl.target))
-            fl_ux.append([u[0] for u in fl.units])
-            fl_uy.append([u[1] for u in fl.units])
+            ux_l = [u[0] for u in fl.units]
+            uy_l = [u[1] for u in fl.units]
+            fl_ux.append(ux_l)
+            fl_uy.append(uy_l)
             fl_uhx.append([h[0] for h in fl.unit_headings])
             fl_uhy.append([h[1] for h in fl.unit_headings])
+            f_px = getattr(fl, "_u_px", None)
+            f_py = getattr(fl, "_u_py", None)
+            f_age = getattr(fl, "_u_age", None)
+            f_uid = getattr(fl, "_u_uid", None)
+            f_tr = getattr(fl, "_u_tr", None)
+            f_tc = getattr(fl, "_u_tc", None)
+            if (
+                f_px is not None
+                and f_py is not None
+                and f_age is not None
+                and f_uid is not None
+                and f_tr is not None
+                and f_tc is not None
+                and len(f_px) == m
+            ):
+                fl_upx.append(list(f_px))
+                fl_upy.append(list(f_py))
+                fl_uage.append(list(f_age))
+                fl_uuid.append(list(f_uid))
+                fl_utr.append(list(f_tr))
+                fl_utc.append(list(f_tc))
+            else:
+                fl_upx.append(list(ux_l))
+                fl_upy.append(list(uy_l))
+                fl_uage.append([0] * m)
+                uids = list(range(next_uid, next_uid + m))
+                next_uid += m
+                fl_uuid.append(uids)
+                fl_utr.append([turn_rate] * m)
+                fl_utc.append([0.0] * m)
             fl_alive.append([True] * m)
             fl_alive_cnt.append(m)
             fl_tgt_idx.append(id_to_idx.get(fl.target, -1))
             fl_spu.append(fl.ships_per_unit)
             fl_owner.append(fl.owner)
+        self._next_uid = next_uid
 
         owner_tgt_fleets: Dict[Tuple[int, int], List[int]] = {}
         for fi, ti in enumerate(fl_tgt_idx):
@@ -1020,20 +1063,35 @@ class GalconSim:
                 uy = fl_uy[fi]
                 uhx = fl_uhx[fi]
                 uhy = fl_uhy[fi]
+                upx = fl_upx[fi]
+                upy = fl_upy[fi]
+                uage = fl_uage[fi]
+                uuid = fl_uuid[fi]
+                utr = fl_utr[fi]
+                utc = fl_utc[fi]
                 alive = fl_alive[fi]
                 m = len(ux)
                 all_alive = alive_c == m
 
-                # 3. Move toward target with heading turn limit + track exact fleet AABB
+                # 3. G2 stuck-unit jitter + move toward target with heading turn limit + track exact fleet AABB
                 min_x = 1e300
                 max_x = -1e300
                 min_y = 1e300
                 max_y = -1e300
+                stuck_thresh = sub_step_dist / STUCK_DIST_DIVISOR
                 for u in range(m):
                     if not all_alive and not alive[u]:
                         continue
                     x = ux[u]
                     y = uy[u]
+                    age_u = uage[u]
+                    if age_u > 0:
+                        if (abs(x - upx[u]) + abs(y - upy[u]) < stuck_thresh) and ((uuid[u] + age_u) % STUCK_JITTER_MOD == 0):
+                            hseed = ((uuid[u] * 1000003) & 0xFFFFFFFF) ^ ((age_u * 2654435761) & 0xFFFFFFFF)
+                            x += (_spawn_hash_u01((hseed + 1) & 0xFFFFFFFF) * 2.0 - 1.0) * sub_step_dist
+                            y += (_spawn_hash_u01((hseed + 2) & 0xFFFFFFFF) * 2.0 - 1.0) * sub_step_dist
+                    upx[u] = x
+                    upy[u] = y
                     dx = tx - x
                     dy = ty - y
                     dist = _sqrt(dx * dx + dy * dy)
@@ -1043,9 +1101,24 @@ class GalconSim:
                         hx = uhx[u]
                         hy = uhy[u]
                         dot = hx * des_x + hy * des_y
-                        if instant_turn or dot >= cos_max:
+                        u_tr = utr[u]
+                        if u_tr == turn_rate:
+                            u_cos = cos_max
+                            u_sin = sin_max
+                            u_instant = instant_turn
+                        else:
+                            u_max_turn = u_tr * sub_dt
+                            u_instant = u_tr <= 0.0 or u_max_turn >= math.pi
+                            if u_instant:
+                                u_cos = -2.0
+                                u_sin = 0.0
+                            else:
+                                u_cos = _cos(u_max_turn)
+                                u_sin = _sin(u_max_turn)
+                        if u_instant or dot >= u_cos:
                             hx = des_x
                             hy = des_y
+                            utc[u] = 0.0
                             if dist <= sub_step_dist:
                                 x = tx
                                 y = ty
@@ -1055,9 +1128,9 @@ class GalconSim:
                         else:
                             cross = hx * des_y - hy * des_x
                             turn_sign = 1.0 if cross >= 0.0 else -1.0
-                            s_rot = turn_sign * sin_max
-                            nhx = hx * cos_max - hy * s_rot
-                            nhy = hx * s_rot + hy * cos_max
+                            s_rot = turn_sign * u_sin
+                            nhx = hx * u_cos - hy * s_rot
+                            nhy = hx * s_rot + hy * u_cos
                             hn = _sqrt(nhx * nhx + nhy * nhy)
                             if hn > 0.0:
                                 hx = nhx / hn
@@ -1065,6 +1138,10 @@ class GalconSim:
                             else:
                                 hx = des_x
                                 hy = des_y
+                            tc = utc[u] + sub_dt
+                            utc[u] = tc
+                            if tc > 1.0:
+                                utr[u] = u_tr + sub_dt * TURN_ESCALATE_PER_SEC
                             align = hx * des_x + hy * des_y
                             speed_scale = min_speed_factor + (1.0 - min_speed_factor) * (
                                 align if align > 0.0 else 0.0
@@ -1076,6 +1153,7 @@ class GalconSim:
                         uhy[u] = hy
                         ux[u] = x
                         uy[u] = y
+                    uage[u] = age_u + 1
                     if x < min_x:
                         min_x = x
                     if x > max_x:
@@ -1228,40 +1306,70 @@ class GalconSim:
             uy = fl_uy[fi]
             uhx = fl_uhx[fi]
             uhy = fl_uhy[fi]
+            upx = fl_upx[fi]
+            upy = fl_upy[fi]
+            uage = fl_uage[fi]
+            uuid = fl_uuid[fi]
+            utr = fl_utr[fi]
+            utc = fl_utc[fi]
             m = len(ux)
             if alive_c == m:
                 new_ux = ux
                 new_uy = uy
                 new_uhx = uhx
                 new_uhy = uhy
+                new_upx = upx
+                new_upy = upy
+                new_uage = uage
+                new_uuid = uuid
+                new_utr = utr
+                new_utc = utc
             else:
                 alive = fl_alive[fi]
                 new_ux = [ux[u] for u in range(m) if alive[u]]
                 new_uy = [uy[u] for u in range(m) if alive[u]]
                 new_uhx = [uhx[u] for u in range(m) if alive[u]]
                 new_uhy = [uhy[u] for u in range(m) if alive[u]]
+                new_upx = [upx[u] for u in range(m) if alive[u]]
+                new_upy = [upy[u] for u in range(m) if alive[u]]
+                new_uage = [uage[u] for u in range(m) if alive[u]]
+                new_uuid = [uuid[u] for u in range(m) if alive[u]]
+                new_utr = [utr[u] for u in range(m) if alive[u]]
+                new_utc = [utc[u] for u in range(m) if alive[u]]
             kept = len(new_ux)
             sum_x = 0.0
             sum_y = 0.0
+            min_x = 1e300
+            max_x = -1e300
+            min_y = 1e300
+            max_y = -1e300
             for u in range(kept):
-                sum_x += new_ux[u]
-                sum_y += new_uy[u]
-            cx = sum_x / float(kept)
-            cy = sum_y / float(kept)
-            max_d2 = 0.0
-            for u in range(kept):
-                ddx = new_ux[u] - cx
-                ddy = new_uy[u] - cy
-                dd2 = ddx * ddx + ddy * ddy
-                if dd2 > max_d2:
-                    max_d2 = dd2
+                xu = new_ux[u]
+                yu = new_uy[u]
+                sum_x += xu
+                sum_y += yu
+                if xu < min_x:
+                    min_x = xu
+                if xu > max_x:
+                    max_x = xu
+                if yu < min_y:
+                    min_y = yu
+                if yu > max_y:
+                    max_y = yu
             fl.units = [[new_ux[u], new_uy[u]] for u in range(kept)]
             fl.unit_headings = [[new_uhx[u], new_uhy[u]] for u in range(kept)]
+            if hasattr(fl, "__dict__"):
+                fl._u_px = new_upx
+                fl._u_py = new_upy
+                fl._u_age = new_uage
+                fl._u_uid = new_uuid
+                fl._u_tr = new_utr
+                fl._u_tc = new_utc
             fl.num_units = kept
             fl.ships = float(kept) * fl_spu[fi]
-            fl.x = cx
-            fl.y = cy
-            fl.radius = _sqrt(max_d2) + ship_radius
+            fl.x = sum_x / float(kept)
+            fl.y = sum_y / float(kept)
+            fl.radius = (((max_x - min_x) + (max_y - min_y)) / 5.0) if kept > 1 else 0.0
 
     def _spawn_and_settle_flock(
         self,
@@ -1410,14 +1518,11 @@ class GalconSim:
                 unit_headings.append([hx0, hy0])
         cx = sum_x / float(parts)
         cy = sum_y / float(parts)
-        max_d2 = 0.0
-        for j in range(parts):
-            ddx = ux[j] - cx
-            ddy = uy[j] - cy
-            dd2 = ddx * ddx + ddy * ddy
-            if dd2 > max_d2:
-                max_d2 = dd2
-        fl_radius = _sqrt(max_d2) + ship_radius
+        min_x = min(ux)
+        max_x = max(ux)
+        min_y = min(uy)
+        max_y = max(uy)
+        fl_radius = (((max_x - min_x) + (max_y - min_y)) / 5.0) if parts > 1 else 0.0
         return units, unit_headings, cx, cy, fl_radius
 
     def step(self, orders_by_player: Dict[int, Sequence[Order]]) -> None:
@@ -1458,7 +1563,7 @@ class GalconSim:
                     if parts == 1:
                         units = [[sx, sy]]
                         unit_headings = [[hx0, hy0]]
-                        cx, cy, fl_radius = sx, sy, SHIP_RADIUS
+                        cx, cy, fl_radius = sx, sy, 0.0
                     else:
                         units, unit_headings, cx, cy, fl_radius = self._spawn_and_settle_flock(
                             fid, parts, sx, sy, dst, hx0, hy0

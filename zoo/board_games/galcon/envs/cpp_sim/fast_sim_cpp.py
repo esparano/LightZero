@@ -37,8 +37,8 @@ _SHIP_SEP_MAX_DISP = 6.0
 _SPAWN_AREA_RADIUS = 6.0
 _SPAWN_SETTLE_ITERS = 0
 _SPAWN_SETTLE_TOL = 0.05
-_ANTIPODE_ESCAPE_TANGENT = 0.05
-_SHIP_TURN_RATE = 4.5
+_ANTIPODE_ESCAPE_TANGENT = 0.0
+_SHIP_TURN_RATE = math.pi * 40.0 / 32.0  # Real G2 (unit_move @0x453ac0): 3.92699 rad/s (225 deg/s)
 _SHIP_TURN_MIN_SPEED_FACTOR = 1.0
 _SEP_MODE_PER_SHIP_CAP = 1
 _GOLDEN_ANGLE = 2.399963229728653
@@ -180,7 +180,7 @@ def _load_or_build_lib() -> Optional[ctypes.CDLL]:
         lib.step_physics_cpp.argtypes = [
             _C_I32, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP,
             _C_I32, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP,
-            _C_I32, _C_VP, _C_VP, _C_VP, _C_VP,
+            _C_I32, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP,
             _C_F64, _C_F64, _C_I32, _C_F64, _C_F64, _C_F64, _C_I32, _C_F64, _C_F64, _C_F64, _C_F64,
         ]
         lib.step_physics_cpp.restype = _C_I32
@@ -372,10 +372,22 @@ class _PhysicsScratch:
         self.uy = (ctypes.c_double * cap)()
         self.uhx = (ctypes.c_double * cap)()
         self.uhy = (ctypes.c_double * cap)()
+        self.u_px = (ctypes.c_double * cap)()
+        self.u_py = (ctypes.c_double * cap)()
+        self.u_age = (ctypes.c_int32 * cap)()
+        self.u_uid = (ctypes.c_int32 * cap)()
+        self.u_tr = (ctypes.c_double * cap)()
+        self.u_tc = (ctypes.c_double * cap)()
         self.ptr_ux = ctypes.addressof(self.ux)
         self.ptr_uy = ctypes.addressof(self.uy)
         self.ptr_uhx = ctypes.addressof(self.uhx)
         self.ptr_uhy = ctypes.addressof(self.uhy)
+        self.ptr_u_px = ctypes.addressof(self.u_px)
+        self.ptr_u_py = ctypes.addressof(self.u_py)
+        self.ptr_u_age = ctypes.addressof(self.u_age)
+        self.ptr_u_uid = ctypes.addressof(self.u_uid)
+        self.ptr_u_tr = ctypes.addressof(self.u_tr)
+        self.ptr_u_tc = ctypes.addressof(self.u_tc)
 
     def _alloc_orders(self, cap: int) -> None:
         self.ord_cap = cap
@@ -475,6 +487,12 @@ def step_physics_cpp(sim: "GalconSim") -> None:
             sc.ptr_uy,
             sc.ptr_uhx,
             sc.ptr_uhy,
+            sc.ptr_u_px,
+            sc.ptr_u_py,
+            sc.ptr_u_age,
+            sc.ptr_u_uid,
+            sc.ptr_u_tr,
+            sc.ptr_u_tc,
             sim.tick_dt,
             sim.fleet_speed,
             substeps,
@@ -518,7 +536,14 @@ def step_physics_cpp(sim: "GalconSim") -> None:
     uy = sc.uy
     uhx = sc.uhx
     uhy = sc.uhy
+    u_px = sc.u_px
+    u_py = sc.u_py
+    u_age = sc.u_age
+    u_uid = sc.u_uid
+    u_tr = sc.u_tr
+    u_tc = sc.u_tc
 
+    next_uid = int(getattr(sim, "_next_uid", 0))
     pos = 0
     for fi, fl in enumerate(fleets):
         units = fl.units
@@ -529,12 +554,52 @@ def step_physics_cpp(sim: "GalconSim") -> None:
         fl_spu[fi] = fl.ships / (m if m > 1 else 1)
         fl_start[fi] = pos
         fl_cnt[fi] = m
-        for u, h in zip(units, headings):
-            ux[pos] = u[0]
-            uy[pos] = u[1]
-            uhx[pos] = h[0]
-            uhy[pos] = h[1]
-            pos += 1
+        f_px = getattr(fl, "_u_px", None)
+        f_py = getattr(fl, "_u_py", None)
+        f_age = getattr(fl, "_u_age", None)
+        f_uid = getattr(fl, "_u_uid", None)
+        f_tr = getattr(fl, "_u_tr", None)
+        f_tc = getattr(fl, "_u_tc", None)
+        has_meta = (
+            f_px is not None
+            and f_py is not None
+            and f_age is not None
+            and f_uid is not None
+            and f_tr is not None
+            and f_tc is not None
+            and len(f_px) == m
+        )
+        if has_meta:
+            for j in range(m):
+                u = units[j]
+                h = headings[j]
+                ux[pos] = u[0]
+                uy[pos] = u[1]
+                uhx[pos] = h[0]
+                uhy[pos] = h[1]
+                u_px[pos] = f_px[j]
+                u_py[pos] = f_py[j]
+                u_age[pos] = f_age[j]
+                u_uid[pos] = f_uid[j]
+                u_tr[pos] = f_tr[j]
+                u_tc[pos] = f_tc[j]
+                pos += 1
+        else:
+            for u, h in zip(units, headings):
+                ux[pos] = u[0]
+                uy[pos] = u[1]
+                uhx[pos] = h[0]
+                uhy[pos] = h[1]
+                u_px[pos] = u[0]
+                u_py[pos] = u[1]
+                u_age[pos] = 0
+                u_uid[pos] = next_uid
+                next_uid += 1
+                u_tr[pos] = _SHIP_TURN_RATE
+                u_tc[pos] = 0.0
+                pos += 1
+    if hasattr(sim, "__dict__"):
+        sim._next_uid = next_uid
 
     fn(
         n_planets,
@@ -559,6 +624,12 @@ def step_physics_cpp(sim: "GalconSim") -> None:
         sc.ptr_uy,
         sc.ptr_uhx,
         sc.ptr_uhy,
+        sc.ptr_u_px,
+        sc.ptr_u_py,
+        sc.ptr_u_age,
+        sc.ptr_u_uid,
+        sc.ptr_u_tr,
+        sc.ptr_u_tc,
         sim.tick_dt,
         sim.fleet_speed,
         substeps,
@@ -589,6 +660,13 @@ def step_physics_cpp(sim: "GalconSim") -> None:
             end = st + kept
             fl.units = list(map(list, zip(ux[st:end], uy[st:end])))
             fl.unit_headings = list(map(list, zip(uhx[st:end], uhy[st:end])))
+            if hasattr(fl, "__dict__"):
+                fl._u_px = list(u_px[st:end])
+                fl._u_py = list(u_py[st:end])
+                fl._u_age = list(u_age[st:end])
+                fl._u_uid = list(u_uid[st:end])
+                fl._u_tr = list(u_tr[st:end])
+                fl._u_tc = list(u_tc[st:end])
             fl.num_units = kept
             fl.ships = fl_ships[fi]
             fl.x = fl_cx[fi]

@@ -1304,3 +1304,94 @@ class TestGalconEnv:
 
         env.close()
 
+    def test_g2_stuck_jitter_turn_rate_and_fleet_r(self) -> None:
+        """Verify G2 stuck-unit jitter escapes tight <12px gaps, G2 turn rate (pi/32*40 = 3.927 rad/s),
+        and G2 fleet_r = ((max_x - min_x) + (max_y - min_y)) / 5.0 with C++/Python bit-exact parity.
+        """
+        from zoo.board_games.galcon.envs.cpp_sim import FastGalconCppSim, GalconSim, HAS_FAST_SIM_CPP, RedirOrder, SendOrder
+        from zoo.board_games.galcon.envs.cpp_sim.sim import Planet as SimPlanet
+
+        # 1. Tight 8px gap trap: two neutral obstacles at y = +/- 28 with radius 24 -> 8px surface gap (< 12px unit diameter)
+        def make_gap_world():
+            return [
+                SimPlanet(id=0, owner=1, ships=50.0, x=80.0, y=160.0, production=100.0, radius=24.0),
+                SimPlanet(id=1, owner=2, ships=500.0, x=320.0, y=160.0, production=100.0, radius=24.0),
+                SimPlanet(id=2, owner=0, ships=100.0, x=200.0, y=132.0, production=100.0, radius=24.0),
+                SimPlanet(id=3, owner=0, ships=100.0, x=200.0, y=188.0, production=100.0, radius=24.0),
+            ]
+
+        sim_py = GalconSim(planets=make_gap_world(), use_cpp=False)
+        sim_py.step({1: [SendOrder(0, 1, 100)]})
+        # Check G2 fleet_r formula on spawn
+        fl_spawn = next(iter(sim_py.fleets.values()))
+        xs = [u[0] for u in fl_spawn.units]
+        ys = [u[1] for u in fl_spawn.units]
+        assert fl_spawn.radius == pytest.approx(((max(xs) - min(xs)) + (max(ys) - min(ys))) / 5.0, abs=1e-12)
+        ticks_used = 0
+        for _ in range(120):
+            sim_py.step({})
+            ticks_used += 1
+            if not sim_py.fleets:
+                break
+        assert len(sim_py.fleets) == 0, "Fleet should escape tight 8px gap via G2 stuck-unit jitter and land"
+
+        if HAS_FAST_SIM_CPP:
+            sim_cpp = GalconSim(planets=make_gap_world(), use_cpp=True)
+            sim_cpp.step({1: [SendOrder(0, 1, 100)]})
+            for _ in range(ticks_used):
+                sim_cpp.step({})
+            assert len(sim_cpp.fleets) == 0
+            assert sim_cpp.planets[1].ships == pytest.approx(sim_py.planets[1].ships, abs=1e-12)
+
+            fast = FastGalconCppSim.from_sim(GalconSim(planets=make_gap_world(), use_cpp=True))
+            try:
+                fast.step({1: [SendOrder(0, 1, 100)]})
+                for _ in range(ticks_used):
+                    fast.step({})
+                out = fast.to_sim()
+                assert len(out.fleets) == 0
+                assert out.planets[1].ships == pytest.approx(sim_py.planets[1].ships, abs=1e-12)
+            finally:
+                fast.close()
+
+        # 2. G2 180-deg redirect turn rate (~3.927 rad/s -> ~0.80s U-turn with ~9.8u overshoot) + single-unit fleet_r == 0.0
+        def make_redir_world():
+            return [
+                SimPlanet(id=0, owner=1, ships=1.0, x=100.0, y=160.0, production=0.0, radius=12.0),
+                SimPlanet(id=1, owner=2, ships=100.0, x=400.0, y=160.0, production=0.0, radius=12.0),
+            ]
+
+        r_py = GalconSim(planets=make_redir_world(), use_cpp=False, allow_redirect=True, tick_dt=0.05, physics_substeps=1)
+        r_py.step({1: [SendOrder(0, 1, 100)]})
+        fid = next(iter(r_py.fleets.keys()))
+        assert r_py.fleets[fid].radius == 0.0
+        for _ in range(20):
+            r_py.step({})
+        x_before = r_py.fleets[fid].x
+        r_py.step({1: [RedirOrder(fid, 0)]})
+        max_x = x_before
+        align_ticks = 0
+        for k in range(1, 30):
+            fl = r_py.fleets[fid]
+            if fl.x > max_x:
+                max_x = fl.x
+            if fl.unit_headings[0][0] <= -0.999 and align_ticks == 0:
+                align_ticks = k
+                break
+            r_py.step({})
+        overshoot = max_x - x_before
+        assert 15 <= align_ticks <= 17, f"Expected ~16 substeps (0.80s) for 180-deg G2 U-turn, got {align_ticks}"
+        assert 8.5 <= overshoot <= 11.5, f"Expected ~9.8u overshoot on 180-deg G2 U-turn, got {overshoot:.2f}"
+
+        if HAS_FAST_SIM_CPP:
+            r_cpp = GalconSim(planets=make_redir_world(), use_cpp=True, allow_redirect=True, tick_dt=0.05, physics_substeps=1)
+            r_cpp.step({1: [SendOrder(0, 1, 100)]})
+            fid_c = next(iter(r_cpp.fleets.keys()))
+            for _ in range(20):
+                r_cpp.step({})
+            r_cpp.step({1: [RedirOrder(fid_c, 0)]})
+            for _ in range(align_ticks - 1):
+                r_cpp.step({})
+            assert r_cpp.fleets[fid_c].units[0] == r_py.fleets[fid].units[0]
+            assert r_cpp.fleets[fid_c].unit_headings[0] == r_py.fleets[fid].unit_headings[0]
+
