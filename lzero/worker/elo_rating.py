@@ -603,7 +603,7 @@ class EloLadder:
             rest = [p for p in pool if p.player_id not in chosen_ids]
             if rest:
                 anchor_entry = next((p for p in rest if p.player_id == self.anchor_id), None)
-                if anchor_entry is not None and abs(ref_elo - self.anchor_elo) <= 600.0:
+                if anchor_entry is not None and (ref_elo - self.anchor_elo) <= 600.0:
                     _add(anchor_entry)
                 else:
                     target_cal_elo = ref_elo - 250.0

@@ -331,3 +331,14 @@ def test_unregularized_sweep_preserves_finite_std_for_non_sweeping_players():
     assert 50.0 < est['normal'].elo_std < 300.0
 
 
+@pytest.mark.unittest
+def test_select_opponents_keeps_anchor_when_candidate_below_minus_600():
+    ladder = EloLadder(anchor_bots=('random', 'expand', 'sparky', 'waffleopt'), max_ladder_size=10, opponents_per_eval=3)
+    ladder.register_player(PlayerEntry(player_id='iter_0', kind='checkpoint', active=True))
+    for opp in ('bot:random', 'bot:expand', 'bot:sparky', 'bot:waffleopt'):
+        ladder.record_match('iter_0', opp, wins_a=0, draws=0, losses_a=2)
+    ladder.fit_ratings()
+    ladder.last_candidate_elo = -700.0
+    opps = {p.player_id for p in ladder.select_opponents()}
+    assert 'iter_0' in opps
+    assert 'bot:random' in opps
