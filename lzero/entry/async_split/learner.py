@@ -350,7 +350,9 @@ class AsyncLearner:
         self.persist_replay_buffer = bool(persist_replay_buffer)
 
         if not self.resume and not self.overwrite:
-            existing_artifacts = detect_existing_run_artifacts(self.dirs)
+            # Exclude log/evaluator/ so a concurrently spawned CPU evaluator creating its
+            # event file before a CUDA learner finishes importing does not falsely trip the guard.
+            existing_artifacts = detect_existing_run_artifacts(self.dirs, include_evaluator_logs=False)
             if existing_artifacts:
                 summary = ', '.join(existing_artifacts)
                 raise FileExistsError(

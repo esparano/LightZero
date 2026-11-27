@@ -217,7 +217,10 @@ def find_latest_checkpoint(ckpt_dir: os.PathLike | str) -> Optional[Path]:
     return best_path
 
 
-def detect_existing_run_artifacts(dirs: AsyncSplitDirs) -> List[str]:
+def detect_existing_run_artifacts(
+    dirs: AsyncSplitDirs,
+    include_evaluator_logs: bool = True,
+) -> List[str]:
     """Return descriptions of existing run artifacts that would be overwritten or
     mixed with TensorBoard history if starting a fresh run without ``--resume``.
     """
@@ -239,7 +242,8 @@ def detect_existing_run_artifacts(dirs: AsyncSplitDirs) -> List[str]:
             preview = ', '.join(ckpt_files[:3])
             suffix = f' (+{len(ckpt_files) - 3} more)' if len(ckpt_files) > 3 else ''
             found.append(f'ckpt/{preview}{suffix}')
-    for sub in ('learner', 'evaluator'):
+    log_subdirs = ('learner', 'evaluator') if include_evaluator_logs else ('learner',)
+    for sub in log_subdirs:
         sub_dir = dirs.log_dir / sub
         if sub_dir.is_dir():
             tb_events = [p for p in sub_dir.iterdir() if p.is_file() and p.name.startswith('events.out.tfevents.')]

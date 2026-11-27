@@ -73,6 +73,12 @@ def test_find_latest_checkpoint_numeric_order_and_detect_artifacts(tmp_path):
     assert detect_existing_run_artifacts(dirs) == []
     assert find_latest_checkpoint(dirs.ckpt_dir) is None
 
+    # Sibling evaluator creating its empty event file first must NOT block fresh learner startup
+    (dirs.log_dir / 'evaluator').mkdir(parents=True, exist_ok=True)
+    (dirs.log_dir / 'evaluator' / 'events.out.tfevents.12345').write_bytes(b'')
+    assert detect_existing_run_artifacts(dirs, include_evaluator_logs=False) == []
+    assert len(detect_existing_run_artifacts(dirs, include_evaluator_logs=True)) == 1
+
     # Create checkpoints where lexicographical order != numeric order
     for name in (
         'iteration_9000.pth.tar',
