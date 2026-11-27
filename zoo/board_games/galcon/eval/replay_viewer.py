@@ -43,6 +43,14 @@ from zoo.board_games.galcon.envs.cpp_sim import (
 from zoo.board_games.galcon.envs.galcon_env import GalconEnv
 
 TEMPLATE_PATH = Path(__file__).with_name("replay_viewer_template.html")
+BUNDLED_ASSETS_DIR = Path(__file__).with_name("assets")
+
+BUNDLED_SHIP_SKINS: Tuple[Tuple[str, str, str], ...] = (
+    ("classic", "Classic Hollow", "ship-classic.png"),
+    ("solid", "Solid Dart", "ship-solid.png"),
+    ("chevron", "Chevron", "ship-chevron.png"),
+    ("triforce", "Triforce", "ship-triforce.png"),
+)
 
 G2_SHIP_SKINS: Tuple[Tuple[str, str, str], ...] = (
     ("classic", "G2 Classic (ship-0)", "ship-0.png"),
@@ -67,7 +75,8 @@ def find_g2_data_dir(explicit_dir: Optional[str | os.PathLike] = None) -> Option
     env_dir = os.environ.get("GALCON2_DATA_DIR")
     if env_dir:
         candidates.append(Path(env_dir))
-    candidates.extend(DEFAULT_G2_DATA_DIRS)
+    if explicit_dir is None and not env_dir:
+        candidates.extend(DEFAULT_G2_DATA_DIRS)
     for path in candidates:
         try:
             if (path / "ship-0.png").is_file():
@@ -132,35 +141,64 @@ def _alpha_key_g2_color_fx(png_path: Path) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def load_g2_sprites(g2_data_dir: Optional[str | os.PathLike] = None) -> Dict[str, Dict[str, Any]]:
-    """Load real Galcon 2 ship and spark sprites if available; otherwise return empty dicts."""
-    root = find_g2_data_dir(g2_data_dir)
-    if root is None:
-        return {"ships": {}, "fx": {}}
+def load_g2_sprites(
+    g2_data_dir: Optional[str | os.PathLike] = None,
+    use_bundled: bool = True,
+) -> Dict[str, Dict[str, Any]]:
+    """Load ship and spark sprites for the HTML replay viewer.
 
+    Uses the repo-bundled original sprites in ``zoo/board_games/galcon/eval/assets/`` by default
+    so replays render identically on every machine without copyrighted external assets. If
+    ``g2_data_dir`` (or ``GALCON2_DATA_DIR``) is explicitly provided and contains ``ship-0.png``,
+    those local sprites override the bundled ones.
+    """
     try:
         import PIL  # noqa: F401
     except ImportError:
         return {"ships": {}, "fx": {}}
 
-    assets: Dict[str, Dict[str, Any]] = {"ships": {}, "fx": {}}
-    for key, label, fname in G2_SHIP_SKINS:
-        fpath = root / fname
-        if fpath.is_file():
-            assets["ships"][key] = {
-                "label": label,
-                "file": fname,
-                "p1": _tint_g2_sprite(fpath, (74, 158, 255)),
-                "p2": _tint_g2_sprite(fpath, (255, 92, 92)),
-            }
+    explicit_g2 = g2_data_dir is not None or bool(os.environ.get("GALCON2_DATA_DIR"))
+    if explicit_g2:
+        g2_root = find_g2_data_dir(g2_data_dir)
+        if g2_root is not None:
+            assets: Dict[str, Dict[str, Any]] = {"ships": {}, "fx": {}}
+            for key, label, fname in G2_SHIP_SKINS:
+                fpath = g2_root / fname
+                if fpath.is_file():
+                    assets["ships"][key] = {
+                        "label": label,
+                        "file": fname,
+                        "p1": _tint_g2_sprite(fpath, (74, 158, 255)),
+                        "p2": _tint_g2_sprite(fpath, (255, 92, 92)),
+                    }
+            spark_path = g2_root / "spark.png"
+            spark_glow_path = g2_root / "spark-1.png"
+            if spark_path.is_file():
+                assets["fx"]["spark_hostile"] = _alpha_key_g2_color_fx(spark_path)
+            if spark_glow_path.is_file():
+                assets["fx"]["spark_glow"] = _alpha_key_g2_color_fx(spark_glow_path)
+            return assets
 
-    spark_path = root / "spark.png"
-    spark_glow_path = root / "spark-1.png"
-    if spark_path.is_file():
-        assets["fx"]["spark_hostile"] = _alpha_key_g2_color_fx(spark_path)
-    if spark_glow_path.is_file():
-        assets["fx"]["spark_glow"] = _alpha_key_g2_color_fx(spark_glow_path)
-    return assets
+    if use_bundled and (BUNDLED_ASSETS_DIR / "ship-classic.png").is_file():
+        assets = {"ships": {}, "fx": {}}
+        for key, label, fname in BUNDLED_SHIP_SKINS:
+            fpath = BUNDLED_ASSETS_DIR / fname
+            if fpath.is_file():
+                assets["ships"][key] = {
+                    "label": label,
+                    "file": fname,
+                    "p1": _tint_g2_sprite(fpath, (74, 158, 255)),
+                    "p2": _tint_g2_sprite(fpath, (255, 92, 92)),
+                }
+        spark_path = BUNDLED_ASSETS_DIR / "spark.png"
+        spark_glow_path = BUNDLED_ASSETS_DIR / "spark-glow.png"
+        if spark_path.is_file():
+            assets["fx"]["spark_hostile"] = _alpha_key_g2_color_fx(spark_path)
+        if spark_glow_path.is_file():
+            assets["fx"]["spark_glow"] = _alpha_key_g2_color_fx(spark_glow_path)
+        return assets
+
+    return {"ships": {}, "fx": {}}
 
 
 def _find_landed_units(

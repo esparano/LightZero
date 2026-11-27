@@ -8,6 +8,8 @@ import pytest
 
 from zoo.board_games.galcon.envs.galcon_env import GalconEnv
 from zoo.board_games.galcon.eval.replay_viewer import (
+    BUNDLED_ASSETS_DIR,
+    load_g2_sprites,
     record_match_20hz,
     render_replay_html,
 )
@@ -120,8 +122,22 @@ def test_immediate_planet_drop_and_hostile_vs_friendly_hits():
     assert len(friendly_hits) > 0, "Expected friendly reinforcement impact events (hostile=0) after P3 capture"
 
 
-def test_render_replay_html_embeds_replays_and_handles_missing_g2_dir(tmp_path):
-    """render_replay_html produces self-contained HTML with no unresolved placeholders even without G2 installed."""
+def test_bundled_original_sprites_load_by_default():
+    """Repo-bundled original ship and spark PNG sprites exist and encode into RGBA data URIs."""
+    for fname in ("ship-classic.png", "ship-solid.png", "ship-chevron.png", "ship-triforce.png", "spark.png", "spark-glow.png"):
+        assert (BUNDLED_ASSETS_DIR / fname).is_file(), f"Missing bundled asset {fname}"
+
+    sprites = load_g2_sprites()
+    assert set(sprites["ships"].keys()) == {"classic", "solid", "chevron", "triforce"}
+    for skin in sprites["ships"].values():
+        assert skin["p1"].startswith("data:image/png;base64,")
+        assert skin["p2"].startswith("data:image/png;base64,")
+    assert sprites["fx"]["spark_hostile"].startswith("data:image/png;base64,")
+    assert sprites["fx"]["spark_glow"].startswith("data:image/png;base64,")
+
+
+def test_render_replay_html_embeds_replays_and_bundled_sprites(tmp_path):
+    """render_replay_html embeds replay JSON and bundled original sprites with no unresolved placeholders."""
     env_cfg = _base_env_cfg(max_steps=6)
     p1 = _ScriptedPlayer("p1", [(0, 3)])
     p2 = _ScriptedPlayer("p2", [(1, 2)])
@@ -130,6 +146,7 @@ def test_render_replay_html_embeds_replays_and_handles_missing_g2_dir(tmp_path):
     html = render_replay_html([rec], g2_data_dir=tmp_path / "nonexistent_g2")
     assert "/*__REPLAY_DATA__*/[]" not in html
     assert "/*__G2_SPRITES__*/{ ships: {}, fx: {} }" not in html
+    assert "data:image/png;base64," in html
     assert "Unit Test Match" in html
     assert "bakeSmoothedVelocityAngles" in html
     assert "if (hit[3] !== 1) continue;" in html
