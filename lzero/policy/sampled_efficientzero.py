@@ -319,6 +319,31 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         else:
             raise ValueError("model type {} is not supported".format(self._cfg.model.model_type))
 
+    def _init_scalar_transforms(self) -> None:
+        """
+        Overview:
+            Initialize discrete value/reward supports and inverse scalar transform handles.
+            Called by ``_init_learn``, ``_init_collect``, and ``_init_eval`` so collect-only
+            and eval-only policies do not require ``learn`` in ``enable_field``.
+        """
+        if (
+            hasattr(self, 'value_support')
+            and hasattr(self, 'reward_support')
+            and hasattr(self, 'value_inverse_scalar_transform_handle')
+            and hasattr(self, 'reward_inverse_scalar_transform_handle')
+        ):
+            return
+        self.value_support = DiscreteSupport(*self._cfg.model.value_support_range, self._cfg.device)
+        self.reward_support = DiscreteSupport(*self._cfg.model.reward_support_range, self._cfg.device)
+        assert self.value_support.size == self._model.value_support_size          # if these assertions fails, somebody introduced...
+        assert self.reward_support.size == self._model.reward_support_size        # ...incoherence between policy and model
+        self.value_inverse_scalar_transform_handle = InverseScalarTransform(
+            self.value_support, self._cfg.model.categorical_distribution
+        )
+        self.reward_inverse_scalar_transform_handle = InverseScalarTransform(
+            self.reward_support, self._cfg.model.categorical_distribution
+        )
+
     def _init_learn(self) -> None:
         """
         Overview:
@@ -384,12 +409,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                 self._cfg.augmentation,
                 image_shape=(self._cfg.model.observation_shape[1], self._cfg.model.observation_shape[2])
             )
-        self.value_support = DiscreteSupport(*self._cfg.model.value_support_range, self._cfg.device)
-        self.reward_support = DiscreteSupport(*self._cfg.model.reward_support_range, self._cfg.device)
-        assert self.value_support.size == self._learn_model.value_support_size          # if these assertions fails, somebody introduced...
-        assert self.reward_support.size == self._learn_model.reward_support_size        # ...incoherence between policy and model
-        self.value_inverse_scalar_transform_handle = InverseScalarTransform(self.value_support, self._cfg.model.categorical_distribution)
-        self.reward_inverse_scalar_transform_handle = InverseScalarTransform(self.reward_support, self._cfg.model.categorical_distribution)
+        self._init_scalar_transforms()
 
     def _forward_learn(self, data: torch.Tensor) -> Dict[str, Union[float, int]]:
         # torch.autograd.set_detect_anomaly(True)
@@ -905,6 +925,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
               Collect mode init method. Called by ``self.__init__``. Initialize the collect model and MCTS utils.
           """
         self._validate_policy_target_type()
+        self._init_scalar_transforms()
         self._collect_model = self._model
         if self._cfg.mcts_ctree:
             self._mcts_collect = MCTSCtree(self._cfg)
@@ -1072,6 +1093,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
              Evaluate mode init method. Called by ``self.__init__``. Initialize the eval model and MCTS utils.
          """
         self._validate_policy_target_type()
+        self._init_scalar_transforms()
         self._eval_model = self._model
         if self._cfg.mcts_ctree:
             self._mcts_eval = MCTSCtree(self._cfg)

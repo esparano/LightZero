@@ -103,8 +103,7 @@ class SelfPlayActor:
         )
         self.collector_env.seed(self.cfg.seed)
 
-        # SampledEfficientZeroPolicy initializes value_inverse_scalar_transform_handle in _init_learn.
-        self.policy = create_policy(self.cfg.policy, model=None, enable_field=['learn', 'collect'])
+        self.policy = create_policy(self.cfg.policy, model=None, enable_field=['collect'])
         self.tb_logger = (
             SummaryWriter(str(self.dirs.log_dir / f'actor_{self.actor_id}')) if enable_tb else None
         )

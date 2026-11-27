@@ -107,9 +107,13 @@ class AsyncEvaluator:
         )
         self.evaluator_env.seed(self.cfg.seed, dynamic_seed=False)
 
-        # SampledEfficientZeroPolicy initializes value_inverse_scalar_transform_handle in _init_learn.
-        self.policy = create_policy(self.cfg.policy, model=None, enable_field=['learn', 'eval'])
-        self.tb_logger = SummaryWriter(str(self.dirs.log_dir / 'evaluator'))
+        self.policy = create_policy(self.cfg.policy, model=None, enable_field=['eval'])
+        # Sub-second suffix prevents tensorboardX (1s timestamp resolution) from truncating
+        # a prior session's event file on fast restarts before _restore_evaluator_state reads it.
+        self.tb_logger = SummaryWriter(
+            str(self.dirs.log_dir / 'evaluator'),
+            filename_suffix=f'.{time.time_ns() % 1_000_000_000:09d}.{os.getpid()}',
+        )
         self.evaluator = Evaluator(
             eval_freq=self.cfg.policy.eval_freq,
             n_evaluator_episode=self.cfg.env.n_evaluator_episode,
