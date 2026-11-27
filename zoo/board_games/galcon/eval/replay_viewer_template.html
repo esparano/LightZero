@@ -1,0 +1,1192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Galcon C++17 Replays — 20 Hz Instant Counts + G2 Ships &amp; Explosions</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    canvas { display: block; }
+    .tab-active {
+      border-color: var(--primary, #3b82f6);
+      background: color-mix(in srgb, var(--primary, #3b82f6) 14%, var(--card, #111827));
+    }
+    .seg-active {
+      background: var(--primary, #3b82f6);
+      color: var(--primary-foreground, #ffffff);
+      border-color: var(--primary, #3b82f6);
+    }
+    input[type="range"] {
+      accent-color: var(--primary, #3b82f6);
+    }
+  </style>
+</head>
+<body class="bg-[var(--background,#0b0f19)] text-[var(--foreground,#e2e8f0)] antialiased min-h-screen">
+  <div class="max-w-7xl mx-auto p-4 md:p-5 space-y-4">
+    <!-- Header -->
+    <div class="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-[var(--border,#1e293b)]">
+      <div>
+        <div class="flex flex-wrap items-center gap-2">
+          <h1 class="text-lg font-semibold tracking-tight text-[var(--foreground,#e2e8f0)]">
+            Galcon C++17 Multi-Ship Simulator Replays
+          </h1>
+          <span id="headerBadge" class="px-2 py-0.5 text-xs font-mono rounded-full bg-[var(--secondary,#1e293b)] text-[var(--secondary-foreground,#cbd5e1)] border border-[var(--border,#334155)]">
+            20 Hz Exact Physics • Real G2 Ships &amp; Sparks
+          </span>
+        </div>
+        <p class="text-xs text-[var(--muted-foreground,#94a3b8)] mt-0.5">
+          Exact 20 Hz C++ substeps (0.05s) — immediate planet ship counts on every launch &amp; impact, smoothed velocity-based ship rotation, dotted send lines, and hostile-only G2 spark explosions
+        </p>
+      </div>
+
+      <!-- Mode Switch + Skin Picker -->
+      <div class="flex flex-wrap items-center gap-2 text-xs">
+        <div class="inline-flex rounded-lg border border-[var(--border,#334155)] bg-[var(--card,#111827)] p-0.5">
+          <button id="modeFull" class="px-2.5 py-1 rounded-md font-medium transition seg-active">
+            20 Hz Full View
+          </button>
+          <button id="modeCompare" class="px-2.5 py-1 rounded-md font-medium transition text-[var(--muted-foreground,#94a3b8)] hover:text-[var(--foreground,#e2e8f0)]">
+            Before (4 Hz) vs After (20 Hz)
+          </button>
+        </div>
+
+        <label class="flex items-center gap-1.5 text-[var(--muted-foreground,#94a3b8)]">
+          <span>G2 Ship</span>
+          <select id="skinSelect" class="px-2 py-1 rounded-lg bg-[var(--card,#111827)] text-[var(--foreground,#e2e8f0)] border border-[var(--border,#334155)] text-xs font-mono">
+            <option value="classic" selected>Classic (ship-0)</option>
+            <option value="solid">Solid (ship-1)</option>
+            <option value="chevron">Chevron (ship-7)</option>
+            <option value="triforce">Triforce (ship-4)</option>
+          </select>
+        </label>
+      </div>
+    </div>
+
+    <!-- Match Selector Tabs -->
+    <div id="matchTabs" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2"></div>
+
+    <!-- Main Viewer Card -->
+    <div class="bg-[var(--card,#111827)] border border-[var(--border,#1e293b)] rounded-xl overflow-hidden shadow-sm">
+      <!-- Scoreboard HUD -->
+      <div class="px-4 py-2.5 border-b border-[var(--border,#1e293b)] flex flex-wrap items-center justify-between gap-2 text-xs">
+        <div class="flex items-center gap-2 min-w-0">
+          <span class="w-2.5 h-2.5 rounded-full shrink-0" style="background:#4A9EFF"></span>
+          <span id="hudP1Name" class="font-semibold truncate text-[var(--foreground,#e2e8f0)]">P1</span>
+          <span id="hudP1Stats" class="font-mono tabular-nums text-[var(--muted-foreground,#94a3b8)]"></span>
+        </div>
+        <div class="flex items-center gap-2 font-mono tabular-nums text-[var(--foreground,#e2e8f0)] font-medium">
+          <span id="hudStep">Step 0 / 100</span>
+          <span class="text-[var(--muted-foreground,#94a3b8)]">•</span>
+          <span id="hudTime">0.00s</span>
+          <span id="hudLastAction" class="hidden sm:inline px-2 py-0.5 rounded bg-[var(--background,#0b0f19)] border border-[var(--border,#1e293b)] text-[var(--muted-foreground,#94a3b8)]"></span>
+        </div>
+        <div class="flex items-center gap-2 min-w-0">
+          <span id="hudP2Stats" class="font-mono tabular-nums text-[var(--muted-foreground,#94a3b8)]"></span>
+          <span id="hudP2Name" class="font-semibold truncate text-[var(--foreground,#e2e8f0)]">P2</span>
+          <span class="w-2.5 h-2.5 rounded-full shrink-0" style="background:#FF5C5C"></span>
+        </div>
+      </div>
+
+      <!-- Canvas Area -->
+      <div id="arenaGrid" class="grid grid-cols-1 bg-[#0b101d]">
+        <!-- BEFORE Pane (visible in Compare mode) -->
+        <div id="paneBefore" class="hidden flex-col">
+          <div class="px-3 py-1.5 bg-[var(--card,#111827)] border-b border-[var(--border,#1e293b)] flex items-center gap-2 text-xs">
+            <span class="px-1.5 py-0.5 rounded font-mono font-semibold text-[11px]" style="background:rgba(245,158,11,0.18);color:#f59e0b">BEFORE (4 Hz)</span>
+            <span class="text-[var(--muted-foreground,#94a3b8)]">Planet counts update every 0.25s tick • no landing explosions</span>
+          </div>
+          <div class="relative w-full aspect-square max-h-[540px] mx-auto flex items-center justify-center bg-[#0d1220]">
+            <canvas id="canvasBefore" class="w-full h-full"></canvas>
+            <div id="bannerBefore" class="hidden absolute top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full text-xs font-semibold shadow-lg border backdrop-blur-sm"></div>
+          </div>
+        </div>
+
+        <!-- AFTER / Main 20 Hz Pane -->
+        <div id="paneAfter" class="flex flex-col">
+          <div id="afterHeader" class="hidden px-3 py-1.5 bg-[var(--card,#111827)] border-b border-[var(--border,#1e293b)] flex items-center gap-2 text-xs">
+            <span class="px-1.5 py-0.5 rounded font-mono font-semibold text-[11px]" style="background:rgba(34,197,94,0.18);color:#22c55e">AFTER (20 Hz)</span>
+            <span class="text-[var(--muted-foreground,#94a3b8)]">Instant ship-count updates per impact (0.05s) • real G2 sparks • dotted lines</span>
+          </div>
+          <div id="afterCanvasWrap" class="relative w-full aspect-square max-h-[580px] mx-auto flex items-center justify-center bg-[#0d1220]">
+            <canvas id="canvasAfter" class="w-full h-full"></canvas>
+            <div id="bannerAfter" class="hidden absolute top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full text-xs font-semibold shadow-lg border backdrop-blur-sm"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Scrubber & Playback Controls -->
+      <div class="p-3.5 border-t border-[var(--border,#1e293b)] space-y-3">
+        <!-- Ship Count Sparkline -->
+        <div class="space-y-1">
+          <div class="flex items-center justify-between text-xs text-[var(--muted-foreground,#94a3b8)]">
+            <span>Total Ships Over Time (click or drag to scrub)</span>
+            <span id="hudFlockUnits" class="font-mono tabular-nums">0 ships in flight</span>
+          </div>
+          <div class="relative rounded-lg overflow-hidden border border-[var(--border,#1e293b)] bg-[var(--background,#0b0f19)] cursor-pointer">
+            <canvas id="sparkCanvas" class="w-full h-14"></canvas>
+          </div>
+        </div>
+
+        <!-- Transport Bar -->
+        <div class="flex flex-wrap items-center gap-2">
+          <button id="btnPlay" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--primary,#3b82f6)] text-[var(--primary-foreground,#ffffff)] hover:opacity-90 transition min-w-[74px]">
+            Pause
+          </button>
+          <button id="btnPrev" class="px-2.5 py-1.5 rounded-lg text-xs font-mono bg-[var(--secondary,#1e293b)] text-[var(--secondary-foreground,#cbd5e1)] border border-[var(--border,#334155)] hover:opacity-85" title="Previous 0.05s substep (Shift: 0.25s tick)">
+            ◀
+          </button>
+          <button id="btnNext" class="px-2.5 py-1.5 rounded-lg text-xs font-mono bg-[var(--secondary,#1e293b)] text-[var(--secondary-foreground,#cbd5e1)] border border-[var(--border,#334155)] hover:opacity-85" title="Next 0.05s substep (Shift: 0.25s tick)">
+            ▶
+          </button>
+          <button id="btnRestart" class="px-2.5 py-1.5 rounded-lg text-xs bg-[var(--secondary,#1e293b)] text-[var(--secondary-foreground,#cbd5e1)] border border-[var(--border,#334155)] hover:opacity-85" title="Restart">
+            ↺
+          </button>
+
+          <input id="scrubber" type="range" min="0" max="500" step="0.2" value="0" class="flex-1 min-w-[140px] cursor-pointer" />
+
+          <div class="flex items-center gap-1 text-xs">
+            <span class="text-[var(--muted-foreground,#94a3b8)]">Speed</span>
+            <select id="speedSelect" class="px-2 py-1 rounded-lg bg-[var(--background,#0b0f19)] text-[var(--foreground,#e2e8f0)] border border-[var(--border,#334155)] text-xs font-mono">
+              <option value="0.25">0.25×</option>
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="2">2×</option>
+              <option value="4">4×</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Visual Toggles -->
+        <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5 pt-1 border-t border-[var(--border,#1e293b)] text-xs text-[var(--muted-foreground,#94a3b8)]">
+          <div class="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+            <label class="flex items-center gap-1.5 cursor-pointer select-none">
+              <input id="chkSmooth" type="checkbox" checked class="accent-[var(--primary,#3b82f6)]" />
+              Smooth 60fps ships
+            </label>
+            <label class="flex items-center gap-1.5 cursor-pointer select-none">
+              <input id="chkArcs" type="checkbox" checked class="accent-[var(--primary,#3b82f6)]" />
+              Dotted send lines
+            </label>
+            <label class="flex items-center gap-1.5 cursor-pointer select-none">
+              <input id="chkExplosions" type="checkbox" checked class="accent-[var(--primary,#3b82f6)]" />
+              G2 spark explosions
+            </label>
+            <label class="flex items-center gap-1.5 cursor-pointer select-none">
+              <input id="chkCounts" type="checkbox" checked class="accent-[var(--primary,#3b82f6)]" />
+              Fleet ship counts
+            </label>
+            <label class="flex items-center gap-1.5 cursor-pointer select-none">
+              <input id="chkProd" type="checkbox" checked class="accent-[var(--primary,#3b82f6)]" />
+              Planet production
+            </label>
+            <label class="flex items-center gap-1.5 cursor-pointer select-none">
+              <input id="chkGrid" type="checkbox" class="accent-[var(--primary,#3b82f6)]" />
+              8×8 policy grid
+            </label>
+          </div>
+          <div class="flex items-center gap-2 font-mono text-[11px]">
+            <span>Space: Play</span>
+            <span>•</span>
+            <span>←/→: 0.05s step</span>
+            <span>•</span>
+            <span>1–6: Match</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Compact Telemetry Row -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div class="bg-[var(--card,#111827)] border border-[var(--border,#1e293b)] rounded-xl p-3.5 space-y-2">
+        <div id="infoCategory" class="text-xs font-mono uppercase tracking-wider text-[var(--muted-foreground,#94a3b8)]"></div>
+        <h2 id="infoTitle" class="text-sm font-semibold text-[var(--foreground,#e2e8f0)]"></h2>
+        <p id="infoSubtitle" class="text-xs text-[var(--muted-foreground,#94a3b8)]"></p>
+        <div class="grid grid-cols-2 gap-2 text-xs pt-1">
+          <div class="p-2 rounded-lg bg-[var(--background,#0b0f19)] border border-[var(--border,#1e293b)]">
+            <div class="text-[var(--muted-foreground,#94a3b8)]">Seed / Peak Units</div>
+            <div id="infoSeedUnits" class="font-mono font-semibold text-[var(--foreground,#e2e8f0)] mt-0.5"></div>
+          </div>
+          <div class="p-2 rounded-lg bg-[var(--background,#0b0f19)] border border-[var(--border,#1e293b)]">
+            <div class="text-[var(--muted-foreground,#94a3b8)]">Outcome</div>
+            <div id="infoOutcome" class="font-semibold text-[var(--foreground,#e2e8f0)] mt-0.5"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="bg-[var(--card,#111827)] border border-[var(--border,#1e293b)] rounded-xl p-3.5 space-y-2">
+        <div class="flex items-center justify-between">
+          <h3 class="text-xs font-semibold uppercase tracking-wider text-[var(--muted-foreground,#94a3b8)]">Planets (Live 20 Hz)</h3>
+          <span class="text-xs text-[var(--muted-foreground,#94a3b8)] font-mono">ships / prod</span>
+        </div>
+        <div id="planetList" class="grid grid-cols-2 gap-1.5 text-xs"></div>
+      </div>
+
+      <div class="bg-[var(--card,#111827)] border border-[var(--border,#1e293b)] rounded-xl p-3.5 space-y-2">
+        <div class="flex items-center justify-between">
+          <h3 class="text-xs font-semibold uppercase tracking-wider text-[var(--muted-foreground,#94a3b8)]">Recent Send Orders</h3>
+          <span class="text-xs text-[var(--muted-foreground,#94a3b8)]">50% send</span>
+        </div>
+        <div id="orderFeed" class="space-y-1 text-xs font-mono max-h-36 overflow-y-auto pr-1"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const REPLAYS = /*__REPLAY_DATA__*/[];
+    const G2_ASSETS = /*__G2_SPRITES__*/{ ships: {}, fx: {} };
+
+    const COLOR_P1 = '#4A9EFF';
+    const COLOR_P1_GLOW = 'rgba(74, 158, 255, 0.32)';
+    const COLOR_P2 = '#FF5C5C';
+    const COLOR_P2_GLOW = 'rgba(255, 92, 92, 0.32)';
+    const COLOR_NEUTRAL = '#7C8698';
+
+    const SHIP_RADIUS = 6.0;
+    const FLEET_SPEED = 40.0;
+    const alignCache = new Map();
+
+    // Load real Galcon 2 ship sprites & spark explosion sprites when embedded
+    const loadedShips = {};
+    let currentSkin = 'classic';
+    Object.keys(G2_ASSETS.ships || {}).forEach(key => {
+      const e = G2_ASSETS.ships[key];
+      const i1 = new Image(), i2 = new Image();
+      i1.src = e.p1;
+      i2.src = e.p2;
+      loadedShips[key] = { p1: i1, p2: i2 };
+    });
+
+    const loadedFx = {};
+    Object.keys(G2_ASSETS.fx || {}).forEach(key => {
+      const img = new Image();
+      img.src = G2_ASSETS.fx[key];
+      loadedFx[key] = img;
+    });
+
+    let viewMode = 'full'; // 'full' | 'compare'
+    let currentIdx = 0;
+    let playFrame = 0.0;
+    let playing = true;
+    let speed = 1.0;
+    let lastTs = null;
+    let draggingSpark = false;
+
+    const canvasBefore = document.getElementById('canvasBefore');
+    const ctxBefore = canvasBefore.getContext('2d');
+    const canvasAfter = document.getElementById('canvasAfter');
+    const ctxAfter = canvasAfter.getContext('2d');
+    const sparkCanvas = document.getElementById('sparkCanvas');
+    const sparkCtx = sparkCanvas.getContext('2d');
+
+    const elTabs = document.getElementById('matchTabs');
+    const elScrubber = document.getElementById('scrubber');
+    const elBtnPlay = document.getElementById('btnPlay');
+    const elBtnPrev = document.getElementById('btnPrev');
+    const elBtnNext = document.getElementById('btnNext');
+    const elBtnRestart = document.getElementById('btnRestart');
+    const elSpeed = document.getElementById('speedSelect');
+    const elSkin = document.getElementById('skinSelect');
+    const elChkSmooth = document.getElementById('chkSmooth');
+    const elChkArcs = document.getElementById('chkArcs');
+    const elChkExplosions = document.getElementById('chkExplosions');
+    const elChkCounts = document.getElementById('chkCounts');
+    const elChkProd = document.getElementById('chkProd');
+    const elChkGrid = document.getElementById('chkGrid');
+    const elBannerBefore = document.getElementById('bannerBefore');
+    const elBannerAfter = document.getElementById('bannerAfter');
+    const elModeFull = document.getElementById('modeFull');
+    const elModeCompare = document.getElementById('modeCompare');
+    const elArenaGrid = document.getElementById('arenaGrid');
+    const elPaneBefore = document.getElementById('paneBefore');
+    const elAfterHeader = document.getElementById('afterHeader');
+    const elAfterCanvasWrap = document.getElementById('afterCanvasWrap');
+
+    function ownerColor(owner) {
+      if (owner === 1) return COLOR_P1;
+      if (owner === 2) return COLOR_P2;
+      return COLOR_NEUTRAL;
+    }
+
+    function winnerLabel(r) {
+      if (r.winner === 1) return 'P1 Win';
+      if (r.winner === 2) return 'P2 Win';
+      return 'Draw';
+    }
+
+    function setViewMode(mode) {
+      viewMode = mode;
+      if (mode === 'compare') {
+        elModeCompare.className = 'px-2.5 py-1 rounded-md font-medium transition seg-active';
+        elModeFull.className = 'px-2.5 py-1 rounded-md font-medium transition text-[var(--muted-foreground,#94a3b8)] hover:text-[var(--foreground,#e2e8f0)]';
+        elPaneBefore.classList.remove('hidden');
+        elPaneBefore.classList.add('flex');
+        elAfterHeader.classList.remove('hidden');
+        elArenaGrid.className = 'grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-[var(--border,#1e293b)] bg-[#0b101d]';
+        elAfterCanvasWrap.className = 'relative w-full aspect-square max-h-[540px] mx-auto flex items-center justify-center bg-[#0d1220]';
+      } else {
+        elModeFull.className = 'px-2.5 py-1 rounded-md font-medium transition seg-active';
+        elModeCompare.className = 'px-2.5 py-1 rounded-md font-medium transition text-[var(--muted-foreground,#94a3b8)] hover:text-[var(--foreground,#e2e8f0)]';
+        elPaneBefore.classList.add('hidden');
+        elPaneBefore.classList.remove('flex');
+        elAfterHeader.classList.add('hidden');
+        elArenaGrid.className = 'grid grid-cols-1 bg-[#0b101d]';
+        elAfterCanvasWrap.className = 'relative w-full aspect-square max-h-[580px] mx-auto flex items-center justify-center bg-[#0d1220]';
+      }
+      renderAll();
+    }
+
+    elModeFull.onclick = () => setViewMode('full');
+    elModeCompare.onclick = () => setViewMode('compare');
+    elSkin.onchange = () => { currentSkin = elSkin.value; renderAll(); };
+
+    function buildTabs() {
+      elTabs.innerHTML = '';
+      REPLAYS.forEach((r, idx) => {
+        const btn = document.createElement('button');
+        const active = idx === currentIdx;
+        const winBadgeColor = r.winner === 1 ? 'background:rgba(74,158,255,0.18);color:#6ab5ff' :
+                              r.winner === 2 ? 'background:rgba(255,92,92,0.18);color:#ff8080' :
+                                               'background:rgba(124,134,152,0.2);color:#9aa4b5';
+        const lastTick = r.frames[r.frames.length - 1].k;
+        btn.className = `text-left p-2.5 rounded-xl border transition bg-[var(--card,#111827)] border-[var(--border,#1e293b)] hover:border-[var(--primary,#3b82f6)] ${active ? 'tab-active' : ''}`;
+        btn.innerHTML = `
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-xs font-semibold text-[var(--foreground,#e2e8f0)] truncate">${idx + 1}. ${r.title}</span>
+            <span class="px-1.5 py-0.5 rounded text-[11px] font-mono shrink-0" style="${winBadgeColor}">${winnerLabel(r)}</span>
+          </div>
+          <div class="flex items-center justify-between text-xs text-[var(--muted-foreground,#94a3b8)] mt-1">
+            <span class="truncate">${r.category}</span>
+            <span class="font-mono shrink-0 ml-2">seed ${r.map_seed} • ${lastTick}t</span>
+          </div>
+        `;
+        btn.onclick = () => selectReplay(idx);
+        elTabs.appendChild(btn);
+      });
+    }
+
+    function selectReplay(idx) {
+      currentIdx = Math.max(0, Math.min(REPLAYS.length - 1, idx));
+      const r = REPLAYS[currentIdx];
+      playFrame = 0;
+      playing = true;
+      elBtnPlay.textContent = 'Pause';
+      elScrubber.max = String(r.frames.length - 1);
+      elScrubber.value = '0';
+
+      document.getElementById('hudP1Name').textContent = r.p1_name;
+      document.getElementById('hudP2Name').textContent = r.p2_name;
+      document.getElementById('infoCategory').textContent = r.category;
+      document.getElementById('infoTitle').textContent = r.title;
+      document.getElementById('infoSubtitle').textContent = r.subtitle;
+      document.getElementById('infoSeedUnits').textContent = `${r.map_seed} / ${r.max_units} ships`;
+      document.getElementById('infoOutcome').textContent =
+        r.winner === 1 ? `${r.p1_name} wins` :
+        r.winner === 2 ? `${r.p2_name} wins` : 'Draw';
+
+      bakeSmoothedVelocityAngles(r, currentIdx);
+      buildTabs();
+      renderAll();
+    }
+
+    function resizeCanvasToDisplaySize(canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.max(1, Math.round(rect.width * dpr));
+      const h = Math.max(1, Math.round(rect.height * dpr));
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      return { w, h, dpr };
+    }
+
+    function drawFallbackHollowShip(ctx, x, y, angRad, spriteSize, owner, alpha) {
+      const col = ownerColor(owner);
+      const r = spriteSize * 0.34;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(-angRad);
+      ctx.beginPath();
+      ctx.moveTo(r * 1.15, 0);
+      ctx.lineTo(-r * 0.85, r * 0.72);
+      ctx.lineTo(-r * 0.85, -r * 0.72);
+      ctx.closePath();
+      ctx.strokeStyle = col;
+      ctx.lineWidth = Math.max(1.5, spriteSize * 0.12);
+      ctx.globalAlpha = alpha;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawG2SpriteShip(ctx, x, y, angRad, spriteSize, owner, alpha) {
+      const pack = loadedShips[currentSkin] || loadedShips.classic;
+      const img = pack ? (owner === 1 ? pack.p1 : pack.p2) : null;
+      if (!img || !img.complete || img.naturalWidth === 0) {
+        drawFallbackHollowShip(ctx, x, y, angRad, spriteSize, owner, alpha);
+        return;
+      }
+      // World angRad has +Y upward; canvas has +Y downward, and G2 sprite points UP (-Y)
+      const canvasAng = -angRad + Math.PI * 0.5;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(canvasAng);
+      ctx.globalAlpha = alpha;
+      ctx.drawImage(img, -spriteSize * 0.5, -spriteSize * 0.5, spriteSize, spriteSize);
+      ctx.restore();
+    }
+
+    function unpackUnits(flat) {
+      const n = (flat.length / 3) | 0;
+      const out = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const base = i * 3;
+        out[i] = [flat[base] * 0.1, flat[base + 1] * 0.1, flat[base + 2] * 0.01];
+      }
+      return out;
+    }
+
+    function lerpAngle(a, b, t) {
+      let d = b - a;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      return a + d * t;
+    }
+
+    function getSubstepAlignment(cacheKey, u0, u1, stepDist) {
+      let cached = alignCache.get(cacheKey);
+      if (cached) return cached;
+      const n = u0.length, m = u1.length;
+      const INF = 1e18;
+      const dp = new Float64Array((n + 1) * (m + 1));
+      const take = new Uint8Array((n + 1) * (m + 1));
+      dp.fill(INF);
+      for (let i = 0; i <= n; i++) dp[i * (m + 1)] = 0;
+      for (let i = 1; i <= n; i++) {
+        const a = u0[i - 1];
+        const px = a[0] + stepDist * Math.cos(a[2]);
+        const py = a[1] + stepDist * Math.sin(a[2]);
+        const jMax = Math.min(i, m);
+        const row = i * (m + 1);
+        const prevRow = (i - 1) * (m + 1);
+        for (let j = 1; j <= jMax; j++) {
+          let best = dp[prevRow + j];
+          let chose = 0;
+          const b = u1[j - 1];
+          const dx = px - b[0];
+          const dy = py - b[1];
+          const c = dp[prevRow + j - 1] + dx * dx + dy * dy;
+          if (c < best) { best = c; chose = 1; }
+          dp[row + j] = best;
+          take[row + j] = chose;
+        }
+      }
+      const matched = [];
+      const isMatched = new Uint8Array(n);
+      let i = n, j = m;
+      while (j > 0 && i > 0) {
+        if (take[i * (m + 1) + j]) {
+          matched.push([i - 1, j - 1]);
+          isMatched[i - 1] = 1;
+          i--; j--;
+        } else {
+          i--;
+        }
+      }
+      matched.reverse();
+      const landed = [];
+      for (let k = 0; k < n; k++) if (!isMatched[k]) landed.push(k);
+      cached = { matched, landed };
+      alignCache.set(cacheKey, cached);
+      return cached;
+    }
+
+    function advanceLandingUnit(a, tp, stepDist, alpha) {
+      if (!tp) return null;
+      const tx = tp[1], ty = tp[2], landR = tp[4] + SHIP_RADIUS;
+      const dx = tx - a[0], dy = ty - a[1];
+      const dist0 = Math.hypot(dx, dy);
+      const travel = stepDist * alpha;
+      if (dist0 - travel <= landR) return null;
+      const moveAng = Math.atan2(dy, dx);
+      const dispAng = lerpAngle(a[2], moveAng, 0.75 * alpha);
+      return [a[0] + Math.cos(moveAng) * travel, a[1] + Math.sin(moveAng) * travel, dispAng];
+    }
+
+    // Precompute lightly smoothed velocity-driven visual angles (purely graphical, no physics change)
+    // using a fast EMA low-pass filter across consecutive 20 Hz substeps to remove 0.1u quantization jitter.
+    function bakeSmoothedVelocityAngles(r, replayIdx) {
+      if (!r || r._velAnglesBaked) return;
+      const stepDist = FLEET_SPEED * r.sub_dt;
+      const SMOOTH_PREV = 0.42; // ~0.058s visual smoothing (~2.6x faster turn response)
+      const SMOOTH_CURR = 1.0 - SMOOTH_PREV;
+      let prevState = new Map();
+
+      for (let k = 0; k < r.frames.length; k++) {
+        const f0 = r.frames[k];
+        const f1 = k + 1 < r.frames.length ? r.frames[k + 1] : null;
+        const nextById = {};
+        if (f1) {
+          for (let j = 0; j < f1.f.length; j++) nextById[f1.f[j][0]] = f1.f[j];
+        }
+        const curState = new Map();
+
+        for (let fi = 0; fi < f0.f.length; fi++) {
+          const fl0 = f0.f[fi];
+          const fid = fl0[0];
+          const flat0 = fl0[4];
+          const u0 = unpackUnits(flat0);
+          const n = u0.length;
+          const fl1 = nextById[fid];
+          const tp = r.planets[fl0[3]];
+
+          const instV = new Array(n);
+          if (fl1) {
+            const u1 = unpackUnits(fl1[4]);
+            if (u1.length === n) {
+              for (let i = 0; i < n; i++) {
+                const vx = u1[i][0] - u0[i][0], vy = u1[i][1] - u0[i][1];
+                const d = Math.hypot(vx, vy);
+                instV[i] = d > 1e-4 ? [vx / d, vy / d] : [Math.cos(u0[i][2]), Math.sin(u0[i][2])];
+              }
+            } else if (u1.length < n) {
+              const cacheKey = `${replayIdx}:${k}:${fid}`;
+              const { matched } = getSubstepAlignment(cacheKey, u0, u1, stepDist);
+              for (let m = 0; m < matched.length; m++) {
+                const i0 = matched[m][0], j1 = matched[m][1];
+                const vx = u1[j1][0] - u0[i0][0], vy = u1[j1][1] - u0[i0][1];
+                const d = Math.hypot(vx, vy);
+                instV[i0] = d > 1e-4 ? [vx / d, vy / d] : [Math.cos(u0[i0][2]), Math.sin(u0[i0][2])];
+              }
+              for (let i = 0; i < n; i++) {
+                if (!instV[i]) {
+                  const dx = tp ? tp[1] - u0[i][0] : Math.cos(u0[i][2]);
+                  const dy = tp ? tp[2] - u0[i][1] : Math.sin(u0[i][2]);
+                  const d = Math.hypot(dx, dy);
+                  instV[i] = d > 1e-4 ? [dx / d, dy / d] : [1, 0];
+                }
+              }
+            } else {
+              for (let i = 0; i < n; i++) instV[i] = [Math.cos(u0[i][2]), Math.sin(u0[i][2])];
+            }
+          } else {
+            for (let i = 0; i < n; i++) {
+              const dx = tp ? tp[1] - u0[i][0] : Math.cos(u0[i][2]);
+              const dy = tp ? tp[2] - u0[i][1] : Math.sin(u0[i][2]);
+              const d = Math.hypot(dx, dy);
+              instV[i] = d > 1e-4 ? [dx / d, dy / d] : [Math.cos(u0[i][2]), Math.sin(u0[i][2])];
+            }
+          }
+
+          const prev = prevState.get(fid);
+          const sv = new Array(n);
+          if (prev && prev.u.length === n) {
+            for (let i = 0; i < n; i++) {
+              const sx = SMOOTH_PREV * prev.sv[i][0] + SMOOTH_CURR * instV[i][0];
+              const sy = SMOOTH_PREV * prev.sv[i][1] + SMOOTH_CURR * instV[i][1];
+              const d = Math.hypot(sx, sy);
+              sv[i] = d > 1e-5 ? [sx / d, sy / d] : instV[i];
+            }
+          } else if (prev && prev.u.length > n) {
+            const prevKey = `${replayIdx}:${k - 1}:${fid}`;
+            const { matched } = getSubstepAlignment(prevKey, prev.u, u0, stepDist);
+            const fromPrev = new Array(n);
+            for (let m = 0; m < matched.length; m++) {
+              fromPrev[matched[m][1]] = prev.sv[matched[m][0]];
+            }
+            for (let i = 0; i < n; i++) {
+              const ps = fromPrev[i];
+              if (ps) {
+                const sx = SMOOTH_PREV * ps[0] + SMOOTH_CURR * instV[i][0];
+                const sy = SMOOTH_PREV * ps[1] + SMOOTH_CURR * instV[i][1];
+                const d = Math.hypot(sx, sy);
+                sv[i] = d > 1e-5 ? [sx / d, sy / d] : instV[i];
+              } else {
+                sv[i] = instV[i];
+              }
+            }
+          } else {
+            for (let i = 0; i < n; i++) sv[i] = instV[i];
+          }
+
+          for (let i = 0; i < n; i++) {
+            const ang = Math.atan2(sv[i][1], sv[i][0]);
+            flat0[i * 3 + 2] = Math.round(ang * 100);
+          }
+          curState.set(fid, { u: u0, sv });
+        }
+        prevState = curState;
+      }
+      r._velAnglesBaked = true;
+    }
+
+    function interpolateSubstepUnits(cacheKey, flat0, flat1, tp, stepDist, alpha) {
+      const u0 = unpackUnits(flat0);
+      if (!flat1) {
+        const out = [];
+        for (let i = 0; i < u0.length; i++) {
+          const p = advanceLandingUnit(u0[i], tp, stepDist, alpha);
+          if (p) out.push(p);
+        }
+        return out;
+      }
+      const u1 = unpackUnits(flat1);
+      if (u0.length === u1.length) {
+        const out = new Array(u0.length);
+        for (let i = 0; i < u0.length; i++) {
+          const a = u0[i], b = u1[i];
+          out[i] = [a[0] + (b[0] - a[0]) * alpha, a[1] + (b[1] - a[1]) * alpha, lerpAngle(a[2], b[2], alpha)];
+        }
+        return out;
+      }
+      if (u1.length > u0.length) return u1;
+      const { matched, landed } = getSubstepAlignment(cacheKey, u0, u1, stepDist);
+      const out = [];
+      for (let k = 0; k < matched.length; k++) {
+        const a = u0[matched[k][0]], b = u1[matched[k][1]];
+        out.push([a[0] + (b[0] - a[0]) * alpha, a[1] + (b[1] - a[1]) * alpha, lerpAngle(a[2], b[2], alpha)]);
+      }
+      for (let k = 0; k < landed.length; k++) {
+        const p = advanceLandingUnit(u0[landed[k]], tp, stepDist, alpha);
+        if (p) out.push(p);
+      }
+      return out;
+    }
+
+    function drawFallbackExplosion(ctx, hx, hy, scale, p, easeOut, rot) {
+      const r = (8 + 14 * easeOut) * scale;
+      const alpha = Math.max(0, 1 - p);
+      ctx.save();
+      ctx.translate(hx, hy);
+      ctx.rotate(rot);
+      const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, r);
+      grad.addColorStop(0, `rgba(255, 240, 200, ${alpha * 0.9})`);
+      grad.addColorStop(0.45, `rgba(255, 130, 40, ${alpha * 0.65})`);
+      grad.addColorStop(1, 'rgba(255, 60, 0, 0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function drawArenaOn(canvas, ctx, bannerEl, opts) {
+      const r = REPLAYS[currentIdx];
+      if (!r) return 0;
+      const { w, h, dpr } = resizeCanvasToDisplaySize(canvas);
+      ctx.clearRect(0, 0, w, h);
+
+      const grad = ctx.createRadialGradient(w * 0.5, h * 0.5, w * 0.08, w * 0.5, h * 0.5, w * 0.72);
+      grad.addColorStop(0, '#161e34');
+      grad.addColorStop(1, '#0b101d');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, w, h);
+
+      const pad = 16 * dpr;
+      const worldW = 2 * r.grid_max_x;
+      const worldH = 2 * r.grid_max_y;
+      const scale = Math.min((w - 2 * pad) / worldW, (h - 2 * pad) / worldH);
+      const ox = w * 0.5;
+      const oy = h * 0.5;
+      const wx = x => ox + x * scale;
+      const wy = y => oy - y * scale;
+
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 1 * dpr;
+      ctx.strokeRect(wx(-r.grid_max_x), wy(r.grid_max_y), worldW * scale, worldH * scale);
+
+      if (elChkGrid.checked) {
+        const gs = r.grid_square_size;
+        ctx.strokeStyle = 'rgba(148, 163, 184, 0.18)';
+        ctx.lineWidth = 1 * dpr;
+        ctx.beginPath();
+        for (let x = -r.grid_max_x; x <= r.grid_max_x + 0.01; x += gs) {
+          ctx.moveTo(wx(x), wy(-r.grid_max_y));
+          ctx.lineTo(wx(x), wy(r.grid_max_y));
+        }
+        for (let y = -r.grid_max_y; y <= r.grid_max_y + 0.01; y += gs) {
+          ctx.moveTo(wx(-r.grid_max_x), wy(y));
+          ctx.lineTo(wx(r.grid_max_x), wy(y));
+        }
+        ctx.stroke();
+      }
+
+      const maxIdx = r.frames.length - 1;
+      const smooth = elChkSmooth.checked;
+      const f0Idx = Math.min(maxIdx, Math.floor(playFrame));
+      const f1Idx = Math.min(maxIdx, f0Idx + 1);
+      const alpha = smooth ? Math.max(0, Math.min(1, playFrame - f0Idx)) : 0;
+
+      const f0 = r.frames[f0Idx];
+      const f1 = r.frames[f1Idx];
+
+      const planetFrame = opts.coarse4HzPlanets
+        ? r.frames[Math.floor(f0Idx / r.substeps) * r.substeps]
+        : f0;
+
+      // Dotted send-order lines (fade smoothly over 15 substeps = 0.75s)
+      if (elChkArcs.checked) {
+        const lookback = 15;
+        for (let k = Math.max(1, f0Idx - lookback); k <= f0Idx; k++) {
+          const act = r.frames[k].a;
+          if (!act) continue;
+          const age = playFrame - k;
+          if (age < 0 || age > lookback) continue;
+          const fade = Math.max(0, 1 - age / lookback) * 0.65;
+          const sp = r.planets[act[1]];
+          const tp = r.planets[act[2]];
+          if (!sp || !tp) continue;
+          ctx.save();
+          ctx.strokeStyle = ownerColor(act[0]);
+          ctx.globalAlpha = fade;
+          ctx.lineWidth = 1.9 * dpr;
+          ctx.setLineDash([5.5 * dpr, 5 * dpr]);
+          ctx.beginPath();
+          ctx.moveTo(wx(sp[1]), wy(sp[2]));
+          ctx.lineTo(wx(tp[1]), wy(tp[2]));
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+
+      // Draw planets with immediate 20 Hz ship counts (no gradual ramp)
+      for (let i = 0; i < r.planets.length; i++) {
+        const pStatic = r.planets[i];
+        const pDyn = planetFrame.p[i];
+        const owner = pDyn[0];
+        const ships = pDyn[1] * 0.1;
+        const px = wx(pStatic[1]);
+        const py = wy(pStatic[2]);
+        const prod = pStatic[3];
+        const rad = pStatic[4] * scale;
+        const col = ownerColor(owner);
+
+        if (owner === 1 || owner === 2) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(px, py, rad + 5 * dpr, 0, Math.PI * 2);
+          ctx.fillStyle = owner === 1 ? COLOR_P1_GLOW : COLOR_P2_GLOW;
+          ctx.fill();
+          ctx.restore();
+        }
+
+        const pGrad = ctx.createRadialGradient(px - rad * 0.3, py - rad * 0.3, rad * 0.1, px, py, rad);
+        pGrad.addColorStop(0, col);
+        pGrad.addColorStop(1, owner === 1 ? '#295b96' : owner === 2 ? '#9c3232' : '#4d5565');
+        ctx.beginPath();
+        ctx.arc(px, py, rad, 0, Math.PI * 2);
+        ctx.fillStyle = pGrad;
+        ctx.fill();
+
+        ctx.lineWidth = 1.4 * dpr;
+        ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+        ctx.stroke();
+
+        ctx.fillStyle = 'rgba(255,255,255,0.55)';
+        ctx.font = `600 ${Math.round(8.5 * dpr)}px ui-monospace, monospace`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`P${pStatic[0]}`, px, py - rad - 6.5 * dpr);
+
+        const fontSize = Math.max(11 * dpr, Math.min(18 * dpr, rad * 0.72));
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = `700 ${Math.round(fontSize)}px ui-sans-serif, system-ui, sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(Math.floor(ships)), px, elChkProd.checked ? py - 2.5 * dpr : py);
+
+        if (elChkProd.checked) {
+          ctx.fillStyle = 'rgba(255,255,255,0.75)';
+          ctx.font = `500 ${Math.round(9 * dpr)}px ui-monospace, monospace`;
+          ctx.fillText(`+${prod}`, px, py + fontSize * 0.56);
+        }
+      }
+
+      // Draw fleets with real Galcon 2 ship sprites
+      const nextFleetsById = {};
+      f1.f.forEach(fl => { nextFleetsById[fl[0]] = fl; });
+
+      let liveUnits = 0;
+      const g2SpriteSize = Math.max(11.5 * dpr, 13.5 * scale);
+      const subStepDist = FLEET_SPEED * r.sub_dt;
+
+      for (let i = 0; i < f0.f.length; i++) {
+        const fl0 = f0.f[i];
+        const fl1 = nextFleetsById[fl0[0]];
+        const col = ownerColor(fl0[1]);
+        const tp = r.planets[fl0[3]];
+        const flat0 = fl0[4];
+        const n0 = (flat0.length / 3) | 0;
+        let drawUnits;
+
+        if (f0Idx < maxIdx) {
+          const cacheKey = `${currentIdx}:${f0Idx}:${fl0[0]}`;
+          drawUnits = interpolateSubstepUnits(cacheKey, flat0, fl1 ? fl1[4] : null, tp, subStepDist, smooth ? alpha : 0);
+        } else {
+          drawUnits = unpackUnits(flat0);
+        }
+
+        liveUnits += drawUnits.length;
+
+        let sx = 0, sy = 0;
+        for (let u = 0; u < drawUnits.length; u++) {
+          const unit = drawUnits[u];
+          sx += unit[0];
+          sy += unit[1];
+          drawG2SpriteShip(ctx, wx(unit[0]), wy(unit[1]), unit[2], g2SpriteSize, fl0[1], 0.96);
+        }
+
+        if (elChkCounts.checked && drawUnits.length > 0) {
+          const cx = sx / drawUnits.length;
+          const cy = sy / drawUnits.length;
+          const ships = (fl0[2] * 0.1) * (drawUnits.length / Math.max(1, n0));
+          const label = String(Math.max(1, Math.round(ships)));
+          ctx.save();
+          ctx.font = `700 ${Math.round(10 * dpr)}px ui-monospace, monospace`;
+          const tw = ctx.measureText(label).width;
+          const bw = tw + 8 * dpr;
+          const bh = 14 * dpr;
+          const bx = wx(cx) - bw * 0.5;
+          const by = wy(cy) - bh * 0.5;
+          ctx.fillStyle = 'rgba(11, 16, 29, 0.78)';
+          ctx.strokeStyle = col;
+          ctx.lineWidth = 1 * dpr;
+          ctx.beginPath();
+          ctx.roundRect(bx, by, bw, bh, 4 * dpr);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = '#FFFFFF';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(label, wx(cx), wy(cy) + 0.5 * dpr);
+          ctx.restore();
+        }
+      }
+
+      // Draw real Galcon 2 ship landing explosion animations (spark.png + spark-1.png) on hostile impacts only
+      if (opts.showExplosions && elChkExplosions.checked) {
+        const fxDuration = 6.5; // ~0.325s at 20 Hz
+        const sparkHostile = loadedFx.spark_hostile;
+        const sparkGlow = loadedFx.spark_glow;
+        const hasG2Fx = Boolean(sparkHostile && sparkHostile.complete && sparkHostile.naturalWidth > 0);
+
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        for (let k = Math.max(1, f0Idx - Math.ceil(fxDuration)); k <= f0Idx; k++) {
+          const hits = r.frames[k].h;
+          if (!hits || hits.length === 0) continue;
+          const age = playFrame - k;
+          if (age < 0 || age > fxDuration) continue;
+          const p = age / fxDuration;
+          const easeOut = 1 - (1 - p) * (1 - p);
+
+          for (let hi = 0; hi < hits.length; hi++) {
+            const hit = hits[hi];
+            if (hit[3] !== 1) continue; // Friendly reinforcements do not trigger explosions
+            const hx = wx(hit[0] * 0.1);
+            const hy = wy(hit[1] * 0.1);
+            const rot = ((k * 73 + hi * 137) % 360) * (Math.PI / 180) + p * 0.35;
+
+            if (hasG2Fx) {
+              if (sparkGlow && sparkGlow.complete && sparkGlow.naturalWidth > 0) {
+                const gSize = (10 + 18 * easeOut) * scale;
+                ctx.globalAlpha = Math.max(0, (1 - p) * (1 - p) * 0.85);
+                ctx.drawImage(sparkGlow, hx - gSize * 0.5, hy - gSize * 0.5, gSize, gSize);
+              }
+              const sSize = (11 + 22 * easeOut) * scale;
+              ctx.save();
+              ctx.translate(hx, hy);
+              ctx.rotate(rot);
+              ctx.globalAlpha = Math.max(0, (1 - p) * 0.95);
+              ctx.drawImage(sparkHostile, -sSize * 0.5, -sSize * 0.5, sSize, sSize);
+              ctx.restore();
+            } else {
+              drawFallbackExplosion(ctx, hx, hy, scale, p, easeOut, rot);
+            }
+          }
+        }
+        ctx.restore();
+      }
+
+      if (f0Idx >= maxIdx) {
+        bannerEl.classList.remove('hidden');
+        if (r.winner === 1) {
+          bannerEl.style.background = 'rgba(74, 158, 255, 0.88)';
+          bannerEl.style.borderColor = '#89bff5';
+          bannerEl.style.color = '#ffffff';
+          bannerEl.textContent = `Winner: ${r.p1_name} (P1)`;
+        } else if (r.winner === 2) {
+          bannerEl.style.background = 'rgba(255, 92, 92, 0.88)';
+          bannerEl.style.borderColor = '#f59b9b';
+          bannerEl.style.color = '#ffffff';
+          bannerEl.textContent = `Winner: ${r.p2_name} (P2)`;
+        } else {
+          bannerEl.style.background = 'rgba(100, 116, 139, 0.88)';
+          bannerEl.style.borderColor = '#cbd5e1';
+          bannerEl.style.color = '#ffffff';
+          bannerEl.textContent = 'Draw (Timeout)';
+        }
+      } else {
+        bannerEl.classList.add('hidden');
+      }
+
+      return liveUnits;
+    }
+
+    function renderArenas() {
+      const r = REPLAYS[currentIdx];
+      if (!r) return;
+      const maxIdx = r.frames.length - 1;
+      const f0Idx = Math.min(maxIdx, Math.floor(playFrame));
+      const f0 = r.frames[f0Idx];
+      const maxTick = r.frames[maxIdx].k;
+
+      if (viewMode === 'compare') {
+        drawArenaOn(canvasBefore, ctxBefore, elBannerBefore, {
+          coarse4HzPlanets: true,
+          showExplosions: false,
+        });
+      }
+      const liveUnits = drawArenaOn(canvasAfter, ctxAfter, elBannerAfter, {
+        coarse4HzPlanets: false,
+        showExplosions: true,
+      });
+
+      const s0 = f0.s;
+      document.getElementById('hudP1Stats').textContent = `${s0[0]} ships • +${s0[2]}`;
+      document.getElementById('hudP2Stats').textContent = `${s0[1]} ships • +${s0[3]}`;
+      document.getElementById('hudStep').textContent = `Step ${f0.k} / ${maxTick}`;
+      document.getElementById('hudTime').textContent = `${(playFrame * r.sub_dt).toFixed(2)}s`;
+      document.getElementById('hudFlockUnits').textContent = `${liveUnits} physical ships in flight`;
+
+      const tickStart = Math.max(1, Math.floor((f0Idx - 1) / r.substeps) * r.substeps + 1);
+      const act = f0Idx > 0 && r.frames[tickStart] ? r.frames[tickStart].a : null;
+      const elAct = document.getElementById('hudLastAction');
+      if (act) {
+        elAct.textContent = `P${act[0]} sent P${act[1]} → P${act[2]}`;
+        elAct.style.color = ownerColor(act[0]);
+      } else {
+        elAct.textContent = 'pass';
+        elAct.style.color = 'var(--muted-foreground, #94a3b8)';
+      }
+
+      renderSidebar(f0, f0Idx, r);
+    }
+
+    let lastSidebarFrame = -1;
+    let lastSidebarIdx = -1;
+    function renderSidebar(frame, frameIdx, r) {
+      if (frameIdx === lastSidebarFrame && currentIdx === lastSidebarIdx) return;
+      lastSidebarFrame = frameIdx;
+      lastSidebarIdx = currentIdx;
+
+      const planetList = document.getElementById('planetList');
+      planetList.innerHTML = r.planets.map((pSt, i) => {
+        const pDyn = frame.p[i];
+        const dot = ownerColor(pDyn[0]);
+        const ownerName = pDyn[0] === 1 ? 'P1' : pDyn[0] === 2 ? 'P2' : 'Neu';
+        return `
+          <div class="flex items-center justify-between px-2 py-1 rounded-lg bg-[var(--background,#0b0f19)] border border-[var(--border,#1e293b)]">
+            <div class="flex items-center gap-1.5">
+              <span class="w-2 h-2 rounded-full" style="background:${dot}"></span>
+              <span class="font-mono font-semibold text-[var(--foreground,#e2e8f0)]">P${pSt[0]}</span>
+              <span class="text-[var(--muted-foreground,#94a3b8)]">${ownerName}</span>
+            </div>
+            <div class="font-mono tabular-nums text-[var(--foreground,#e2e8f0)]">
+              <span class="font-semibold">${Math.floor(pDyn[1] * 0.1)}</span><span class="text-[var(--muted-foreground,#94a3b8)]">/+${pSt[3]}</span>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      const orders = [];
+      for (let k = frameIdx; k >= 1 && orders.length < 10; k--) {
+        const a = r.frames[k].a;
+        if (a) orders.push({ t: r.frames[k].t * 0.01, player: a[0], src: a[1], dst: a[2] });
+      }
+      const orderFeed = document.getElementById('orderFeed');
+      if (orders.length === 0) {
+        orderFeed.innerHTML = `<div class="text-[var(--muted-foreground,#94a3b8)] italic">No send orders yet</div>`;
+      } else {
+        orderFeed.innerHTML = orders.map(o => `
+          <div class="flex items-center justify-between px-2 py-1 rounded bg-[var(--background,#0b0f19)] border border-[var(--border,#1e293b)]">
+            <span class="text-[var(--muted-foreground,#94a3b8)]">t=${o.t.toFixed(2)}s</span>
+            <span style="color:${ownerColor(o.player)}" class="font-semibold">P${o.player}</span>
+            <span class="text-[var(--foreground,#e2e8f0)]">P${o.src} → P${o.dst}</span>
+          </div>
+        `).join('');
+      }
+    }
+
+    function renderSparkline() {
+      const r = REPLAYS[currentIdx];
+      if (!r) return;
+      const { w, h, dpr } = resizeCanvasToDisplaySize(sparkCanvas);
+      const ctx = sparkCtx;
+      ctx.clearRect(0, 0, w, h);
+
+      const isLight = document.documentElement.classList.contains('light');
+      const frames = r.frames;
+      const n = frames.length;
+      if (n < 2) return;
+
+      let maxShips = 100;
+      for (let i = 0; i < n; i++) {
+        maxShips = Math.max(maxShips, frames[i].s[0], frames[i].s[1]);
+      }
+
+      const padX = 6 * dpr;
+      const padY = 5 * dpr;
+      const plotW = w - 2 * padX;
+      const plotH = h - 2 * padY;
+
+      const xFor = i => padX + (i / (n - 1)) * plotW;
+      const yFor = val => padY + plotH * (1 - val / maxShips);
+
+      ctx.strokeStyle = isLight ? 'rgba(0,0,0,0.07)' : 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 1 * dpr;
+      ctx.beginPath();
+      ctx.moveTo(padX, padY + plotH * 0.5);
+      ctx.lineTo(w - padX, padY + plotH * 0.5);
+      ctx.stroke();
+
+      function drawSeries(idx, color) {
+        ctx.beginPath();
+        for (let i = 0; i < n; i++) {
+          const x = xFor(i);
+          const y = yFor(frames[i].s[idx]);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2 * dpr;
+        ctx.stroke();
+      }
+      drawSeries(0, COLOR_P1);
+      drawSeries(1, COLOR_P2);
+
+      const px = xFor(playFrame);
+      ctx.strokeStyle = isLight ? '#0f172a' : '#f8fafc';
+      ctx.lineWidth = 1.5 * dpr;
+      ctx.beginPath();
+      ctx.moveTo(px, 0);
+      ctx.lineTo(px, h);
+      ctx.stroke();
+    }
+
+    function renderAll() {
+      renderArenas();
+      renderSparkline();
+    }
+
+    function loop(ts) {
+      if (lastTs === null) lastTs = ts;
+      const dtSec = Math.min(0.1, (ts - lastTs) / 1000);
+      lastTs = ts;
+
+      const r = REPLAYS[currentIdx];
+      if (playing && r && r.frames.length > 1) {
+        const maxIdx = r.frames.length - 1;
+        const delta = (dtSec * speed) / r.sub_dt;
+        playFrame += delta;
+        if (playFrame >= maxIdx) {
+          playFrame = maxIdx;
+          playing = false;
+          elBtnPlay.textContent = 'Replay';
+        }
+        elScrubber.value = String(playFrame);
+      }
+      renderAll();
+      requestAnimationFrame(loop);
+    }
+
+    elBtnPlay.onclick = () => {
+      const r = REPLAYS[currentIdx];
+      if (!r) return;
+      if (!playing && playFrame >= r.frames.length - 1) playFrame = 0;
+      playing = !playing;
+      elBtnPlay.textContent = playing ? 'Pause' : 'Play';
+    };
+
+    elBtnPrev.onclick = e => {
+      playing = false;
+      elBtnPlay.textContent = 'Play';
+      const jump = e.shiftKey ? 5 : 1;
+      playFrame = Math.max(0, Math.floor(playFrame) - jump);
+      elScrubber.value = String(playFrame);
+      renderAll();
+    };
+
+    elBtnNext.onclick = e => {
+      const r = REPLAYS[currentIdx];
+      if (!r) return;
+      playing = false;
+      elBtnPlay.textContent = 'Play';
+      const jump = e.shiftKey ? 5 : 1;
+      playFrame = Math.min(r.frames.length - 1, Math.floor(playFrame) + jump);
+      elScrubber.value = String(playFrame);
+      renderAll();
+    };
+
+    elBtnRestart.onclick = () => {
+      playFrame = 0;
+      playing = true;
+      elBtnPlay.textContent = 'Pause';
+      elScrubber.value = '0';
+      renderAll();
+    };
+
+    elScrubber.oninput = () => {
+      playing = false;
+      elBtnPlay.textContent = 'Play';
+      playFrame = parseFloat(elScrubber.value) || 0;
+      renderAll();
+    };
+
+    elSpeed.onchange = () => {
+      speed = parseFloat(elSpeed.value) || 1.0;
+    };
+
+    function scrubSparkFromEvent(e) {
+      const r = REPLAYS[currentIdx];
+      if (!r) return;
+      const rect = sparkCanvas.getBoundingClientRect();
+      const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      playing = false;
+      elBtnPlay.textContent = 'Play';
+      playFrame = frac * (r.frames.length - 1);
+      elScrubber.value = String(playFrame);
+      renderAll();
+    }
+    sparkCanvas.addEventListener('mousedown', e => { draggingSpark = true; scrubSparkFromEvent(e); });
+    window.addEventListener('mousemove', e => { if (draggingSpark) scrubSparkFromEvent(e); });
+    window.addEventListener('mouseup', () => { draggingSpark = false; });
+
+    window.addEventListener('keydown', e => {
+      if (e.target && ['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
+      if (e.code === 'Space') { e.preventDefault(); elBtnPlay.click(); }
+      else if (e.code === 'ArrowLeft') { e.preventDefault(); elBtnPrev.click(); }
+      else if (e.code === 'ArrowRight') { e.preventDefault(); elBtnNext.click(); }
+      else if (e.key === 'r' || e.key === 'R') { elBtnRestart.click(); }
+      else if (e.key >= '1' && e.key <= '9') {
+        const i = parseInt(e.key, 10) - 1;
+        if (i < REPLAYS.length) selectReplay(i);
+      }
+    });
+
+    window.addEventListener('resize', renderAll);
+    window.addEventListener('themechange', renderAll);
+
+    if (REPLAYS.length > 0) {
+      const badge = document.getElementById('headerBadge');
+      if (badge) badge.textContent = `20 Hz Exact Physics • ${REPLAYS.length} Game${REPLAYS.length === 1 ? '' : 's'}`;
+      selectReplay(0);
+      requestAnimationFrame(loop);
+    }
+  </script>
+</body>
+</html>
