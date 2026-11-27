@@ -13,6 +13,9 @@
 - **Elo Checkpoint-Ladder Evaluation & Offline Tournaments (`lzero.entry.async_split`):**
   - Live async runs support `--eval-mode {bot,elo_ladder,both}` on both `evaluator` and `launch` (default `bot`). In `elo_ladder`/`both`, `AsyncEloEvaluator` runs paired side-swapped matches on matched map seeds, fits joint Bradley-Terry MLE ratings anchored at `bot:random = 0.0`, logs `elo_iter/*` & `elo_step/*` to `log/elo_evaluator/`, persists rungs/state under `elo_ladder/` (full `--resume` support), and saves `ckpt/elo_ckpt_best.pth.tar`.
   - Standalone offline tournaments run via `python3 -m lzero.entry.async_split tournament --config <cfg> --ckpt-dir <dir> --mode {ladder,round_robin}` (supports repeatable `--ckpt-dir`, cross-config `label=ckpt@cfg` specs, `--resume`, and `--write-tb`).
+- **Shared Experiments Registry & Resource Balancer Coordination (`/home/evan/LightZero/data_sez/experiments_registry.md`):**
+  - Before starting, stopping, pausing, or reallocating GPU/CPU resources for any training run, **always read `/home/evan/LightZero/data_sez/experiments_registry.md`** and follow its **Resource Balancer Protocol** (`RUNNING`, `PENDING_LAUNCH`, `LOCKED`, `PAUSED`, `STOPPED`, `COMPLETED`). Never auto-restart `PAUSED`, `STOPPED`, or `COMPLETED` runs, and preserve GPU/CPU headroom when a run is marked `PENDING_LAUNCH`.
+  - After launching, stopping, pausing, planning, or rebalancing any run, update its row in the registry and append a 1-line timestamped entry to the **Cross-Conversation Handoff Log**.
 - **Rebuilding C++ / Cython MCTS (`ctree`) extensions:**
   Whenever you edit any `.cpp`, `.h`, or `.pyx` file under `lzero/mcts/ctree/`, you **must** recompile before running tests or training:
   ```bash
