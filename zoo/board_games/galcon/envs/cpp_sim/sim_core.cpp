@@ -3277,4 +3277,220 @@ int32_t sim_encode_obs_and_mask(
     return 0;
 }
 
+// Fast native C++ action picker for GalconFixedPolicyBot (mode=0) and GalconRandomBot (mode=1).
+// Returns exact legal action ID (>= 0), or -1 if fallback to Python is needed (e.g. grid > 1024 cells).
+int32_t sim_pick_bot_action(
+    const SimState* st,
+    int32_t current_player,
+    int32_t grid_width,
+    int32_t grid_height,
+    double grid_max_x,
+    double grid_max_y,
+    double grid_square_size,
+    double send_ratio,
+    double min_send_ships,
+    int32_t enable_fleet_redirection,
+    int32_t mode,
+    uint64_t rng_val
+) {
+    if (!st) return -1;
+    const int32_t grid_cells = grid_width * grid_height;
+    if (grid_cells <= 0 || grid_cells > 1024) return -1;
+    const int32_t np = st->n_planets;
+    const int32_t nf = st->n_fleets;
+    const int32_t w_m1 = grid_width - 1;
+    const int32_t h_m1 = grid_height - 1;
+    const int32_t pair_action_count = grid_cells * grid_cells;
+
+    int32_t cell_tgt_id[1024];
+    int32_t cell_fr_id[1024];
+    uint8_t cell_fr_can[1024];
+    int32_t tgt_cells[SIM_MAX_PLANETS];
+    int32_t src_cells[SIM_MAX_PLANETS];
+    int32_t n_tgt = 0;
+    int32_t n_src = 0;
+
+    for (int32_t c = 0; c < grid_cells; ++c) {
+        cell_tgt_id[c] = -1;
+        cell_fr_id[c] = -1;
+        cell_fr_can[c] = 0;
+    }
+
+    auto world_to_cell = [&](double x, double y) -> int32_t {
+        int32_t gx = static_cast<int32_t>(std::floor((x + grid_max_x) / grid_square_size));
+        if (gx < 0) gx = 0;
+        else if (gx > w_m1) gx = w_m1;
+        int32_t gy = static_cast<int32_t>(std::floor((y + grid_max_y) / grid_square_size));
+        if (gy < 0) gy = 0;
+        else if (gy > h_m1) gy = h_m1;
+        return gy * grid_width + gx;
+    };
+
+    auto cell_tuple_key = [&](int32_t cell) -> int32_t {
+        const int32_t gx = cell % grid_width;
+        const int32_t gy = cell / grid_width;
+        return (gx << 16) | gy;
+    };
+
+    for (int32_t i = 0; i < np; ++i) {
+        const int32_t cell = world_to_cell(st->p_x[i], st->p_y[i]);
+        const int32_t pid = st->p_id[i];
+        if (cell_tgt_id[cell] < 0) {
+            cell_tgt_id[cell] = pid;
+            tgt_cells[n_tgt++] = cell;
+        } else if (pid < cell_tgt_id[cell]) {
+            cell_tgt_id[cell] = pid;
+        }
+        if (st->p_owner[i] == current_player) {
+            if (cell_fr_id[cell] < 0 || pid < cell_fr_id[cell]) {
+                cell_fr_id[cell] = pid;
+            }
+            const double ships = st->p_ships[i];
+            if (ships > 0.0) {
+                const double scaled = ships * send_ratio;
+                const double to_send = std::floor(ships < scaled ? ships : scaled);
+                if (to_send >= min_send_ships && to_send > 0.0) {
+                    if (!cell_fr_can[cell]) {
+                        cell_fr_can[cell] = 1;
+                        src_cells[n_src++] = cell;
+                    }
+                }
+            }
+        }
+    }
+
+    if (n_tgt == 0) return 0;
+
+    // Sort helper for (gx, gy) tuple order (only needed for fixed mode)
+    auto sort_cells_xy = [&](int32_t* arr, int32_t cnt) {
+        for (int32_t a = 1; a < cnt; ++a) {
+            const int32_t kc = arr[a];
+            const int32_t kk = cell_tuple_key(kc);
+            int32_t b = a - 1;
+            while (b >= 0 && cell_tuple_key(arr[b]) > kk) {
+                arr[b + 1] = arr[b];
+                --b;
+            }
+            arr[b + 1] = kc;
+        }
+    };
+
+    if (mode == 0) {
+        // Fixed policy: exact first non-pass action in sorted (sx, sy), (tx, ty) order (sends before redirects)
+        sort_cells_xy(tgt_cells, n_tgt);
+        if (n_src > 0) {
+            sort_cells_xy(src_cells, n_src);
+            for (int32_t si = 0; si < n_src; ++si) {
+                const int32_t sc = src_cells[si];
+                const int32_t src_id = cell_fr_id[sc];
+                for (int32_t ti = 0; ti < n_tgt; ++ti) {
+                    const int32_t tc = tgt_cells[ti];
+                    if (src_id != cell_tgt_id[tc]) {
+                        return sc * grid_cells + tc + 1;
+                    }
+                }
+            }
+        }
+        if (enable_fleet_redirection && nf > 0) {
+            int32_t redir_cell_tgt[1024];
+            int32_t redir_cells[SIM_MAX_FLEETS];
+            int32_t n_redir = 0;
+            for (int32_t c = 0; c < grid_cells; ++c) redir_cell_tgt[c] = -2;
+            for (int32_t f = 0; f < nf; ++f) {
+                if (st->fl_owner[f] != current_player) continue;
+                const int32_t tidx = st->fl_target_idx[f];
+                const int32_t ftgt_id = (tidx >= 0 && tidx < np) ? st->p_id[tidx] : -1;
+                const int32_t cell = world_to_cell(st->fl_cx[f], st->fl_cy[f]);
+                if (redir_cell_tgt[cell] == -2) {
+                    redir_cell_tgt[cell] = ftgt_id;
+                    redir_cells[n_redir++] = cell;
+                } else if (redir_cell_tgt[cell] != -1 && redir_cell_tgt[cell] != ftgt_id) {
+                    redir_cell_tgt[cell] = -1;
+                }
+            }
+            if (n_redir > 0) {
+                sort_cells_xy(redir_cells, n_redir);
+                const int32_t redir_offset = pair_action_count + 1;
+                for (int32_t ri = 0; ri < n_redir; ++ri) {
+                    const int32_t sc = redir_cells[ri];
+                    const int32_t only_tgt = redir_cell_tgt[sc];
+                    for (int32_t ti = 0; ti < n_tgt; ++ti) {
+                        const int32_t tc = tgt_cells[ti];
+                        if (only_tgt == -1 || cell_tgt_id[tc] != only_tgt) {
+                            return sc * grid_cells + tc + redir_offset;
+                        }
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    // mode == 1: Uniform random legal non-pass action
+    int32_t redir_cell_tgt[1024];
+    int32_t redir_cells[SIM_MAX_FLEETS];
+    int32_t n_redir = 0;
+    if (enable_fleet_redirection && nf > 0) {
+        for (int32_t c = 0; c < grid_cells; ++c) redir_cell_tgt[c] = -2;
+        for (int32_t f = 0; f < nf; ++f) {
+            if (st->fl_owner[f] != current_player) continue;
+            const int32_t tidx = st->fl_target_idx[f];
+            const int32_t ftgt_id = (tidx >= 0 && tidx < np) ? st->p_id[tidx] : -1;
+            const int32_t cell = world_to_cell(st->fl_cx[f], st->fl_cy[f]);
+            if (redir_cell_tgt[cell] == -2) {
+                redir_cell_tgt[cell] = ftgt_id;
+                redir_cells[n_redir++] = cell;
+            } else if (redir_cell_tgt[cell] != -1 && redir_cell_tgt[cell] != ftgt_id) {
+                redir_cell_tgt[cell] = -1;
+            }
+        }
+    }
+
+    int32_t total = 0;
+    for (int32_t si = 0; si < n_src; ++si) {
+        const int32_t src_id = cell_fr_id[src_cells[si]];
+        for (int32_t ti = 0; ti < n_tgt; ++ti) {
+            if (src_id != cell_tgt_id[tgt_cells[ti]]) ++total;
+        }
+    }
+    for (int32_t ri = 0; ri < n_redir; ++ri) {
+        const int32_t only_tgt = redir_cell_tgt[redir_cells[ri]];
+        if (only_tgt == -1) {
+            total += n_tgt;
+        } else {
+            for (int32_t ti = 0; ti < n_tgt; ++ti) {
+                if (cell_tgt_id[tgt_cells[ti]] != only_tgt) ++total;
+            }
+        }
+    }
+
+    if (total <= 0) return 0;
+
+    int32_t pick = static_cast<int32_t>(rng_val % static_cast<uint64_t>(total));
+    for (int32_t si = 0; si < n_src; ++si) {
+        const int32_t sc = src_cells[si];
+        const int32_t src_id = cell_fr_id[sc];
+        for (int32_t ti = 0; ti < n_tgt; ++ti) {
+            const int32_t tc = tgt_cells[ti];
+            if (src_id != cell_tgt_id[tc]) {
+                if (pick == 0) return sc * grid_cells + tc + 1;
+                --pick;
+            }
+        }
+    }
+    const int32_t redir_offset = pair_action_count + 1;
+    for (int32_t ri = 0; ri < n_redir; ++ri) {
+        const int32_t sc = redir_cells[ri];
+        const int32_t only_tgt = redir_cell_tgt[sc];
+        for (int32_t ti = 0; ti < n_tgt; ++ti) {
+            const int32_t tc = tgt_cells[ti];
+            if (only_tgt == -1 || cell_tgt_id[tc] != only_tgt) {
+                if (pick == 0) return sc * grid_cells + tc + redir_offset;
+                --pick;
+            }
+        }
+    }
+    return 0;
+}
+
 } // extern "C"

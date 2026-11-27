@@ -1,3 +1,4 @@
+import random
 import numpy as np
 
 
@@ -16,12 +17,18 @@ class GalconPassBot:
 class GalconRandomBot:
     """
     Random policy bot for Galcon. Takes a random non-pass action.
+    Uses a fast native C++ picker on GalconEnv's live SimState when available.
     """
 
     def __init__(self, env) -> None:
         self.env = env
 
     def get_action(self) -> int:
+        picker = getattr(self.env, '_pick_cpp_bot_action', None)
+        if picker is not None:
+            act = picker(1, random.getrandbits(63))
+            if act >= 0:
+                return act
         non_pass_actions = [action for action in self.env.legal_actions if action != self.env.pass_action]
         if len(non_pass_actions) > 0:
             return int(np.random.choice(non_pass_actions))
@@ -34,12 +41,18 @@ class GalconFixedPolicyBot:
 
     Phase 2 behavior:
         Return the first legal non-pass action if available; otherwise pass.
+    Uses a fast native C++ picker on GalconEnv's live SimState when available.
     """
 
     def __init__(self, env) -> None:
         self.env = env
 
     def get_action(self) -> int:
+        picker = getattr(self.env, '_pick_cpp_bot_action', None)
+        if picker is not None:
+            act = picker(0)
+            if act >= 0:
+                return act
         for action in self.env.legal_actions:
             if action != self.env.pass_action:
                 return int(action)

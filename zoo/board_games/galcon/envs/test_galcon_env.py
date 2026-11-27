@@ -1414,8 +1414,8 @@ class TestGalconEnv:
             env.reset()
             for i in range(len(env.planets)):
                 p_i = env.planets[i]
-                assert abs(p_i.x) <= env.grid_max_x - (p_i.radius + GalconEnv.PLANETS_SETTLE_PADDING) + 1e-6
-                assert abs(p_i.y) <= env.grid_max_y - (p_i.radius + GalconEnv.PLANETS_SETTLE_PADDING) + 1e-6
+                assert abs(p_i.x) <= env.grid_max_x - (p_i.radius + GalconEnv.SHIP_RADIUS) + 1e-6
+                assert abs(p_i.y) <= env.grid_max_y - (p_i.radius + GalconEnv.SHIP_RADIUS) + 1e-6
                 for j in range(i + 1, len(env.planets)):
                     p_j = env.planets[j]
                     dist = math.hypot(p_i.x - p_j.x, p_i.y - p_j.y)

@@ -241,3 +241,57 @@ class TestGalconRuleBots:
             assert summary.wins_a + summary.losses_a + summary.draws == 2
         finally:
             runner.close()
+
+    @pytest.mark.parametrize('enable_redir', [False, True])
+    def test_cpp_random_and_fixed_bots_match_python_semantics(self, enable_redir: bool) -> None:
+        """Fast C++ GalconFixedPolicyBot matches exact Python legal_actions order (sends then redirects),
+        and GalconRandomBot samples uniformly from legal non-pass actions (falling back to pass when empty).
+        """
+        cfg = EasyDict(self.cfg)
+        cfg.update(dict(
+            battle_mode='self_play_mode',
+            num_planets=16,
+            grid_max_x=240.0,
+            grid_max_y=160.0,
+            enable_fleet_redirection=enable_redir,
+            map_seed=77,
+            max_episode_steps=40,
+        ))
+        env = GalconEnv(cfg)
+        env.reset()
+        fixed_bot = GalconFixedPolicyBot(env)
+        rand_bot = GalconRandomBot(env)
+
+        for step in range(30):
+            legal = env.legal_actions
+            non_pass = [a for a in legal if a != env.pass_action]
+            expected_fixed = non_pass[0] if non_pass else env.pass_action
+            got_fixed = fixed_bot.get_action()
+            assert got_fixed == expected_fixed, f"step={step}: fixed got {got_fixed}, expected {expected_fixed}"
+
+            got_rand = rand_bot.get_action()
+            if non_pass:
+                assert got_rand in non_pass
+            else:
+                assert got_rand == env.pass_action
+
+            _, _, done, _ = env.step(got_rand)
+            if done:
+                break
+
+        # Verify redirect-only & pass-only states when no friendly planet can send
+        for p in env.planets:
+            if p.owner == env._current_player:
+                p.ships = 0.0
+        legal = env.legal_actions
+        non_pass = [a for a in legal if a != env.pass_action]
+        expected_fixed = non_pass[0] if non_pass else env.pass_action
+        assert fixed_bot.get_action() == expected_fixed
+        got_rand = rand_bot.get_action()
+        assert (got_rand in non_pass) if non_pass else (got_rand == env.pass_action)
+
+        # Remove all fleets -> pass-only state
+        env.fleets = []
+        assert fixed_bot.get_action() == env.pass_action
+        assert rand_bot.get_action() == env.pass_action
+        env.close()

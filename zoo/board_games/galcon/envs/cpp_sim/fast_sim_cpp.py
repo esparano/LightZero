@@ -289,6 +289,12 @@ def _load_or_build_lib() -> Optional[ctypes.CDLL]:
         ]
         lib.sim_encode_obs_and_mask.restype = _C_I32
 
+        lib.sim_pick_bot_action.argtypes = [
+            _C_VP, _C_I32, _C_I32, _C_I32, _C_F64, _C_F64, _C_F64,
+            _C_F64, _C_F64, _C_I32, _C_I32, ctypes.c_uint64,
+        ]
+        lib.sim_pick_bot_action.restype = _C_I32
+
         return lib
     except Exception:
         return None
@@ -1711,6 +1717,40 @@ class EnvCppSimHandle:
             ptr_out_mask,
         )
         return rc == 0
+
+    def pick_bot_action(
+        self,
+        cur_player: int,
+        grid_width: int,
+        grid_height: int,
+        grid_max_x: float,
+        grid_max_y: float,
+        grid_square_size: float,
+        send_ratio: float,
+        min_send_ships: float,
+        enable_fleet_redirection: bool,
+        mode: int,
+        rng_val: int = 0,
+    ) -> int:
+        handle = self._handle
+        if handle is None:
+            return -1
+        return int(
+            self._lib.sim_pick_bot_action(
+                handle,
+                cur_player,
+                grid_width,
+                grid_height,
+                grid_max_x,
+                grid_max_y,
+                grid_square_size,
+                send_ratio,
+                min_send_ships,
+                1 if enable_fleet_redirection else 0,
+                mode,
+                rng_val & 0xFFFFFFFFFFFFFFFF,
+            )
+        )
 
 
 __all__ = [

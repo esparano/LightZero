@@ -579,11 +579,11 @@ class GalconEnv(BaseEnv):
             map_seed = self._resolve_map_seed()
         rng = np.random.RandomState(map_seed)
 
-        # Clamp all planets within map boundaries before checking overlaps (matches G2 planets_settle)
+        # Clamp all planets within map boundaries before checking overlaps
         for i in range(0, len(self.planets), 2):
             p_i = self.planets[i]
-            margin_x = p_i.radius + self.PLANETS_SETTLE_PADDING
-            margin_y = p_i.radius + self.PLANETS_SETTLE_PADDING
+            margin_x = p_i.radius + self.SHIP_RADIUS
+            margin_y = p_i.radius + self.SHIP_RADIUS
             p_i.x = max(-self.grid_max_x + margin_x, min(self.grid_max_x - margin_x, p_i.x))
             p_i.y = max(-self.grid_max_y + margin_y, min(self.grid_max_y - margin_y, p_i.y))
             p_odd = self.planets[i + 1]
@@ -634,9 +634,9 @@ class GalconEnv(BaseEnv):
                 p_i.x += dx
                 p_i.y += dy
 
-                # Keep within map boundaries (matching G2 planets_settle edge padding)
-                margin_x = p_i.radius + self.PLANETS_SETTLE_PADDING
-                margin_y = p_i.radius + self.PLANETS_SETTLE_PADDING
+                # Keep within map boundaries
+                margin_x = p_i.radius + self.SHIP_RADIUS
+                margin_y = p_i.radius + self.SHIP_RADIUS
                 p_i.x = max(-self.grid_max_x + margin_x, min(self.grid_max_x - margin_x, p_i.x))
                 p_i.y = max(-self.grid_max_y + margin_y, min(self.grid_max_y - margin_y, p_i.y))
 
@@ -2287,6 +2287,24 @@ class GalconEnv(BaseEnv):
             'ships_player_1': self._total_ships(self.PLAYER_1),
             'ships_player_2': self._total_ships(self.PLAYER_2),
         }
+
+    def _pick_cpp_bot_action(self, mode: int, rng_val: int = 0) -> int:
+        """Fast C++ action picker for fixed (mode=0) and random (mode=1) rule bots (-1 on fallback)."""
+        if self.use_cpp_sim and self.grid_cell_count <= 1024 and self._sync_cpp_sim():
+            return self._cpp_sim.pick_bot_action(
+                self._current_player,
+                self.grid_width,
+                self.grid_height,
+                self.grid_max_x,
+                self.grid_max_y,
+                self.grid_square_size,
+                self.send_ratio,
+                self.min_send_ships,
+                self.enable_fleet_redirection,
+                mode,
+                rng_val,
+            )
+        return -1
 
     def random_action(self) -> int:
         return int(np.random.choice(self.legal_actions))
