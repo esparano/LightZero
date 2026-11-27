@@ -322,7 +322,7 @@ class OfflineTournament:
         default_input_cfg: Tuple[dict, dict],
         checkpoints: Sequence[CheckpointSpec],
         output_dir: os.PathLike | str,
-        anchor_bots: Optional[Sequence[str] | str] = ('random',),
+        anchor_bots: Optional[Sequence[str] | str] = None,
         games_per_pair: int = 10,
         mode: str = 'ladder',
         num_rounds: int = 6,
@@ -387,7 +387,7 @@ class OfflineTournament:
             self._policy_slots: Dict[Tuple[str, int], Tuple[Any, EasyDict]] = {}
             self._bot_players: Dict[str, EnvBotMatchPlayer] = {}
 
-            parsed_anchors = _parse_anchor_bots(anchor_bots)
+            parsed_anchors = _parse_anchor_bots(anchor_bots, env_cfg=self._default_cfg.env)
             self.ladder = EloLadder(
                 anchor_bots=parsed_anchors,
                 anchor_elo=0.0,

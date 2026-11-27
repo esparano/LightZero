@@ -173,7 +173,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument('--device', default='cpu', choices=['cpu', 'cuda', 'auto'], help='Evaluation device.')
     p_eval.add_argument('--env-num', type=int, default=None, help='Override evaluator_env_num.')
     p_eval.add_argument('--n-episode', type=int, default=None, help='Override n_evaluator_episode (e.g. 20).')
-    p_eval.add_argument('--bot-action-type', default=None, help='Override opponent bot type (e.g. random, pass, fixed).')
+    p_eval.add_argument(
+        '--bot-action-type',
+        default=None,
+        help='Override opponent bot type (e.g. random, pass, fixed, mcts).',
+    )
     p_eval.add_argument('--num-simulations', type=int, default=None, help='Override MCTS num_simulations.')
     p_eval.add_argument('--env-manager', default=None, choices=['base', 'subprocess'], help='Override env_manager type.')
     p_eval.add_argument('--min-iter-gap', type=int, default=0, help='Minimum learner iterations between evaluations.')
@@ -229,8 +233,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_eval.add_argument(
         '--elo-anchor-bots',
-        default='random',
-        help="Comma-separated anchor bots (first is pinned to 0.0 Elo; default 'random').",
+        default='random,mcts',
+        help="Comma-separated anchor bots (first is pinned to 0.0 Elo; supports mcts and mcts:<sims>; default 'random,mcts').",
     )
     p_eval.add_argument(
         '--elo-prior-draws',
@@ -271,8 +275,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_tourn.add_argument(
         '--anchor-bots',
-        default='random',
-        help="Comma-separated anchor bots (first is pinned to 0.0 Elo; default 'random').",
+        default='random,mcts',
+        help="Comma-separated anchor bots (first is pinned to 0.0 Elo; supports mcts and mcts:<sims>; default 'random,mcts').",
     )
     p_tourn.add_argument(
         '--mode',
@@ -355,7 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument('--elo-promotion-win-rate', type=float, default=0.55)
     p_launch.add_argument('--elo-promotion-margin', type=float, default=50.0)
     p_launch.add_argument('--elo-periodic-promote-every', type=int, default=0)
-    p_launch.add_argument('--elo-anchor-bots', default='random')
+    p_launch.add_argument('--elo-anchor-bots', default='random,mcts')
     p_launch.add_argument('--elo-prior-draws', type=float, default=0.1)
     p_launch.add_argument('--eval-min-iter-gap', type=int, default=500)
     p_launch.add_argument('--no-evaluator', action='store_true')

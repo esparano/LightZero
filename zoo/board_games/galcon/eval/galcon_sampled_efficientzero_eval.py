@@ -41,46 +41,50 @@ if __name__ == '__main__':
     main_config.env.render_mode = 'image_savefile_mode'
     main_config.env.replay_path = './video/galcon/eval'
 
-    # Set video name based on model path and extension
+    # Set base video name based on model path and extension
+    base_replay_suffix = ''
     if model_path != None:
         exp_name_extracted = re.search(r'[^/]+/(.*?)/', model_path)
         if exp_name_extracted:
             model_version_extracted = re.search(r'([^/]+)\.pth\.tar$', model_path)
             if model_version_extracted:
-                main_config.env.replay_name_suffix = f'_{exp_name_extracted.group(1)}_{model_version_extracted.group(1)}_'
+                base_replay_suffix = f'_{exp_name_extracted.group(1)}_{model_version_extracted.group(1)}_'
 
-    main_config.env.bot_action_type = 'random'
-    # probability of eval bot's action being 
+    # Supported bots: ['fixed', 'random', 'pass', 'mcts']
+    eval_bot_types = ['random', 'mcts']
+    # probability of eval bot's action being overridden
     main_config.env.prob_pass_action_in_bot = 0
     main_config.env.prob_random_action_in_bot = 0.
 
-    # ['fixed', 'random', 'pass']
     create_config.env_manager.type = 'base'
     main_config.env.evaluator_env_num = 1
     main_config.env.n_evaluator_episode = 1
 
     total_test_episodes = num_episodes_each_seed * len(seeds)
-    returns_mean_seeds = []
-    returns_seeds = []
-    for seed in seeds:
-        returns_mean, returns = eval_muzero(
-            [main_config, create_config],
-            seed=seed,
-            num_episodes_each_seed=num_episodes_each_seed,
-            print_seed_details=True,
-            model_path=model_path
+    for bot_type in eval_bot_types:
+        main_config.env.bot_action_type = bot_type
+        main_config.env.replay_name_suffix = f'{base_replay_suffix}{bot_type}_'
+        returns_mean_seeds = []
+        returns_seeds = []
+        for seed in seeds:
+            returns_mean, returns = eval_muzero(
+                [main_config, create_config],
+                seed=seed,
+                num_episodes_each_seed=num_episodes_each_seed,
+                print_seed_details=True,
+                model_path=model_path
+            )
+            returns_mean_seeds.append(returns_mean)
+            returns_seeds.append(returns)
+
+        returns_mean_seeds = np.array(returns_mean_seeds)
+        returns_seeds = np.array(returns_seeds)
+
+        print("=" * 20)
+        print(f"[Opponent: {bot_type}] Evaluated {len(seeds)} seed(s) x {num_episodes_each_seed} episode(s).")
+        print(f"For seeds {seeds}, the mean returns are {returns_mean_seeds}, and the returns are {returns_seeds}.")
+        print("Across all seeds, the mean reward is:", returns_mean_seeds.mean())
+        print(
+            f'win rate: {len(np.where(returns_seeds == 1.)[0]) / total_test_episodes}, draw rate: {len(np.where(returns_seeds == 0.)[0]) / total_test_episodes}, lose rate: {len(np.where(returns_seeds == -1.)[0]) / total_test_episodes}'
         )
-        returns_mean_seeds.append(returns_mean)
-        returns_seeds.append(returns)
-
-    returns_mean_seeds = np.array(returns_mean_seeds)
-    returns_seeds = np.array(returns_seeds)
-
-    print("=" * 20)
-    print(f"We evaluated a total of {len(seeds)} seeds. For each seed, we evaluated {num_episodes_each_seed} episode(s).")
-    print(f"For seeds {seeds}, the mean returns are {returns_mean_seeds}, and the returns are {returns_seeds}.")
-    print("Across all seeds, the mean reward is:", returns_mean_seeds.mean())
-    print(
-        f'win rate: {len(np.where(returns_seeds == 1.)[0]) / total_test_episodes}, draw rate: {len(np.where(returns_seeds == 0.)[0]) / total_test_episodes}, lose rate: {len(np.where(returns_seeds == -1.)[0]) / total_test_episodes}'
-    )
-    print("=" * 20)
+        print("=" * 20)

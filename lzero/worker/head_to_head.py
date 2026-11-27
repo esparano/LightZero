@@ -180,13 +180,19 @@ class PolicyMatchPlayer(MatchPlayer):
 
 
 def _build_env_bot(env: Any, bot_type: str) -> Optional[Any]:
-    """Instantiate a built-in rule bot bound to ``env`` when supported."""
+    """Instantiate a built-in rule bot bound to ``env`` when supported.
+
+    On Galcon, supports ``'random'``, ``'fixed'``, ``'pass'``, ``'mcts'`` (tournament-tuned
+    64-simulation pure C++ MCTS), and parameterized simulation budgets such as
+    ``'mcts:16'``, ``'mcts:32'``, ``'mcts:64'``, ``'mcts:128'`` (or ``'mcts64'``).
+    """
     bot_key = str(bot_type).strip().lower()
     env_cfg = getattr(env, 'cfg', None)
     env_id = str(env_cfg.get('env_id', '')).lower() if isinstance(env_cfg, dict) else ''
     if env_id == 'galcon' or (hasattr(env, 'pass_action') and hasattr(env, 'planets')):
         from zoo.board_games.galcon.envs.rule_bot import (
             GalconFixedPolicyBot,
+            GalconMCTSBot,
             GalconPassBot,
             GalconRandomBot,
         )
@@ -197,6 +203,13 @@ def _build_env_bot(env: Any, bot_type: str) -> Optional[Any]:
             return GalconFixedPolicyBot(env)
         if bot_key == 'pass':
             return GalconPassBot(env)
+        if bot_key == 'mcts':
+            return GalconMCTSBot(env)
+        if bot_key.startswith('mcts:') or (bot_key.startswith('mcts') and bot_key[4:].isdigit()):
+            sims_str = bot_key.split(':', 1)[1] if ':' in bot_key else bot_key[4:]
+            if not sims_str.isdigit() or int(sims_str) < 1:
+                raise ValueError(f'Invalid Galcon MCTS bot_type: {bot_type!r} (expected mcts or mcts:<sims>)')
+            return GalconMCTSBot(env, num_simulations=int(sims_str))
         raise ValueError(f'Unsupported Galcon bot_type: {bot_type!r}')
 
     if bot_key == 'random':
@@ -207,7 +220,7 @@ def _build_env_bot(env: Any, bot_type: str) -> Optional[Any]:
 
 
 class EnvBotMatchPlayer(MatchPlayer):
-    """Built-in rule-bot player (e.g. Galcon ``random``, ``fixed``, ``pass``).
+    """Built-in rule-bot player (e.g. Galcon ``random``, ``fixed``, ``pass``, ``mcts``, ``mcts:128``).
 
     On Galcon, invokes canonical rule bots directly (independent of
     ``prob_random_action_in_bot`` / ``prob_pass_action_in_bot``) so Elo anchors

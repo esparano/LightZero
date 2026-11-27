@@ -567,6 +567,7 @@ def test_retroactive_best_rung_inversion_updates_elo_ckpt_best(tmp_path):
         evaluator_env_num=1,
         games_per_opponent=10,
         opponents_per_eval=4,
+        anchor_bots=('random',),
     )
     try:
         # Save distinct rung checkpoints for iter_100 and iter_200
@@ -759,6 +760,7 @@ def test_elo_evaluator_promotion_uses_post_refit_champion_score(tmp_path):
         opponents_per_eval=4,
         promotion_win_rate=0.55,
         promotion_elo_margin=50.0,
+        anchor_bots=('random',),
     )
     try:
         p100 = elo_eval.dirs.elo_rungs_dir / 'iter_100.pth.tar'
@@ -974,3 +976,66 @@ def test_cli_parses_elo_evaluator_launch_and_tournament_args():
     assert tourn_args.mode == 'ladder'
     assert tourn_args.write_tb is True
     assert tourn_args.resume is True
+
+
+@pytest.mark.unittest
+def test_head_to_head_and_elo_evaluator_support_mcts_anchor_bot(tmp_path):
+    """Verify MCTS bot (default and parameterized mcts:<sims>) works in HeadToHeadRunner,
+    AsyncEloEvaluator (default Galcon anchors include both random and mcts), and CLI defaults.
+    """
+    parser = build_parser()
+    assert parser.parse_args(['evaluator']).elo_anchor_bots == 'random,mcts'
+    assert parser.parse_args(['launch']).elo_anchor_bots == 'random,mcts'
+    assert parser.parse_args(['tournament']).anchor_bots == 'random,mcts'
+
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    cfg_pair[0].env.max_episode_steps = 12
+    cfg_pair[0].env.mcts_num_simulations = 16
+    compiled = compile_config(
+        copy.deepcopy(cfg_pair[0]), seed=0, env=None, auto=True, create_cfg=copy.deepcopy(cfg_pair[1]), save_cfg=False
+    )
+    env_fn, collector_env_cfg, _ = get_vec_env_setting(compiled.env)
+    runner = HeadToHeadRunner(env_fn=env_fn, env_cfg=collector_env_cfg[0], env_num=2)
+    try:
+        bot_mcts = EnvBotMatchPlayer('mcts:16')
+        bot_pass = EnvBotMatchPlayer('pass')
+        summary = runner.play_match(bot_mcts, bot_pass, num_games=2, seed=19)
+        assert summary.total_games == 2
+        assert summary.win_rate_a >= 0.5
+    finally:
+        runner.close()
+
+    run_dir = tmp_path / 'elo_mcts_default_anchors'
+    dirs = AsyncSplitDirs.from_root(run_dir)
+    dirs.ensure_exists()
+    elo_eval = AsyncEloEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=7,
+        device='cpu',
+        evaluator_env_num=2,
+        games_per_opponent=2,
+        opponents_per_eval=4,
+        max_ladder_size=4,
+        min_iter_gap=0,
+    )
+    try:
+        assert elo_eval.ladder.anchor_bot_types == ['random', 'mcts']
+        assert elo_eval.ladder.anchor_id == 'bot:random'
+        publish_weights(
+            dirs.latest_weights_path,
+            elo_eval.candidate_policy._model.state_dict(),
+            train_iter=0,
+            envstep=0,
+        )
+        res = elo_eval.eval_once_if_updated()
+        assert res is not None
+        opps_played = {m['opponent_id'] for m in res['matches']}
+        assert {'bot:random', 'bot:mcts'}.issubset(opps_played)
+    finally:
+        elo_eval.close()
+
+    tb_tags = _read_tb_tags(dirs.log_dir / 'elo_evaluator')
+    assert 'elo_iter/win_rate_vs_bot_random' in tb_tags
+    assert 'elo_iter/win_rate_vs_bot_mcts' in tb_tags
+

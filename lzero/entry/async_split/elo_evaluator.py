@@ -51,14 +51,25 @@ def _ding_exp_name(root_dir: Path) -> str:
     return os.path.relpath(str(root_dir), os.getcwd())
 
 
-def _parse_anchor_bots(anchor_bots: Optional[Sequence[str] | str]) -> List[str]:
+def _default_anchor_bots_for_env(env_cfg: Optional[Dict[str, Any]]) -> List[str]:
+    env_id = str(env_cfg.get('env_id', '')).lower() if isinstance(env_cfg, dict) else ''
+    if env_id == 'galcon':
+        return ['random', 'mcts']
+    return ['random']
+
+
+def _parse_anchor_bots(
+    anchor_bots: Optional[Sequence[str] | str],
+    env_cfg: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    default_bots = _default_anchor_bots_for_env(env_cfg)
     if anchor_bots is None:
-        return ['random']
+        return default_bots
     if isinstance(anchor_bots, str):
         items = [s.strip() for s in anchor_bots.split(',') if s.strip()]
-        return items if items else ['random']
+        return items if items else default_bots
     items = [str(s).strip() for s in anchor_bots if str(s).strip()]
-    return items if items else ['random']
+    return items if items else default_bots
 
 
 class AsyncEloEvaluator:
@@ -77,7 +88,7 @@ class AsyncEloEvaluator:
         promotion_win_rate: float = 0.55,
         promotion_elo_margin: float = 50.0,
         periodic_promote_every: int = 0,
-        anchor_bots: Optional[Sequence[str] | str] = ('random',),
+        anchor_bots: Optional[Sequence[str] | str] = None,
         prior_draws: float = 0.1,
         num_simulations: Optional[int] = None,
         min_iter_gap: int = 0,
@@ -149,7 +160,7 @@ class AsyncEloEvaluator:
             )
             self._bot_players: Dict[str, EnvBotMatchPlayer] = {}
 
-            parsed_anchors = _parse_anchor_bots(anchor_bots)
+            parsed_anchors = _parse_anchor_bots(anchor_bots, env_cfg=self.cfg.env)
             self.ladder = EloLadder(
                 anchor_bots=parsed_anchors,
                 anchor_elo=0.0,
@@ -556,6 +567,11 @@ class AsyncEloEvaluator:
             scalars['win_rate_vs_champion'] = float(score_vs_champion)
         if score_vs_anchor is not None:
             scalars['win_rate_vs_anchor'] = float(score_vs_anchor)
+        for bot_type in self.ladder.anchor_bot_types:
+            bot_pid = f'bot:{bot_type}'
+            if bot_pid in scores_by_opp:
+                safe_bot = bot_type.replace(':', '_')
+                scalars[f'win_rate_vs_bot_{safe_bot}'] = float(scores_by_opp[bot_pid])
 
         for tag, val in scalars.items():
             if not math.isfinite(val):

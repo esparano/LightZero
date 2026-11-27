@@ -74,7 +74,7 @@ class AsyncEvaluator:
         elo_promotion_win_rate: float = 0.55,
         elo_promotion_margin: float = 50.0,
         elo_periodic_promote_every: int = 0,
-        elo_anchor_bots: Optional[Sequence[str] | str] = ('random',),
+        elo_anchor_bots: Optional[Sequence[str] | str] = None,
         elo_prior_draws: float = 0.1,
     ) -> None:
         if eval_mode not in {'bot', 'elo_ladder', 'both'}:
