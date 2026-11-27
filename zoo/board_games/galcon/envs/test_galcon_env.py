@@ -954,3 +954,48 @@ class TestGalconEnv:
         assert ts1.obs['to_play'] == 2
         ts2 = env_sp.step(env_sp.pass_action)
         assert ts2.obs['to_play'] == 1
+
+    def test_min_send_ships_enforced_after_send_ratio_and_integer_fleets(self) -> None:
+        """Classic Galcon send rule: sent fleets are floored to whole ships and must be >= min_send_ships.
+
+        With send_ratio=0.5 and min_send_ships=1, planets with 1.0 <= ships < 2.0 must NOT be able
+        to launch sub-1-ship (0-labeled) fleets, while planets with >= 2.0 ships send floor(ships * 0.5)
+        whole ships and preserve fractional production progress on the source planet.
+        """
+        env = GalconEnv(self.cfg)
+        env.reset()
+
+        p1 = env.planets[0]
+        p2 = env.planets[1]
+        p1_gx, p1_gy = env._world_to_grid(p1.x, p1.y)
+        p2_gx, p2_gy = env._world_to_grid(p2.x, p2.y)
+        send_act = env.encode_action(p1_gx, p1_gy, p2_gx, p2_gy)
+
+        # 1.9 ships * 0.5 = 0.95 -> floor = 0 < min_send_ships (1): illegal & no-op
+        p1.ships = 1.9
+        env._legal_actions = None
+        assert send_act not in env.legal_actions
+        assert env.observe()['action_mask'][send_act] == 0
+        env._apply_action(send_act)
+        assert len(env.fleets) == 0
+        assert p1.ships == pytest.approx(1.9)
+
+        # Exactly 2.0 ships * 0.5 = 1.0 -> legal, launches 1 whole ship, leaves 1.0
+        p1.ships = 2.0
+        env._legal_actions = None
+        assert send_act in env.legal_actions
+        assert env.observe()['action_mask'][send_act] == 1
+        env._apply_action(send_act)
+        assert len(env.fleets) == 1
+        assert env.fleets[-1].ships == 1.0
+        assert p1.ships == pytest.approx(1.0)
+
+        # Fractional 5.9 ships * 0.5 = 2.95 -> launches floor(2.95) = 2 whole ships, leaves 3.9
+        env.fleets.clear()
+        p1.ships = 5.9
+        env._legal_actions = None
+        assert send_act in env.legal_actions
+        env._apply_action(send_act)
+        assert len(env.fleets) == 1
+        assert env.fleets[-1].ships == 2.0
+        assert p1.ships == pytest.approx(3.9)

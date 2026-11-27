@@ -588,13 +588,10 @@ class GalconEnv(BaseEnv):
             return
         if source.owner != self._current_player:
             return
-        if source.ships < self.min_send_ships:
+        if not self._can_send_from_planet(source):
             return
 
-        ships_to_send = min(source.ships, source.ships * self.send_ratio)
-        if ships_to_send <= 0:
-            return
-
+        ships_to_send = self._ships_to_send(source.ships)
         source.ships -= ships_to_send
         source.ships = max(0.0, source.ships)
 
@@ -783,6 +780,14 @@ class GalconEnv(BaseEnv):
         _, source_x, source_y, target_x, target_y = self.decode_action_with_type(action)
         return source_x, source_y, target_x, target_y
 
+    def _ships_to_send(self, source_ships: float) -> float:
+        ships = max(0.0, float(source_ships))
+        return float(math.floor(min(ships, ships * self.send_ratio)))
+
+    def _can_send_from_planet(self, planet: Planet) -> bool:
+        ships_to_send = self._ships_to_send(planet.ships)
+        return ships_to_send >= self.min_send_ships and ships_to_send > 0
+
     # TODO: This is expensive and may be called more than once. Good candidate for optimization.
     @property
     def legal_actions(self) -> List[int]:
@@ -794,7 +799,7 @@ class GalconEnv(BaseEnv):
 
         for planet in self.planets:
             grid_x, grid_y = self._world_to_grid(planet.x, planet.y)
-            if planet.owner == self._current_player and planet.ships >= self.min_send_ships:
+            if planet.owner == self._current_player and self._can_send_from_planet(planet):
                 friendly_source_cells.add((grid_x, grid_y))
             target_cells.add((grid_x, grid_y))
 
