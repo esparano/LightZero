@@ -136,6 +136,7 @@ class SampledEfficientZeroMCTSPtree(object):
 
             # minimax value storage
             min_max_stats_lst = MinMaxStatsList(batch_size)
+            min_max_stats_lst.set_delta(self._cfg.value_delta_max)
 
             for simulation_index in range(self._cfg.num_simulations):
                 # In each simulation, we expanded a new node, so in one search, we have ``num_simulations`` num of nodes at most.

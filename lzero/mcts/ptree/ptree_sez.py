@@ -892,7 +892,7 @@ def batch_backpropagate(
 
         # ****** backpropagate ******
         if to_play is None:
-            backpropagate(results.search_paths[i], min_max_stats_lst.stats_lst[i], 0, values[i], discount_factor)
+            backpropagate(results.search_paths[i], min_max_stats_lst.stats_lst[i], -1, values[i], discount_factor)
         else:
             backpropagate(
                 results.search_paths[i], min_max_stats_lst.stats_lst[i], to_play[i], values[i], discount_factor
