@@ -928,3 +928,29 @@ class TestGalconEnv:
                     p_i, p_j = env_20p.planets[i], env_20p.planets[j]
                     dist = np.hypot(p_i.x - p_j.x, p_i.y - p_j.y)
                     assert dist >= (p_i.radius + p_j.radius) - 1e-4
+
+    def test_to_play_invariant_across_battle_modes(self) -> None:
+        """BUG-8: play_with_bot_mode and eval_mode must emit to_play=-1 on reset and every step
+        (single-agent MDP with agent+bot per step), whereas self_play_mode alternates {1, 2}.
+        """
+        for mode in ['play_with_bot_mode', 'eval_mode']:
+            cfg = EasyDict(GalconEnv.default_config())
+            cfg.update(dict(battle_mode=mode, bot_action_type='pass', num_planets=4, max_episode_steps=4, map_seed=2))
+            env = GalconEnv(cfg)
+            obs = env.reset()
+            assert obs['to_play'] == -1, f"Expected to_play=-1 on reset in {mode}, got {obs['to_play']}"
+            done = False
+            while not done:
+                ts = env.step(env.pass_action)
+                assert ts.obs['to_play'] == -1, f"Expected to_play=-1 after step in {mode}, got {ts.obs['to_play']}"
+                done = ts.done
+
+        cfg_sp = EasyDict(GalconEnv.default_config())
+        cfg_sp.update(dict(battle_mode='self_play_mode', num_planets=4, max_episode_steps=4, map_seed=2))
+        env_sp = GalconEnv(cfg_sp)
+        obs = env_sp.reset()
+        assert obs['to_play'] == 1
+        ts1 = env_sp.step(env_sp.pass_action)
+        assert ts1.obs['to_play'] == 2
+        ts2 = env_sp.step(env_sp.pass_action)
+        assert ts2.obs['to_play'] == 1

@@ -494,8 +494,9 @@ class GalconEnv(BaseEnv):
 
             bot_action = self.bot_action()
             timestep_player2 = self._player_step(bot_action, flag='bot')
-            # Player 2 has finished, so player 1 will play next
-            timestep_player2.obs['to_play'] = self.PLAYER_1
+            # In play_with_bot_mode / eval_mode, observe() emits to_play=-1 because each env.step()
+            # advances a full (agent + bot) turn and all transitions stay in Player 1's perspective.
+            timestep_player2.obs['to_play'] = -1
 
             # Invert reward from Player 2's (bot's) perspective to Player 1's (agent's) perspective.
             neg_reward = -timestep_player2.reward
@@ -844,11 +845,12 @@ class GalconEnv(BaseEnv):
 
         observation = self.current_state()
 
-        # if self.battle_mode in ['play_with_bot_mode', 'eval_mode']:
-        #     to_play = -1
-        # else:
-            # to_play = self._current_player
-        to_play = self._current_player
+        if self.battle_mode in ['play_with_bot_mode', 'eval_mode']:
+            # Single-agent perspective (each step executes agent + bot): disable MCTS minimax
+            # negation and buffer alternating sign flips. self_play_mode policies remap -1 -> 1 in _forward_eval.
+            to_play = -1
+        else:
+            to_play = self._current_player
 
         if self.debug_legal_actions:
             print(self.legal_actions)
