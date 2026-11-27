@@ -142,3 +142,37 @@ class TestGalconRuleBots:
             assert isinstance(obs, dict)
             if done:
                 break
+
+    def test_mcts_bot_defaults_and_future_ships_eval_parity(self) -> None:
+        from zoo.board_games.galcon.envs.cpp_sim import FastGalconCppSim, GalconSim, HAS_FAST_SIM_CPP, SendOrder, SimPlanet
+        from zoo.board_games.galcon.envs.cpp_sim.sim import evaluate_galcon_state
+
+        env = GalconEnv(self.cfg)
+        bot = GalconMCTSBot(env)
+        assert bot.search_engine.num_simulations == 16
+        assert bot.search_engine.rollout_ticks == 0
+        assert bot.search_engine.c_puct == pytest.approx(0.5)
+
+        # Verify C++ and Python future-ships evaluators match and penalize expensive neutral capture
+        def _eval_after_send(neutral_ships: float):
+            planets = [
+                SimPlanet(0, 1, 100.0, -100.0, 0.0, 100.0, 24.0),
+                SimPlanet(1, 2, 100.0, 150.0, 0.0, 100.0, 24.0),
+                SimPlanet(2, 0, neutral_ships, -30.0, 0.0, 20.0, 13.0),
+            ]
+            sim = GalconSim(planets, [], width=400.0, height=250.0, use_cpp=True)
+            sim.step({1: [SendOrder(0, 2, 50)]})
+            py_val = evaluate_galcon_state(sim, player=1, horizon=40)
+            if HAS_FAST_SIM_CPP:
+                cpp = FastGalconCppSim.from_sim(sim)
+                try:
+                    cpp_val = cpp.evaluate_heuristic(1, horizon=40)
+                finally:
+                    cpp.close()
+                assert cpp_val == pytest.approx(py_val, abs=1e-5)
+            return py_val
+
+        val_cheap = _eval_after_send(5.0)
+        val_expensive = _eval_after_send(49.0)
+        assert val_cheap > val_expensive + 0.05
+

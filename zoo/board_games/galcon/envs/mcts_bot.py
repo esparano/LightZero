@@ -192,12 +192,12 @@ class GalconMCTSSearch:
     def __init__(
         self,
         *,
-        num_simulations: int = 64,
+        num_simulations: int = 16,
         c_puct: float = 0.5,
         max_actions: int = 10,
         max_depth: int = 8,
         eval_horizon: int = 40,
-        rollout_ticks: int = 4,
+        rollout_ticks: int = 0,
         prior_temp: float = 1.5,
         send_percent: int = 50,
         min_send_ships: float = 1.0,
@@ -345,7 +345,7 @@ class GalconMCTSSearch:
                             w = sim_copy.winner()
                             leaf_val = 1.0 if w == node.player else (0.0 if w == 0 else -1.0)
                         else:
-                            leaf_val = float(evaluate_galcon_state(sim_copy, node.player))
+                            leaf_val = float(evaluate_galcon_state(sim_copy, node.player, horizon=self.eval_horizon))
 
                 # Backpropagate value up the search path (negating each ply for alternating two-player zero-sum)
                 v = leaf_val
@@ -391,17 +391,14 @@ class GalconMCTSBot:
     ) -> None:
         self.env = env
         cfg = getattr(env, "cfg", {})
-        resolved_sims = int(num_simulations if num_simulations is not None else cfg.get("mcts_num_simulations", 64))
-        default_rollout = 8 if resolved_sims <= 16 else 4
+        resolved_sims = int(num_simulations if num_simulations is not None else cfg.get("mcts_num_simulations", 16))
         self.search_engine = GalconMCTSSearch(
             num_simulations=resolved_sims,
             c_puct=float(c_puct if c_puct is not None else cfg.get("mcts_c_puct", 0.5)),
             max_actions=int(max_actions if max_actions is not None else cfg.get("mcts_max_actions", 10)),
             max_depth=int(max_depth if max_depth is not None else cfg.get("mcts_max_depth", 8)),
             eval_horizon=int(eval_horizon if eval_horizon is not None else cfg.get("mcts_eval_horizon", 40)),
-            rollout_ticks=int(
-                rollout_ticks if rollout_ticks is not None else cfg.get("mcts_rollout_ticks", default_rollout)
-            ),
+            rollout_ticks=int(rollout_ticks if rollout_ticks is not None else cfg.get("mcts_rollout_ticks", 0)),
             prior_temp=float(prior_temp if prior_temp is not None else cfg.get("mcts_prior_temp", 1.5)),
             send_percent=max(1, min(100, int(round(float(env.send_ratio) * 100.0)))),
             min_send_ships=float(env.min_send_ships),

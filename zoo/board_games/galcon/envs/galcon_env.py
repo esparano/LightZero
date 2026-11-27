@@ -132,13 +132,13 @@ class GalconEnv(BaseEnv):
         env_id='Galcon',
         battle_mode='self_play_mode',
         bot_action_type='random',  # {'random', 'fixed', 'pass', 'mcts'}
-        # Tournament-tuned pure C++ MCTS bot defaults (~18 ms/move, ~+860 Elo over random)
-        mcts_num_simulations=64,
+        # Pareto-optimal fast pure C++ MCTS bot defaults (~5.5 ms/move; scale to 64 sims for +113 Elo at ~15 ms/move)
+        mcts_num_simulations=16,
         mcts_c_puct=0.5,
         mcts_max_actions=10,
         mcts_max_depth=8,
         mcts_eval_horizon=40,
-        mcts_rollout_ticks=4,
+        mcts_rollout_ticks=0,
         mcts_prior_temp=1.5,
         num_planets=8,
         min_send_ships=1,

@@ -1675,11 +1675,12 @@ def project_all_planet_futures(
     return my_arrs, en_arrs, proj_owner, proj_ships
 
 
-def evaluate_galcon_state(sim: GalconSim, player: int) -> float:
-    """Fast tactical value estimate in ``[-1, +1]`` for lookahead & RL shaping."""
+def evaluate_galcon_state(sim: GalconSim, player: int, horizon: int = 24) -> float:
+    """Fast tactical value estimate in ``[-1, +1]`` (matches C++ ``sim_eval_heuristic``)."""
     if sim.done:
         w = sim.winner()
         return 1.0 if w == player else (0.0 if w == 0 else -1.0)
+    H = horizon if (0 < horizon <= 64) else 24
     opp = 2 if player == 1 else 1
     my_ships = sim.total_ships(player)
     en_ships = sim.total_ships(opp)
@@ -1687,13 +1688,32 @@ def evaluate_galcon_state(sim: GalconSim, player: int) -> float:
     en_prod = sim.total_production(opp)
     ship_adv = (my_ships - en_ships) / max(30.0, my_ships + en_ships)
     prod_adv = (my_prod - en_prod) / max(40.0, my_prod + en_prod)
-    # Also value future projected ownership after current fleets land
+    # Also value future projected ownership & post-landing ships after in-flight fleets land
     planets = list(sim.planets.values())
-    _, _, po_all, _ = project_all_planet_futures(sim, planets, player, horizon=24)
+    _, _, po_all, ps_all = project_all_planet_futures(sim, planets, player, horizon=H)
     prods = np.array([p.production for p in planets], dtype=np.float64)
     po_end = po_all[:, -1]
+    ps_end = ps_all[:, -1].astype(np.float64)
     fut_my_prod = float(prods[po_end > 0].sum())
     fut_en_prod = float(prods[po_end < 0].sum())
+    fut_my_ships = float(ps_end[po_end > 0].sum())
+    fut_en_ships = float(ps_end[po_end < 0].sum())
+    # Include fleets still in flight beyond horizon H
+    id_to_planet = {p.id: p for p in planets}
+    step_dist = max(1e-6, sim.fleet_speed * sim.tick_dt)
+    for fl in sim.fleets.values():
+        dst = id_to_planet.get(fl.target)
+        in_horizon = False
+        if dst is not None:
+            dist = max(0.0, math.hypot(dst.x - fl.x, dst.y - fl.y) - dst.radius - SHIP_RADIUS)
+            eta = max(1, int(math.ceil((dist - ARRIVAL_EPS) / step_dist)))
+            in_horizon = (0 <= (eta - 1) < H)
+        if not in_horizon:
+            if fl.owner == player:
+                fut_my_ships += float(fl.ships)
+            elif fl.owner == opp:
+                fut_en_ships += float(fl.ships)
+    fut_ship_adv = (fut_my_ships - fut_en_ships) / max(30.0, fut_my_ships + fut_en_ships)
     fut_prod_adv = (fut_my_prod - fut_en_prod) / max(40.0, fut_my_prod + fut_en_prod)
-    raw = 1.15 * ship_adv + 0.70 * prod_adv + 1.10 * fut_prod_adv
+    raw = 0.45 * ship_adv + 0.90 * fut_ship_adv + 0.50 * prod_adv + 1.10 * fut_prod_adv
     return float(math.tanh(raw))
