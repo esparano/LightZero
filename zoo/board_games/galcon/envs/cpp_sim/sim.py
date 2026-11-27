@@ -825,10 +825,10 @@ class GalconSim:
             fl_spu.append(fl.ships_per_unit)
             fl_owner.append(fl.owner)
 
-        tgt_fleets: List[List[int]] = [[] for _ in range(n_planets)]
+        owner_tgt_fleets: Dict[Tuple[int, int], List[int]] = {}
         for fi, ti in enumerate(fl_tgt_idx):
             if 0 <= ti < n_planets:
-                tgt_fleets[ti].append(fi)
+                owner_tgt_fleets.setdefault((fl_owner[fi], ti), []).append(fi)
 
         for _s in range(substeps):
             # 1. Production on owned planets
@@ -837,10 +837,9 @@ class GalconSim:
                 if p.owner > 0:
                     p.ships += p_prod_sub[i]
 
-            # 2. Same-target ship-ship circle separation (Gauss-Seidel + per-ship substep cap)
+            # 2. Same-owner same-target ship-ship circle separation (Gauss-Seidel + per-ship substep cap)
             if sep_k > 0.0:
-                for tgt_i in range(n_planets):
-                    grp = tgt_fleets[tgt_i]
+                for grp in owner_tgt_fleets.values():
                     n_grp = len(grp)
                     if n_grp == 0:
                         continue

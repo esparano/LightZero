@@ -1,6 +1,6 @@
 """Calibrated C++17 / Python Galcon multi-ship physics engine for LightZero GalconEnv."""
 
-from .fast_sim_cpp import FastGalconCppSim, HAS_FAST_SIM_CPP, step_physics_cpp
+from .fast_sim_cpp import EnvCppSimHandle, FastGalconCppSim, HAS_FAST_SIM_CPP, step_physics_cpp
 from .sim import (
     BASE_ITEM_USERS,
     DEFAULT_PHYSICS_SUBSTEPS,
@@ -17,6 +17,7 @@ from .sim import (
 __all__ = [
     "BASE_ITEM_USERS",
     "DEFAULT_PHYSICS_SUBSTEPS",
+    "EnvCppSimHandle",
     "FastGalconCppSim",
     "GalconSim",
     "HAS_FAST_SIM_CPP",

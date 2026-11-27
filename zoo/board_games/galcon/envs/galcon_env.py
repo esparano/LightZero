@@ -1,4 +1,5 @@
 import copy
+import ctypes
 import math
 import os
 from datetime import datetime
@@ -26,10 +27,12 @@ from zoo.board_games.galcon.envs.rule_bot import (
     GalconMCTSBot,
     GalconPassBot,
     GalconRandomBot,
+    build_galcon_bot,
 )
 from zoo.board_games.galcon.envs.cpp_sim import (
     BASE_ITEM_USERS,
     DEFAULT_PHYSICS_SUBSTEPS,
+    EnvCppSimHandle,
     GalconSim as _CppSimFallback,
     HAS_FAST_SIM_CPP,
     SPAWN_AREA_RADIUS,
@@ -39,7 +42,7 @@ from zoo.board_games.galcon.envs.cpp_sim import (
 from zoo.board_games.galcon.envs.cpp_sim.sim import _spawn_hash_u01
 
 
-@dataclass
+@dataclass(slots=True)
 class Planet:
     id: int
     owner: int
@@ -51,19 +54,132 @@ class Planet:
     neutral: bool
 
 
-@dataclass
 class Fleet:
-    id: int
-    owner: int
-    ships: float
-    x: float
-    y: float
-    source: int
-    target: int
-    radius: float
-    num_units: int = 1
-    units: Optional[List[List[float]]] = None
-    unit_headings: Optional[List[List[float]]] = None
+    __slots__ = (
+        'id',
+        'owner',
+        'ships',
+        'x',
+        'y',
+        'source',
+        'target',
+        'radius',
+        'num_units',
+        '_units',
+        '_unit_headings',
+        '_cpp_env',
+        '_cpp_gen',
+    )
+
+    def __init__(
+        self,
+        id: int,
+        owner: int,
+        ships: float,
+        x: float,
+        y: float,
+        source: int,
+        target: int,
+        radius: float,
+        num_units: int = 1,
+        units: Optional[List[List[float]]] = None,
+        unit_headings: Optional[List[List[float]]] = None,
+    ) -> None:
+        self.id = id
+        self.owner = owner
+        self.ships = ships
+        self.x = x
+        self.y = y
+        self.source = source
+        self.target = target
+        self.radius = radius
+        self.num_units = num_units
+        self._units = units
+        self._unit_headings = unit_headings
+        self._cpp_env: Optional['GalconEnv'] = None
+        self._cpp_gen: int = -1
+
+    @property
+    def units(self) -> Optional[List[List[float]]]:
+        if self._units is None and self._cpp_env is not None:
+            self._cpp_env._materialize_fleet_units(self)
+        return self._units
+
+    @units.setter
+    def units(self, value: Optional[List[List[float]]]) -> None:
+        self._units = value
+        if self._cpp_env is not None:
+            self._cpp_env._cpp_units_materialized = True
+            self._cpp_env = None
+
+    @property
+    def unit_headings(self) -> Optional[List[List[float]]]:
+        if self._unit_headings is None and self._cpp_env is not None:
+            self._cpp_env._materialize_fleet_units(self)
+        return self._unit_headings
+
+    @unit_headings.setter
+    def unit_headings(self, value: Optional[List[List[float]]]) -> None:
+        self._unit_headings = value
+        if self._cpp_env is not None:
+            self._cpp_env._cpp_units_materialized = True
+            self._cpp_env = None
+
+    def __repr__(self) -> str:
+        return (
+            f'Fleet(id={self.id!r}, owner={self.owner!r}, ships={self.ships!r}, '
+            f'x={self.x!r}, y={self.y!r}, source={self.source!r}, target={self.target!r}, '
+            f'radius={self.radius!r}, num_units={self.num_units!r})'
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Fleet):
+            return NotImplemented
+        return (
+            self.id == other.id
+            and self.owner == other.owner
+            and self.ships == other.ships
+            and self.x == other.x
+            and self.y == other.y
+            and self.source == other.source
+            and self.target == other.target
+            and self.radius == other.radius
+            and self.num_units == other.num_units
+            and self.units == other.units
+            and self.unit_headings == other.unit_headings
+        )
+
+    def __getstate__(self):
+        return (
+            self.id,
+            self.owner,
+            self.ships,
+            self.x,
+            self.y,
+            self.source,
+            self.target,
+            self.radius,
+            self.num_units,
+            self.units,
+            self.unit_headings,
+        )
+
+    def __setstate__(self, state) -> None:
+        (
+            self.id,
+            self.owner,
+            self.ships,
+            self.x,
+            self.y,
+            self.source,
+            self.target,
+            self.radius,
+            self.num_units,
+            self._units,
+            self._unit_headings,
+        ) = state
+        self._cpp_env = None
+        self._cpp_gen = -1
 
 
 @ENV_REGISTRY.register('galcon')
@@ -131,7 +247,7 @@ class GalconEnv(BaseEnv):
     config = dict(
         env_id='Galcon',
         battle_mode='self_play_mode',
-        bot_action_type='random',  # {'random', 'fixed', 'pass', 'mcts'}
+        bot_action_type='random',  # {'random', 'fixed', 'pass', 'mcts', 'waffle', 'waffleopt', 'sparky', 'sparkyn', 'greedy', 'expand', 'pressure', 'arcade', 'counter'}
         # Pareto-optimal fast pure C++ MCTS bot defaults (~5.5 ms/move; scale to 64 sims for +113 Elo at ~15 ms/move)
         mcts_num_simulations=16,
         mcts_c_puct=0.5,
@@ -295,17 +411,7 @@ class GalconEnv(BaseEnv):
         self.prob_random_action_in_bot = self.cfg.prob_random_action_in_bot
         self.prob_pass_action_in_bot = self.cfg.prob_pass_action_in_bot
         self.bot_action_type = self.cfg.bot_action_type
-
-        if self.bot_action_type == 'random':
-            self.bot = GalconRandomBot(self)
-        elif self.bot_action_type == 'fixed':
-            self.bot = GalconFixedPolicyBot(self)
-        elif self.bot_action_type == 'pass':
-            self.bot = GalconPassBot(self)
-        elif self.bot_action_type == 'mcts':
-            self.bot = GalconMCTSBot(self)
-        else:
-            raise ValueError(f'Unsupported Galcon bot_action_type: {self.bot_action_type}')
+        self.bot = build_galcon_bot(self, self.bot_action_type)
 
         self.debug_legal_actions = self.cfg.debug_legal_actions
         self.debug_observation = self.cfg.debug_observation
@@ -313,7 +419,28 @@ class GalconEnv(BaseEnv):
         self.planets: List[Planet] = []
         self.fleets: List[Fleet] = []
         self._current_map_seed: Optional[int] = None
+        self._cpp_sim: Optional[EnvCppSimHandle] = None
+        self._cpp_gen: int = 0
+        self._cpp_units_materialized: bool = False
+        self._cpp_cfg_sig: Optional[Tuple[float, float, int]] = None
+        self._cpp_planets_sorted: List[Planet] = []
+        self._cpp_pid_to_idx: Dict[int, int] = {}
+        self._cpp_p_snap: List[Tuple[Any, ...]] = []
+        self._cpp_f_snap: List[Tuple[Any, ...]] = []
+        self._init_cpp_bucket_buffers()
         self.reset()
+
+    def _init_cpp_bucket_buffers(self) -> None:
+        self._cpp_buckets_ref = self.LANDING_BUCKETS
+        n_b = len(self.LANDING_BUCKETS)
+        self._cpp_n_buckets = n_b
+        self._cpp_bucket_lowers = (ctypes.c_double * max(1, n_b))()
+        self._cpp_bucket_uppers = (ctypes.c_double * max(1, n_b))()
+        for i, (lo, hi) in enumerate(self.LANDING_BUCKETS):
+            self._cpp_bucket_lowers[i] = float(lo)
+            self._cpp_bucket_uppers[i] = float(hi)
+        self._ptr_cpp_bucket_lowers = ctypes.addressof(self._cpp_bucket_lowers)
+        self._ptr_cpp_bucket_uppers = ctypes.addressof(self._cpp_bucket_uppers)
 
     def reset(self, start_player_index: int = 0, replay_name_suffix: Optional[str] = None) -> dict:
         self._step_count = 0
@@ -330,6 +457,15 @@ class GalconEnv(BaseEnv):
         # Also resets planets and fleets
         self._generate_map(map_seed=episode_map_seed)
         self._settle_planets(map_seed=episode_map_seed)
+        if self.use_cpp_sim and HAS_FAST_SIM_CPP:
+            self._init_or_reset_cpp_sim()
+        elif self._cpp_sim is not None:
+            self._cpp_sim.close()
+            self._cpp_sim = None
+            self._cpp_p_snap = []
+            self._cpp_f_snap = []
+        if hasattr(self.bot, 'reset'):
+            self.bot.reset()
 
         return self.observe()
 
@@ -519,14 +655,14 @@ class GalconEnv(BaseEnv):
         if self.battle_mode == 'self_play_mode':
             return self._player_step(action, flag='agent')
         elif self.battle_mode in ['play_with_bot_mode', 'eval_mode']:
-            timestep_player1 = self._player_step(action, flag='agent')
+            timestep_player1 = self._player_step(action, flag='agent', need_obs=False)
             if timestep_player1.done:
                 # # Player 1 has finished, so player 2 will play next
                 # timestep_player1.obs['to_play'] = self.PLAYER_2
                 return timestep_player1
 
             bot_action = self.bot_action()
-            timestep_player2 = self._player_step(bot_action, flag='bot')
+            timestep_player2 = self._player_step(bot_action, flag='bot', need_obs=True)
             # In play_with_bot_mode / eval_mode, observe() emits to_play=-1 because each env.step()
             # advances a full (agent + bot) turn and all transitions stay in Player 1's perspective.
             timestep_player2.obs['to_play'] = -1
@@ -542,16 +678,74 @@ class GalconEnv(BaseEnv):
         else:
             raise ValueError(f'Unsupported battle_mode: {self.battle_mode}')
 
-    def _player_step(self, action: int, flag: str) -> BaseEnvTimestep:
-        if action not in self.legal_actions:
-            action = self.pass_action
+    def _player_step(self, action: int, flag: str, need_obs: bool = True) -> BaseEnvTimestep:
+        if 0 < action < self.total_num_actions:
+            self._apply_action(action)
 
-        self._apply_action(action)
         self._advance_one_tick()
         self._step_count += 1
 
-        winner_by_elimination = self._winner_by_elimination()
-        done, winner = self.get_done_winner()
+        # Single-pass planet & fleet statistics for elimination, timeout, and state info.
+        p1_id = self.PLAYER_1
+        p2_id = self.PLAYER_2
+        p1_alive = False
+        p2_alive = False
+        p1_prod = 0.0
+        p2_prod = 0.0
+        p1_p_ships = 0.0
+        p2_p_ships = 0.0
+        for p in self.planets:
+            own = p.owner
+            if own == p1_id:
+                p1_alive = True
+                p1_prod += p.production
+                p1_p_ships += p.ships
+            elif own == p2_id:
+                p2_alive = True
+                p2_prod += p.production
+                p2_p_ships += p.ships
+
+        p1_f_ships = 0.0
+        p2_f_ships = 0.0
+        for fl in self.fleets:
+            own = fl.owner
+            if own == p1_id:
+                p1_alive = True
+                p1_f_ships += fl.ships
+            elif own == p2_id:
+                p2_alive = True
+                p2_f_ships += fl.ships
+
+        p1_prod_r = float(round(p1_prod, 2))
+        p2_prod_r = float(round(p2_prod, 2))
+        p1_ships_r = float(round(p1_p_ships + p1_f_ships, 2))
+        p2_ships_r = float(round(p2_p_ships + p2_f_ships, 2))
+
+        if p1_alive and not p2_alive:
+            winner_by_elimination = p1_id
+        elif p2_alive and not p1_alive:
+            winner_by_elimination = p2_id
+        else:
+            winner_by_elimination = -1
+
+        if winner_by_elimination != -1:
+            done = True
+            winner = winner_by_elimination
+        elif self._step_count >= self.max_episode_steps:
+            done = True
+            if p1_prod_r > p2_prod_r:
+                winner = p1_id
+            elif p2_prod_r > p1_prod_r:
+                winner = p2_id
+            elif p1_ships_r > p2_ships_r:
+                winner = p1_id
+            elif p2_ships_r > p1_ships_r:
+                winner = p2_id
+            else:
+                winner = -1
+        else:
+            done = False
+            winner = -1
 
         if done:
             ended_by_timeout = (winner_by_elimination == -1 and self._step_count >= self.max_episode_steps)
@@ -569,12 +763,23 @@ class GalconEnv(BaseEnv):
             reward = np.array(0, dtype=np.float32)
             eval_return = None
 
-        info = self._get_state_info(winner if done else -1)
+        info = {
+            'winner': winner if done else -1,
+            'step_count': self._step_count,
+            'simulated_seconds': self._step_count * self.tick_seconds,
+            'production_player_1': p1_prod_r,
+            'production_player_2': p2_prod_r,
+            'ships_player_1': p1_ships_r,
+            'ships_player_2': p2_ships_r,
+        }
 
         self._current_player = self.next_player
-        
-        obs = self.observe()
-        
+
+        if need_obs or done or self.debug_legal_actions or self.debug_observation:
+            obs = self.observe()
+        else:
+            obs = None
+
         # Render the new step.
         if self.render_mode is not None:
             self.render(self.render_mode)
@@ -582,16 +787,34 @@ class GalconEnv(BaseEnv):
             info['eval_episode_return'] = eval_return
             if self.render_mode == 'image_savefile_mode':
                 self.save_render_output(replay_name_suffix=self.replay_name_suffix, replay_path=self.replay_path,
-                                        format=self.replay_format)            
+                                        format=self.replay_format)
 
         return BaseEnvTimestep(obs, reward, done, info)
 
     def _fleets_at_cell(self, grid_x: int, grid_y: int, owner: Optional[int] = None) -> List[Fleet]:
         matched = []
+        grid_max_x = self.grid_max_x
+        grid_max_y = self.grid_max_y
+        sq = self.grid_square_size
+        w_m1 = self.grid_width - 1
+        h_m1 = self.grid_height - 1
+        floor = math.floor
         for fleet in self.fleets:
             if owner is not None and fleet.owner != owner:
                 continue
-            if self._world_to_grid(fleet.x, fleet.y) == (grid_x, grid_y):
+            gx = floor((fleet.x + grid_max_x) / sq)
+            if gx < 0:
+                gx = 0
+            elif gx > w_m1:
+                gx = w_m1
+            if gx != grid_x:
+                continue
+            gy = floor((fleet.y + grid_max_y) / sq)
+            if gy < 0:
+                gy = 0
+            elif gy > h_m1:
+                gy = h_m1
+            if gy == grid_y:
                 matched.append(fleet)
         return matched
 
@@ -607,8 +830,41 @@ class GalconEnv(BaseEnv):
         if action_type == 'redirect':
             if not self.enable_fleet_redirection:
                 return
-            for fleet in self._fleets_at_cell(source_x, source_y, owner=self._current_player):
-                fleet.target = target.id
+            cur_player = self._current_player
+            target_id = target.id
+            grid_max_x = self.grid_max_x
+            grid_max_y = self.grid_max_y
+            sq = self.grid_square_size
+            w_m1 = self.grid_width - 1
+            h_m1 = self.grid_height - 1
+            floor = math.floor
+            cpp_sim = self._cpp_sim
+            dst_idx = self._cpp_pid_to_idx.get(target_id, -1) if cpp_sim is not None else -1
+            f_snap = self._cpp_f_snap
+            n_snap = len(f_snap)
+            for idx, fleet in enumerate(self.fleets):
+                if fleet.owner != cur_player:
+                    continue
+                gx = floor((fleet.x + grid_max_x) / sq)
+                if gx < 0:
+                    gx = 0
+                elif gx > w_m1:
+                    gx = w_m1
+                if gx != source_x:
+                    continue
+                gy = floor((fleet.y + grid_max_y) / sq)
+                if gy < 0:
+                    gy = 0
+                elif gy > h_m1:
+                    gy = h_m1
+                if gy != source_y:
+                    continue
+                fleet.target = target_id
+                if cpp_sim is not None and fleet._cpp_env is self and dst_idx >= 0:
+                    if cpp_sim.set_fleet_target(fleet.id, dst_idx):
+                        if idx < n_snap and f_snap[idx][0] is fleet:
+                            s = f_snap[idx]
+                            f_snap[idx] = (s[0], s[1], s[2], s[3], s[4], s[5], target_id, s[7])
             return
 
         # action_type == 'send': planet launch only (does not redirect flying fleets in this cell)
@@ -648,8 +904,266 @@ class GalconEnv(BaseEnv):
         )
         self._next_fleet_id += 1
 
+    def _init_or_reset_cpp_sim(self) -> None:
+        planets = self.planets
+        if not planets or len(planets) > 64:
+            if self._cpp_sim is not None:
+                self._cpp_sim.close()
+                self._cpp_sim = None
+            self._cpp_p_snap = []
+            self._cpp_f_snap = []
+            return
+
+        if all(p.id == i for i, p in enumerate(planets)):
+            planets_sorted = list(planets)
+        else:
+            planets_sorted = sorted(planets, key=lambda p: p.id)
+
+        if self._cpp_sim is None:
+            self._cpp_sim = EnvCppSimHandle.create(
+                planets_sorted,
+                width=2.0 * self.grid_max_x,
+                height=2.0 * self.grid_max_y,
+                fleet_speed=self.fleet_speed,
+                tick_dt=self.tick_seconds,
+                physics_substeps=self.physics_substeps,
+                allow_redirect=self.enable_fleet_redirection,
+            )
+        else:
+            ok = self._cpp_sim.update_planets(
+                planets_sorted,
+                fleet_speed=self.fleet_speed,
+                tick_dt=self.tick_seconds,
+                physics_substeps=self.physics_substeps,
+                clear_fleets=True,
+            )
+            if not ok:
+                self._cpp_sim.close()
+                self._cpp_sim = None
+
+        if self._cpp_sim is not None:
+            self._cpp_planets_sorted = planets_sorted
+            self._cpp_pid_to_idx = {p.id: i for i, p in enumerate(planets_sorted)}
+            self._cpp_cfg_sig = (self.tick_seconds, self.fleet_speed, self.physics_substeps)
+            self._cpp_p_snap = [
+                (p, p.id, p.owner, p.ships, p.x, p.y, p.production, p.radius) for p in planets
+            ]
+            self._cpp_f_snap = []
+            self._cpp_units_materialized = False
+            self._cpp_gen += 1
+        else:
+            self._cpp_p_snap = []
+            self._cpp_f_snap = []
+
+    def _materialize_fleet_units(self, fleet: Fleet) -> None:
+        if self._cpp_sim is None or fleet._cpp_gen != self._cpp_gen:
+            fleet._cpp_env = None
+            return
+        units, headings = self._cpp_sim.read_fleet_units(fleet.id)
+        if units is not None:
+            fleet._units = units
+            fleet._unit_headings = headings
+            self._cpp_units_materialized = True
+        else:
+            fleet._cpp_env = None
+
+    def _materialize_all_cpp_fleets(self) -> None:
+        if self._cpp_sim is None:
+            return
+        for fl in self.fleets:
+            if fl._cpp_env is self and (fl._units is None or fl._unit_headings is None):
+                self._materialize_fleet_units(fl)
+            fl._cpp_env = None
+
+    def _sync_cpp_sim(self) -> bool:
+        if not HAS_FAST_SIM_CPP:
+            return False
+        planets = self.planets
+        n_planets = len(planets)
+        if n_planets <= 0 or n_planets > 64:
+            self._materialize_all_cpp_fleets()
+            if self._cpp_sim is not None:
+                self._cpp_sim.close()
+                self._cpp_sim = None
+            return False
+
+        cfg_sig = (self.tick_seconds, self.fleet_speed, self.physics_substeps)
+        p_snap = self._cpp_p_snap
+        planets_match = (
+            self._cpp_sim is not None
+            and self._cpp_cfg_sig == cfg_sig
+            and n_planets == len(p_snap)
+        )
+        if planets_match:
+            for p, s in zip(planets, p_snap):
+                if (
+                    p is not s[0]
+                    or p.id != s[1]
+                    or p.owner != s[2]
+                    or p.ships != s[3]
+                    or p.x != s[4]
+                    or p.y != s[5]
+                    or p.production != s[6]
+                    or p.radius != s[7]
+                ):
+                    planets_match = False
+                    break
+
+        fleets = self.fleets
+        f_snap = self._cpp_f_snap
+        fleets_match = (
+            self._cpp_sim is not None
+            and not self._cpp_units_materialized
+            and len(fleets) == len(f_snap)
+        )
+        if fleets_match:
+            for fl, s in zip(fleets, f_snap):
+                if (
+                    fl is not s[0]
+                    or fl._cpp_env is not self
+                    or fl.id != s[1]
+                    or fl.owner != s[2]
+                    or fl.ships != s[3]
+                    or fl.x != s[4]
+                    or fl.y != s[5]
+                    or fl.target != s[6]
+                    or fl.num_units != s[7]
+                ):
+                    fleets_match = False
+                    break
+
+        if planets_match and fleets_match:
+            return True
+
+        # Before overwriting C++ fleet buffers, preserve any still-lazy units on fleets
+        # that remain in self.fleets while another fleet was added/mutated.
+        if self._cpp_sim is not None and not fleets_match:
+            for fl in fleets:
+                if fl._cpp_env is self and (fl._units is None or fl._unit_headings is None):
+                    self._materialize_fleet_units(fl)
+
+        if all(p.id == i for i, p in enumerate(planets)):
+            planets_sorted = list(planets)
+        else:
+            planets_sorted = sorted(planets, key=lambda p: p.id)
+        pid_to_idx = {p.id: i for i, p in enumerate(planets_sorted)}
+
+        if self._cpp_sim is None:
+            self._cpp_sim = EnvCppSimHandle.create(
+                planets_sorted,
+                width=2.0 * self.grid_max_x,
+                height=2.0 * self.grid_max_y,
+                fleet_speed=self.fleet_speed,
+                tick_dt=self.tick_seconds,
+                physics_substeps=self.physics_substeps,
+                allow_redirect=self.enable_fleet_redirection,
+            )
+            if self._cpp_sim is None:
+                return False
+            fleets_match = False
+        elif not planets_match:
+            if not self._cpp_sim.update_planets(
+                planets_sorted,
+                fleet_speed=self.fleet_speed,
+                tick_dt=self.tick_seconds,
+                physics_substeps=self.physics_substeps,
+                clear_fleets=False,
+            ):
+                self._materialize_all_cpp_fleets()
+                self._cpp_sim.close()
+                self._cpp_sim = None
+                return False
+            if pid_to_idx != self._cpp_pid_to_idx:
+                for fl in fleets:
+                    if fl._cpp_env is self and (fl._units is None or fl._unit_headings is None):
+                        self._materialize_fleet_units(fl)
+                fleets_match = False
+
+        if not fleets_match:
+            planet_by_id = {p.id: p for p in planets_sorted}
+            if not self._cpp_sim.load_fleets(fleets, planet_by_id, pid_to_idx):
+                self._materialize_all_cpp_fleets()
+                self._cpp_sim.close()
+                self._cpp_sim = None
+                return False
+            self._cpp_gen += 1
+            gen = self._cpp_gen
+            any_kept_units = False
+            for fl in fleets:
+                if fl._units is not None or fl._unit_headings is not None:
+                    any_kept_units = True
+                fl._cpp_env = self
+                fl._cpp_gen = gen
+            self._cpp_units_materialized = any_kept_units
+
+        self._cpp_planets_sorted = planets_sorted
+        self._cpp_pid_to_idx = pid_to_idx
+        self._cpp_cfg_sig = cfg_sig
+        self._cpp_p_snap = [
+            (p, p.id, p.owner, p.ships, p.x, p.y, p.production, p.radius) for p in planets
+        ]
+        self._cpp_f_snap = [
+            (fl, fl.id, fl.owner, fl.ships, fl.x, fl.y, fl.target, fl.num_units) for fl in fleets
+        ]
+        return True
+
     def _spawn_cpp_fleet(self, source: Planet, target: Planet, ships_to_send: float) -> None:
         """Launch a multi-unit physical fleet matching calibrated Galcon 2 spawn geometry."""
+        if self._sync_cpp_sim():
+            src_idx = self._cpp_pid_to_idx.get(source.id, -1)
+            dst_idx = self._cpp_pid_to_idx.get(target.id, -1)
+            if src_idx >= 0 and dst_idx >= 0:
+                fid = self._next_fleet_id
+                rc, cx, cy, fl_radius, parts = self._cpp_sim.spawn_fleet_exact(
+                    source.owner,
+                    src_idx,
+                    dst_idx,
+                    float(ships_to_send),
+                    fid,
+                )
+                if rc == 1:
+                    return
+                if rc == 0:
+                    source.ships = max(0.0, source.ships - ships_to_send)
+                    self._next_fleet_id = fid + 1
+                    fl = Fleet(
+                        id=fid,
+                        owner=source.owner,
+                        ships=float(ships_to_send),
+                        x=float(cx),
+                        y=float(cy),
+                        source=source.id,
+                        target=target.id,
+                        radius=float(fl_radius),
+                        num_units=int(parts),
+                    )
+                    fl._cpp_env = self
+                    fl._cpp_gen = self._cpp_gen
+                    self.fleets.append(fl)
+                    # Keep planet & fleet snapshots synchronized with C++ state
+                    p_snap = self._cpp_p_snap
+                    if 0 <= source.id < len(p_snap) and p_snap[source.id][0] is source:
+                        p_snap[source.id] = (
+                            source, source.id, source.owner, source.ships,
+                            source.x, source.y, source.production, source.radius,
+                        )
+                    else:
+                        for i, s in enumerate(p_snap):
+                            if s[0] is source:
+                                p_snap[i] = (
+                                    source, source.id, source.owner, source.ships,
+                                    source.x, source.y, source.production, source.radius,
+                                )
+                                break
+                    self._cpp_f_snap.append(
+                        (fl, fl.id, fl.owner, fl.ships, fl.x, fl.y, fl.target, fl.num_units)
+                    )
+                    return
+                # Capacity overflow in fixed POD SimState: materialize & fall back to Python/vector path
+                self._materialize_all_cpp_fleets()
+                self._cpp_sim.close()
+                self._cpp_sim = None
+
         total_planet_ships = sum(max(0.0, p.ships) for p in self.planets)
         item_count = (
             BASE_ITEM_USERS
@@ -730,6 +1244,21 @@ class GalconEnv(BaseEnv):
 
     def _advance_one_tick_cpp(self) -> None:
         """Advance multi-ship C++17 (or bit-exact Python fallback) physics in-place on self.planets & self.fleets."""
+        if self._sync_cpp_sim():
+            self.fleets = self._cpp_sim.step_physics_and_read(self._cpp_planets_sorted, self.fleets)
+            self._cpp_gen += 1
+            gen = self._cpp_gen
+            for fl in self.fleets:
+                fl._cpp_gen = gen
+            self._cpp_units_materialized = False
+            self._cpp_p_snap = [
+                (p, p.id, p.owner, p.ships, p.x, p.y, p.production, p.radius) for p in self.planets
+            ]
+            self._cpp_f_snap = [
+                (fl, fl.id, fl.owner, fl.ships, fl.x, fl.y, fl.target, fl.num_units) for fl in self.fleets
+            ]
+            return
+
         adapter = object.__new__(_CppSimFallback)
         adapter.planets = {p.id: p for p in self.planets}
         adapter.fleets = {f.id: f for f in self.fleets}
@@ -809,10 +1338,16 @@ class GalconEnv(BaseEnv):
 
     # Given world coordinates (x, y), return the equivalent grid (x, y)
     def _world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
-        grid_x = int(math.floor((x - (-self.grid_max_x)) / self.grid_square_size))
-        grid_y = int(math.floor((y - (-self.grid_max_y)) / self.grid_square_size))
-        grid_x = int(np.clip(grid_x, 0, self.grid_width - 1))
-        grid_y = int(np.clip(grid_y, 0, self.grid_height - 1))
+        grid_x = math.floor((x + self.grid_max_x) / self.grid_square_size)
+        if grid_x < 0:
+            grid_x = 0
+        elif grid_x >= self.grid_width:
+            grid_x = self.grid_width - 1
+        grid_y = math.floor((y + self.grid_max_y) / self.grid_square_size)
+        if grid_y < 0:
+            grid_y = 0
+        elif grid_y >= self.grid_height:
+            grid_y = self.grid_height - 1
         return grid_x, grid_y
 
     # Cells are indexed numerically, starting at index 0 = (0, 0), index 1 = (0, 1), index grid_width = (1, 0), ...
@@ -832,65 +1367,114 @@ class GalconEnv(BaseEnv):
 
     def _local_grid_offset(self, x: float, y: float) -> Tuple[float, float]:
         grid_x, grid_y = self._world_to_grid(x, y)
-        cell_min_x = -self.grid_max_x + grid_x * self.grid_square_size
-        cell_min_y = -self.grid_max_y + grid_y * self.grid_square_size
-        normalized_x = self._linear_encode(x - cell_min_x, self.grid_square_size)
-        normalized_y = self._linear_encode(y - cell_min_y, self.grid_square_size)
-        return normalized_x, normalized_y
+        sq = self.grid_square_size
+        nx = (x - (-self.grid_max_x + grid_x * sq)) / sq
+        if nx <= 0.0:
+            nx = 0.0
+        elif nx >= 1.0:
+            nx = 1.0
+        ny = (y - (-self.grid_max_y + grid_y * sq)) / sq
+        if ny <= 0.0:
+            ny = 0.0
+        elif ny >= 1.0:
+            ny = 1.0
+        return nx, ny
 
     def _normalize_world_x(self, x: float) -> float:
-        return self._linear_encode(x - (-self.grid_max_x), 2 * self.grid_max_x)
+        val = (x + self.grid_max_x) / (2.0 * self.grid_max_x)
+        if val <= 0.0:
+            return 0.0
+        if val >= 1.0:
+            return 1.0
+        return val
 
     def _normalize_world_y(self, y: float) -> float:
-        return self._linear_encode(y - (-self.grid_max_y), 2 * self.grid_max_y)
+        val = (y + self.grid_max_y) / (2.0 * self.grid_max_y)
+        if val <= 0.0:
+            return 0.0
+        if val >= 1.0:
+            return 1.0
+        return val
 
     def _linear_encode(self, x: float, max_expected_value: float) -> float:
-        return float(np.clip(x / max_expected_value, 0.0, 1.0))
+        val = x / max_expected_value
+        if val <= 0.0:
+            return 0.0
+        if val >= 1.0:
+            return 1.0
+        return val
 
     # (x + 1) / (max_expected_x + 1). max_expected_x is the largest value the network is likely to ever see.
     def _log_encode(self, value: float, max_expected_value: float) -> float:
         value = max(0.0, float(value))
         max_expected_value = max(1.0, float(max_expected_value))
-        return float(np.log(value + 1.0) / np.log(max_expected_value + 1.0))
+        return math.log(value + 1.0) / math.log(max_expected_value + 1.0)
 
     def _encode_ships(self, ships: float) -> float:
-        return self._linear_encode(ships, self.max_expected_ships)
+        val = ships / self.max_expected_ships
+        if val <= 0.0:
+            return 0.0
+        if val >= 1.0:
+            return 1.0
+        return val
 
     def _encode_eta(self, eta_seconds: float) -> float:
-        return self._linear_encode(eta_seconds, self.max_expected_eta)
+        val = eta_seconds / self.max_expected_eta
+        if val <= 0.0:
+            return 0.0
+        if val >= 1.0:
+            return 1.0
+        return val
 
     def _fleet_eta_seconds(self, fleet: Fleet) -> float:
         target = self.planets[fleet.target]
-        distance_to_target_edge = max(0.0, self._distance(fleet.x, fleet.y, target.x, target.y) - target.radius)
-        return distance_to_target_edge / max(self.fleet_speed, 1e-6)
+        distance_to_target_edge = math.hypot(fleet.x - target.x, fleet.y - target.y) - target.radius
+        if distance_to_target_edge <= 0.0:
+            return 0.0
+        return distance_to_target_edge / (self.fleet_speed if self.fleet_speed > 1e-6 else 1e-6)
 
     def _planet_at_cell(self, grid_x: int, grid_y: int, owner: Optional[int] = None) -> Optional[Planet]:
-        matching_planets = []
+        grid_max_x = self.grid_max_x
+        grid_max_y = self.grid_max_y
+        sq = self.grid_square_size
+        w_m1 = self.grid_width - 1
+        h_m1 = self.grid_height - 1
+        floor = math.floor
+
+        best: Optional[Planet] = None
+        count = 0
         for planet in self.planets:
-            planet_grid_x, planet_grid_y = self._world_to_grid(planet.x, planet.y)
-            if planet_grid_x != grid_x or planet_grid_y != grid_y:
-                continue
             if owner is not None and planet.owner != owner:
                 continue
-            matching_planets.append(planet)
+            gx = floor((planet.x + grid_max_x) / sq)
+            if gx < 0:
+                gx = 0
+            elif gx > w_m1:
+                gx = w_m1
+            if gx != grid_x:
+                continue
+            gy = floor((planet.y + grid_max_y) / sq)
+            if gy < 0:
+                gy = 0
+            elif gy > h_m1:
+                gy = h_m1
+            if gy != grid_y:
+                continue
+            count += 1
+            if best is None or planet.id < best.id:
+                best = planet
 
-        if len(matching_planets) == 0:
-            return None
-
-        if len(matching_planets) > 1: 
+        if count > 1:
             logging.warning(
                 'WARNING: More than one planet found in grid cell. This should not happen for grid cell size <= 25.'
             )
-
-        # Deterministic tie-breaker if multiple planets share a grid square.
-        matching_planets.sort(key=lambda p: p.id)
-        return matching_planets[0]
+        return best
 
     def encode_action(
         self, source_x: int, source_y: int, target_x: int, target_y: int, is_redirect: bool = False
     ) -> int:
-        source_cell = self._grid_to_cell_index(source_x, source_y)
-        target_cell = self._grid_to_cell_index(target_x, target_y)
+        source_cell = source_y * self.grid_width + source_x
+        target_cell = target_y * self.grid_width + target_x
         base_action = source_cell * self.grid_cell_count + target_cell + 1
         return base_action + self.pair_action_count if is_redirect else base_action
 
@@ -910,83 +1494,258 @@ class GalconEnv(BaseEnv):
         source_cell = shifted_action // self.grid_cell_count
         target_cell = shifted_action % self.grid_cell_count
 
-        source_x, source_y = self._cell_index_to_grid(source_cell)
-        target_x, target_y = self._cell_index_to_grid(target_cell)
-        return action_type, source_x, source_y, target_x, target_y
+        grid_width = self.grid_width
+        return (
+            action_type,
+            source_cell % grid_width,
+            source_cell // grid_width,
+            target_cell % grid_width,
+            target_cell // grid_width,
+        )
 
     def decode_action(self, action: int) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
         _, source_x, source_y, target_x, target_y = self.decode_action_with_type(action)
         return source_x, source_y, target_x, target_y
 
     def _ships_to_send(self, source_ships: float) -> float:
-        ships = max(0.0, float(source_ships))
-        return float(math.floor(min(ships, ships * self.send_ratio)))
+        ships = float(source_ships)
+        if ships <= 0.0:
+            return 0.0
+        scaled = ships * self.send_ratio
+        return float(math.floor(ships if ships < scaled else scaled))
 
     def _can_send_from_planet(self, planet: Planet) -> bool:
-        ships_to_send = self._ships_to_send(planet.ships)
+        ships = planet.ships
+        if ships <= 0.0:
+            return False
+        scaled = ships * self.send_ratio
+        ships_to_send = math.floor(ships if ships < scaled else scaled)
         return ships_to_send >= self.min_send_ships and ships_to_send > 0
 
-    # TODO: This is expensive and may be called more than once. Good candidate for optimization.
     @property
     def legal_actions(self) -> List[int]:
         legal = [self.pass_action]
-        legal_set = {self.pass_action}
 
+        grid_max_x = self.grid_max_x
+        grid_max_y = self.grid_max_y
+        sq = self.grid_square_size
+        grid_width = self.grid_width
+        w_m1 = grid_width - 1
+        h_m1 = self.grid_height - 1
+        grid_cell_count = self.grid_cell_count
+        cur_player = self._current_player
+        send_ratio = self.send_ratio
+        min_send_ships = self.min_send_ships
+        floor = math.floor
+
+        target_by_cell: Dict[Tuple[int, int], Planet] = {}
+        friendly_by_cell: Dict[Tuple[int, int], Planet] = {}
         friendly_source_cells = set()
-        target_cells = set()
 
         for planet in self.planets:
-            grid_x, grid_y = self._world_to_grid(planet.x, planet.y)
-            if planet.owner == self._current_player and self._can_send_from_planet(planet):
-                friendly_source_cells.add((grid_x, grid_y))
-            target_cells.add((grid_x, grid_y))
+            gx = floor((planet.x + grid_max_x) / sq)
+            if gx < 0:
+                gx = 0
+            elif gx > w_m1:
+                gx = w_m1
+            gy = floor((planet.y + grid_max_y) / sq)
+            if gy < 0:
+                gy = 0
+            elif gy > h_m1:
+                gy = h_m1
+            cell = (gx, gy)
 
-        # Note: Sorting seems to be not strictly necessary...
-        for source_x, source_y in sorted(friendly_source_cells):
-            source = self._planet_at_cell(source_x, source_y, owner=self._current_player)
-            if source is None:
-                continue
+            prev_t = target_by_cell.get(cell)
+            if prev_t is None or planet.id < prev_t.id:
+                target_by_cell[cell] = planet
 
-            for target_x, target_y in sorted(target_cells):
-                target = self._planet_at_cell(target_x, target_y)
-                if target is None:
-                    continue
-                if source.id == target.id:
-                    continue
+            if planet.owner == cur_player:
+                prev_f = friendly_by_cell.get(cell)
+                if prev_f is None or planet.id < prev_f.id:
+                    friendly_by_cell[cell] = planet
+                ships = planet.ships
+                if ships > 0.0:
+                    scaled = ships * send_ratio
+                    to_send = floor(ships if ships < scaled else scaled)
+                    if to_send >= min_send_ships and to_send > 0:
+                        friendly_source_cells.add(cell)
 
-                act = self.encode_action(source_x, source_y, target_x, target_y)
-                if act not in legal_set:
-                    legal_set.add(act)
-                    legal.append(act)
+        sorted_targets = [
+            (ty * grid_width + tx, target_by_cell[(tx, ty)].id)
+            for (tx, ty) in sorted(target_by_cell.keys())
+        ]
 
-        if self.enable_fleet_redirection:
-            friendly_fleet_cells = {}
+        for sx, sy in sorted(friendly_source_cells):
+            src_id = friendly_by_cell[(sx, sy)].id
+            row_base = (sy * grid_width + sx) * grid_cell_count + 1
+            for tgt_cell_idx, tgt_id in sorted_targets:
+                if src_id != tgt_id:
+                    legal.append(row_base + tgt_cell_idx)
+
+        if self.enable_fleet_redirection and self.fleets:
+            # Map each cell containing friendly fleets to either the unique target_id shared
+            # by all friendly fleets in that cell, or -1 if >=2 distinct targets exist.
+            fleet_cell_target: Dict[Tuple[int, int], int] = {}
             for fleet in self.fleets:
-                if fleet.owner == self._current_player:
-                    cell = self._world_to_grid(fleet.x, fleet.y)
-                    friendly_fleet_cells.setdefault(cell, []).append(fleet)
+                if fleet.owner != cur_player:
+                    continue
+                gx = floor((fleet.x + grid_max_x) / sq)
+                if gx < 0:
+                    gx = 0
+                elif gx > w_m1:
+                    gx = w_m1
+                gy = floor((fleet.y + grid_max_y) / sq)
+                if gy < 0:
+                    gy = 0
+                elif gy > h_m1:
+                    gy = h_m1
+                cell = (gx, gy)
+                prev_tgt = fleet_cell_target.get(cell)
+                if prev_tgt is None:
+                    fleet_cell_target[cell] = fleet.target
+                elif prev_tgt != -1 and prev_tgt != fleet.target:
+                    fleet_cell_target[cell] = -1
 
-            for (source_x, source_y), cell_fleets in sorted(friendly_fleet_cells.items()):
-                for target_x, target_y in sorted(target_cells):
-                    target = self._planet_at_cell(target_x, target_y)
-                    if target is None:
-                        continue
-                    # Only legal if at least one friendly fleet in this cell isn't already heading to target
-                    if not any(f.target != target.id for f in cell_fleets):
-                        continue
-                    act = self.encode_action(source_x, source_y, target_x, target_y, is_redirect=True)
-                    if act not in legal_set:
-                        legal_set.add(act)
-                        legal.append(act)
+            redir_offset = self.pair_action_count + 1
+            for (sx, sy) in sorted(fleet_cell_target.keys()):
+                only_tgt = fleet_cell_target[(sx, sy)]
+                row_base = (sy * grid_width + sx) * grid_cell_count + redir_offset
+                if only_tgt == -1:
+                    for tgt_cell_idx, _ in sorted_targets:
+                        legal.append(row_base + tgt_cell_idx)
+                else:
+                    for tgt_cell_idx, tgt_id in sorted_targets:
+                        if tgt_id != only_tgt:
+                            legal.append(row_base + tgt_cell_idx)
 
         return legal
 
-    def observe(self) -> dict:
-        action_mask = np.zeros(self.total_num_actions, dtype=np.int8)
-        for action in self.legal_actions:
-            action_mask[action] = 1
+    def _fill_action_mask(self, action_mask: np.ndarray) -> None:
+        action_mask[self.pass_action] = 1
 
-        observation = self.current_state()
+        grid_max_x = self.grid_max_x
+        grid_max_y = self.grid_max_y
+        sq = self.grid_square_size
+        grid_width = self.grid_width
+        w_m1 = grid_width - 1
+        h_m1 = self.grid_height - 1
+        grid_cell_count = self.grid_cell_count
+        cur_player = self._current_player
+        send_ratio = self.send_ratio
+        min_send_ships = self.min_send_ships
+        floor = math.floor
+
+        target_by_cell: Dict[int, int] = {}
+        friendly_by_cell: Dict[int, int] = {}
+        friendly_source_cells = set()
+
+        for planet in self.planets:
+            gx = floor((planet.x + grid_max_x) / sq)
+            if gx < 0:
+                gx = 0
+            elif gx > w_m1:
+                gx = w_m1
+            gy = floor((planet.y + grid_max_y) / sq)
+            if gy < 0:
+                gy = 0
+            elif gy > h_m1:
+                gy = h_m1
+            cell_idx = gy * grid_width + gx
+
+            prev_tid = target_by_cell.get(cell_idx)
+            if prev_tid is None or planet.id < prev_tid:
+                target_by_cell[cell_idx] = planet.id
+
+            if planet.owner == cur_player:
+                prev_fid = friendly_by_cell.get(cell_idx)
+                if prev_fid is None or planet.id < prev_fid:
+                    friendly_by_cell[cell_idx] = planet.id
+                ships = planet.ships
+                if ships > 0.0:
+                    scaled = ships * send_ratio
+                    to_send = floor(ships if ships < scaled else scaled)
+                    if to_send >= min_send_ships and to_send > 0:
+                        friendly_source_cells.add(cell_idx)
+
+        target_items = list(target_by_cell.items())
+        for src_cell_idx in friendly_source_cells:
+            src_id = friendly_by_cell[src_cell_idx]
+            row_base = src_cell_idx * grid_cell_count + 1
+            for tgt_cell_idx, tgt_id in target_items:
+                if src_id != tgt_id:
+                    action_mask[row_base + tgt_cell_idx] = 1
+
+        if self.enable_fleet_redirection and self.fleets:
+            fleet_cell_target: Dict[int, int] = {}
+            for fleet in self.fleets:
+                if fleet.owner != cur_player:
+                    continue
+                gx = floor((fleet.x + grid_max_x) / sq)
+                if gx < 0:
+                    gx = 0
+                elif gx > w_m1:
+                    gx = w_m1
+                gy = floor((fleet.y + grid_max_y) / sq)
+                if gy < 0:
+                    gy = 0
+                elif gy > h_m1:
+                    gy = h_m1
+                cell_idx = gy * grid_width + gx
+                prev_tgt = fleet_cell_target.get(cell_idx)
+                if prev_tgt is None:
+                    fleet_cell_target[cell_idx] = fleet.target
+                elif prev_tgt != -1 and prev_tgt != fleet.target:
+                    fleet_cell_target[cell_idx] = -1
+
+            redir_offset = self.pair_action_count + 1
+            for src_cell_idx, only_tgt in fleet_cell_target.items():
+                row_base = src_cell_idx * grid_cell_count + redir_offset
+                if only_tgt == -1:
+                    for tgt_cell_idx, _ in target_items:
+                        action_mask[row_base + tgt_cell_idx] = 1
+                else:
+                    for tgt_cell_idx, tgt_id in target_items:
+                        if tgt_id != only_tgt:
+                            action_mask[row_base + tgt_cell_idx] = 1
+
+    def observe(self) -> dict:
+        if self.LANDING_BUCKETS is not self._cpp_buckets_ref:
+            self._init_cpp_bucket_buffers()
+        encoded_in_cpp = False
+        if (
+            self.use_cpp_sim
+            and self.grid_cell_count <= 1024
+            and self._cpp_n_buckets <= 16
+            and self._sync_cpp_sim()
+        ):
+            observation = np.empty(self._observation_shape, dtype=np.float32)
+            action_mask = np.empty(self.total_num_actions, dtype=np.int8)
+            encoded_in_cpp = self._cpp_sim.encode_obs_and_mask(
+                self._current_player,
+                self.grid_width,
+                self.grid_height,
+                self.grid_max_x,
+                self.grid_max_y,
+                self.grid_square_size,
+                self.fleet_top_k,
+                self.max_expected_ships,
+                self.max_expected_production,
+                self.max_fleet_radius,
+                self.max_expected_eta,
+                self.send_ratio,
+                self.min_send_ships,
+                self.enable_fleet_redirection,
+                self._cpp_n_buckets,
+                self._ptr_cpp_bucket_lowers,
+                self._ptr_cpp_bucket_uppers,
+                observation.ctypes.data,
+                action_mask.ctypes.data,
+            )
+
+        if not encoded_in_cpp:
+            action_mask = np.zeros(self.total_num_actions, dtype=np.int8)
+            self._fill_action_mask(action_mask)
+            observation = self.current_state()
 
         if self.battle_mode in ['play_with_bot_mode', 'eval_mode']:
             # Single-agent perspective (each step executes agent + bot): disable MCTS minimax
@@ -1043,73 +1802,226 @@ class GalconEnv(BaseEnv):
                     max(friendly - enemy, 0)
                     max(enemy - friendly, 0)
         """
+        if self.LANDING_BUCKETS is not self._cpp_buckets_ref:
+            self._init_cpp_bucket_buffers()
+        if (
+            self.use_cpp_sim
+            and self.grid_cell_count <= 1024
+            and self._cpp_n_buckets <= 16
+            and self._sync_cpp_sim()
+        ):
+            obs = np.empty(self._observation_shape, dtype=np.float32)
+            if self._cpp_sim.encode_obs_and_mask(
+                self._current_player,
+                self.grid_width,
+                self.grid_height,
+                self.grid_max_x,
+                self.grid_max_y,
+                self.grid_square_size,
+                self.fleet_top_k,
+                self.max_expected_ships,
+                self.max_expected_production,
+                self.max_fleet_radius,
+                self.max_expected_eta,
+                self.send_ratio,
+                self.min_send_ships,
+                self.enable_fleet_redirection,
+                self._cpp_n_buckets,
+                self._ptr_cpp_bucket_lowers,
+                self._ptr_cpp_bucket_uppers,
+                obs.ctypes.data,
+                0,
+            ):
+                return obs
+
         obs = np.zeros(self._observation_shape, dtype=np.float32)
 
         self._encode_planets(obs)
-        self._encode_fleets(obs)
-        self._encode_landing_schedule(obs)
+        if self.fleets:
+            self._encode_fleets(obs)
+            self._encode_landing_schedule(obs)
 
         return obs
 
     def _encode_planets(self, obs: np.ndarray) -> None:
+        grid_max_x = self.grid_max_x
+        grid_max_y = self.grid_max_y
+        sq = self.grid_square_size
+        w_m1 = self.grid_width - 1
+        h_m1 = self.grid_height - 1
+        max_ships = self.max_expected_ships
+        max_prod = self.max_expected_production
+        cur_player = self._current_player
+        neutral_player = self.PLAYER_NEUTRAL
+        floor = math.floor
+
+        ch_lx = self.PLANET_LOCAL_X_CHANNEL
+        ch_ly = self.PLANET_LOCAL_Y_CHANNEL
+        ch_fs = self.PLANET_FRIENDLY_SHIPS_CHANNEL
+        ch_fp = self.PLANET_FRIENDLY_PRODUCTION_CHANNEL
+        ch_ns = self.PLANET_NEUTRAL_SHIPS_CHANNEL
+        ch_np = self.PLANET_NEUTRAL_PRODUCTION_CHANNEL
+        ch_es = self.PLANET_ENEMY_SHIPS_CHANNEL
+        ch_ep = self.PLANET_ENEMY_PRODUCTION_CHANNEL
+
         for planet in self.planets:
-            grid_x, grid_y = self._world_to_grid(planet.x, planet.y)
-            local_x, local_y = self._local_grid_offset(planet.x, planet.y)
+            px = planet.x
+            py = planet.y
+            gx = floor((px + grid_max_x) / sq)
+            if gx < 0:
+                gx = 0
+            elif gx > w_m1:
+                gx = w_m1
+            gy = floor((py + grid_max_y) / sq)
+            if gy < 0:
+                gy = 0
+            elif gy > h_m1:
+                gy = h_m1
 
-            obs[self.PLANET_LOCAL_X_CHANNEL, grid_y, grid_x] = local_x
-            obs[self.PLANET_LOCAL_Y_CHANNEL, grid_y, grid_x] = local_y
+            lx = (px - (-grid_max_x + gx * sq)) / sq
+            if lx <= 0.0:
+                lx = 0.0
+            elif lx >= 1.0:
+                lx = 1.0
+            ly = (py - (-grid_max_y + gy * sq)) / sq
+            if ly <= 0.0:
+                ly = 0.0
+            elif ly >= 1.0:
+                ly = 1.0
 
-            if planet.owner == self._current_player:
-                obs[self.PLANET_FRIENDLY_SHIPS_CHANNEL, grid_y, grid_x] = float(
-                    np.clip(planet.ships / self.max_expected_ships, 0.0, 1.0)
-                )
-                obs[self.PLANET_FRIENDLY_PRODUCTION_CHANNEL, grid_y, grid_x] = float(
-                    np.clip(planet.production / self.max_expected_production, 0.0, 1.0)
-                )
-            elif planet.owner == self.PLAYER_NEUTRAL:
-                obs[self.PLANET_NEUTRAL_SHIPS_CHANNEL, grid_y, grid_x] = float(
-                    np.clip(planet.ships / self.max_expected_ships, 0.0, 1.0)
-                )
-                obs[self.PLANET_NEUTRAL_PRODUCTION_CHANNEL, grid_y, grid_x] = float(
-                    np.clip(planet.production / self.max_expected_production, 0.0, 1.0)
-                )
+            obs[ch_lx, gy, gx] = lx
+            obs[ch_ly, gy, gx] = ly
+
+            s_val = planet.ships / max_ships
+            if s_val <= 0.0:
+                s_val = 0.0
+            elif s_val >= 1.0:
+                s_val = 1.0
+            p_val = planet.production / max_prod
+            if p_val <= 0.0:
+                p_val = 0.0
+            elif p_val >= 1.0:
+                p_val = 1.0
+
+            own = planet.owner
+            if own == cur_player:
+                obs[ch_fs, gy, gx] = s_val
+                obs[ch_fp, gy, gx] = p_val
+            elif own == neutral_player:
+                obs[ch_ns, gy, gx] = s_val
+                obs[ch_np, gy, gx] = p_val
             else:
-                obs[self.PLANET_ENEMY_SHIPS_CHANNEL, grid_y, grid_x] = float(
-                    np.clip(planet.ships / self.max_expected_ships, 0.0, 1.0)
-                )
-                obs[self.PLANET_ENEMY_PRODUCTION_CHANNEL, grid_y, grid_x] = float(
-                    np.clip(planet.production / self.max_expected_production, 0.0, 1.0)
-                )
+                obs[ch_es, gy, gx] = s_val
+                obs[ch_ep, gy, gx] = p_val
 
     def _encode_fleets(self, obs: np.ndarray) -> None:
-        fleets_by_cell: Dict[Tuple[int, int], List[Fleet]] = {}
+        fleets = self.fleets
+        if not fleets:
+            return
 
-        for fleet in self.fleets:
-            grid_x, grid_y = self._world_to_grid(fleet.x, fleet.y)
-            fleets_by_cell.setdefault((grid_x, grid_y), []).append(fleet)
+        grid_max_x = self.grid_max_x
+        grid_max_y = self.grid_max_y
+        span_x = 2.0 * grid_max_x
+        span_y = 2.0 * grid_max_y
+        sq = self.grid_square_size
+        w_m1 = self.grid_width - 1
+        h_m1 = self.grid_height - 1
+        cur_player = self._current_player
+        planets = self.planets
+        speed = self.fleet_speed if self.fleet_speed > 1e-6 else 1e-6
+        max_rad = self.max_fleet_radius if self.max_fleet_radius > 1e-6 else 1e-6
+        max_ships = self.max_expected_ships
+        max_eta = self.max_expected_eta
+        top_k = self.fleet_top_k
+        feat_cnt = self.FLEET_FEATURE_COUNT
+        floor = math.floor
+        hypot = math.hypot
+
+        friendly_by_cell: Dict[Tuple[int, int], List[Fleet]] = {}
+        enemy_by_cell: Dict[Tuple[int, int], List[Fleet]] = {}
+
+        for fleet in fleets:
+            gx = floor((fleet.x + grid_max_x) / sq)
+            if gx < 0:
+                gx = 0
+            elif gx > w_m1:
+                gx = w_m1
+            gy = floor((fleet.y + grid_max_y) / sq)
+            if gy < 0:
+                gy = 0
+            elif gy > h_m1:
+                gy = h_m1
+            cell = (gx, gy)
+            if fleet.owner == cur_player:
+                lst = friendly_by_cell.get(cell)
+                if lst is None:
+                    friendly_by_cell[cell] = [fleet]
+                else:
+                    lst.append(fleet)
+            else:
+                lst = enemy_by_cell.get(cell)
+                if lst is None:
+                    enemy_by_cell[cell] = [fleet]
+                else:
+                    lst.append(fleet)
 
         fleet_base_channel = self.PLANET_CHANNEL_COUNT
+        enemy_base_channel = fleet_base_channel + self.fleet_slot_count_per_side * feat_cnt
 
-        for (grid_x, grid_y), fleets in fleets_by_cell.items():
-            friendly_fleets = [fleet for fleet in fleets if fleet.owner == self._current_player]
-            enemy_fleets = [fleet for fleet in fleets if fleet.owner != self._current_player]
+        for side_map, base_ch in ((friendly_by_cell, fleet_base_channel), (enemy_by_cell, enemy_base_channel)):
+            for (gx, gy), cell_fleets in side_map.items():
+                n_fl = len(cell_fleets)
+                if n_fl > 1:
+                    cell_fleets.sort(key=lambda fl: fl.ships, reverse=True)
+                n_top = top_k if n_fl > top_k else n_fl
+                for slot_idx in range(n_top):
+                    fl = cell_fleets[slot_idx]
+                    tgt = planets[fl.target]
+                    dist_edge = hypot(fl.x - tgt.x, fl.y - tgt.y) - tgt.radius
+                    eta = (dist_edge / speed) if dist_edge > 0.0 else 0.0
+                    ch = base_ch + slot_idx * feat_cnt
 
-            self._encode_top_k_fleets(
-                obs=obs,
-                grid_x=grid_x,
-                grid_y=grid_y,
-                fleets=friendly_fleets,
-                base_channel=fleet_base_channel,
-            )
+                    vx = (tgt.x + grid_max_x) / span_x
+                    obs[ch, gy, gx] = 0.0 if vx <= 0.0 else (1.0 if vx >= 1.0 else vx)
+                    vy = (tgt.y + grid_max_y) / span_y
+                    obs[ch + 1, gy, gx] = 0.0 if vy <= 0.0 else (1.0 if vy >= 1.0 else vy)
+                    vr = fl.radius / max_rad
+                    obs[ch + 2, gy, gx] = 0.0 if vr <= 0.0 else (1.0 if vr >= 1.0 else vr)
+                    vs = fl.ships / max_ships
+                    obs[ch + 3, gy, gx] = 0.0 if vs <= 0.0 else (1.0 if vs >= 1.0 else vs)
+                    ve = eta / max_eta
+                    obs[ch + 4, gy, gx] = 0.0 if ve <= 0.0 else (1.0 if ve >= 1.0 else ve)
 
-            enemy_base_channel = fleet_base_channel + self.fleet_slot_count_per_side * self.FLEET_FEATURE_COUNT
-            self._encode_top_k_fleets(
-                obs=obs,
-                grid_x=grid_x,
-                grid_y=grid_y,
-                fleets=enemy_fleets,
-                base_channel=enemy_base_channel,
-            )
+                if n_fl > top_k:
+                    rem = cell_fleets[top_k:]
+                    total_ships = 0.0
+                    for fl in rem:
+                        total_ships += fl.ships
+                    if total_ships > 0.0:
+                        w_tx = 0.0
+                        w_ty = 0.0
+                        w_rad = 0.0
+                        w_eta = 0.0
+                        for fl in rem:
+                            tgt = planets[fl.target]
+                            w = fl.ships / total_ships
+                            w_tx += tgt.x * w
+                            w_ty += tgt.y * w
+                            w_rad += fl.radius * w
+                            dist_edge = hypot(fl.x - tgt.x, fl.y - tgt.y) - tgt.radius
+                            if dist_edge > 0.0:
+                                w_eta += (dist_edge / speed) * w
+                        ch = base_ch + top_k * feat_cnt
+                        vx = (w_tx + grid_max_x) / span_x
+                        obs[ch, gy, gx] = 0.0 if vx <= 0.0 else (1.0 if vx >= 1.0 else vx)
+                        vy = (w_ty + grid_max_y) / span_y
+                        obs[ch + 1, gy, gx] = 0.0 if vy <= 0.0 else (1.0 if vy >= 1.0 else vy)
+                        vr = w_rad / max_rad
+                        obs[ch + 2, gy, gx] = 0.0 if vr <= 0.0 else (1.0 if vr >= 1.0 else vr)
+                        vs = total_ships / max_ships
+                        obs[ch + 3, gy, gx] = 0.0 if vs <= 0.0 else (1.0 if vs >= 1.0 else vs)
+                        ve = w_eta / max_eta
+                        obs[ch + 4, gy, gx] = 0.0 if ve <= 0.0 else (1.0 if ve >= 1.0 else ve)
 
     # Encode top-K fleets and a "summary" channel for a single player (friendly OR enemy)
     def _encode_top_k_fleets(
@@ -1195,32 +2107,93 @@ class GalconEnv(BaseEnv):
         obs[base_channel + 4, grid_y, grid_x] = self._encode_eta(weighted_eta)
 
     def _encode_landing_schedule(self, obs: np.ndarray) -> None:
+        fleets = self.fleets
+        if not fleets:
+            return
+
         landing_base_channel = self.PLANET_CHANNEL_COUNT + self.fleet_channel_count
+        buckets = self.LANDING_BUCKETS
+        n_buckets = len(buckets)
+        feat_per_bucket = self.LANDING_FEATURE_COUNT_PER_BUCKET
+        planets = self.planets
+        cur_player = self._current_player
+        speed = self.fleet_speed if self.fleet_speed > 1e-6 else 1e-6
+        max_ships = self.max_expected_ships
+        grid_max_x = self.grid_max_x
+        grid_max_y = self.grid_max_y
+        sq = self.grid_square_size
+        w_m1 = self.grid_width - 1
+        h_m1 = self.grid_height - 1
+        floor = math.floor
+        hypot = math.hypot
 
-        for planet in self.planets:
-            grid_x, grid_y = self._world_to_grid(planet.x, planet.y)
-            friendly_by_bucket = np.zeros(len(self.LANDING_BUCKETS), dtype=np.float32)
-            enemy_by_bucket = np.zeros(len(self.LANDING_BUCKETS), dtype=np.float32)
+        default_3_buckets = (
+            n_buckets == 3
+            and buckets[0] == (0.0, 1.0)
+            and buckets[1] == (1.0, 2.0)
+            and buckets[2] == (2.0, math.inf)
+        )
 
-            for fleet in self.fleets:
-                if fleet.target != planet.id:
-                    continue
-
-                bucket_index = self._landing_bucket_index(self._fleet_eta_seconds(fleet))
-                if fleet.owner == self._current_player:
-                    friendly_by_bucket[bucket_index] += fleet.ships
+        # Accumulate incoming ships in a single O(F) pass, only touching planets with incoming fleets.
+        # Each entry stores [friendly_0..B-1, enemy_0..B-1].
+        by_target: Dict[int, List[float]] = {}
+        two_b = 2 * n_buckets
+        for fleet in fleets:
+            tid = fleet.target
+            target = planets[tid]
+            dist_edge = hypot(fleet.x - target.x, fleet.y - target.y) - target.radius
+            eta = (dist_edge / speed) if dist_edge > 0.0 else 0.0
+            if default_3_buckets:
+                if eta < 1.0:
+                    b_idx = 0
+                elif eta < 2.0:
+                    b_idx = 1
                 else:
-                    enemy_by_bucket[bucket_index] += fleet.ships
+                    b_idx = 2
+            else:
+                b_idx = self._landing_bucket_index(eta)
 
-            for bucket_index in range(len(self.LANDING_BUCKETS)):
-                friendly = float(friendly_by_bucket[bucket_index])
-                enemy = float(enemy_by_bucket[bucket_index])
-                bucket_channel = landing_base_channel + bucket_index * self.LANDING_FEATURE_COUNT_PER_BUCKET
+            acc = by_target.get(tid)
+            if acc is None:
+                acc = [0.0] * two_b
+                by_target[tid] = acc
+            if fleet.owner == cur_player:
+                acc[b_idx] += fleet.ships
+            else:
+                acc[n_buckets + b_idx] += fleet.ships
 
-                obs[bucket_channel + 0, grid_y, grid_x] = self._encode_ships(friendly)
-                obs[bucket_channel + 1, grid_y, grid_x] = self._encode_ships(enemy)
-                obs[bucket_channel + 2, grid_y, grid_x] = self._encode_ships(max(friendly - enemy, 0.0))
-                obs[bucket_channel + 3, grid_y, grid_x] = self._encode_ships(max(enemy - friendly, 0.0))
+        for tid, acc in by_target.items():
+            planet = planets[tid]
+            gx = floor((planet.x + grid_max_x) / sq)
+            if gx < 0:
+                gx = 0
+            elif gx > w_m1:
+                gx = w_m1
+            gy = floor((planet.y + grid_max_y) / sq)
+            if gy < 0:
+                gy = 0
+            elif gy > h_m1:
+                gy = h_m1
+
+            for b_idx in range(n_buckets):
+                friendly = acc[b_idx]
+                enemy = acc[n_buckets + b_idx]
+                if friendly == 0.0 and enemy == 0.0:
+                    continue
+                ch = landing_base_channel + b_idx * feat_per_bucket
+                if friendly > 0.0:
+                    vf = friendly / max_ships
+                    obs[ch, gy, gx] = 1.0 if vf >= 1.0 else vf
+                if enemy > 0.0:
+                    ve = enemy / max_ships
+                    obs[ch + 1, gy, gx] = 1.0 if ve >= 1.0 else ve
+                diff = friendly - enemy
+                if diff > 0.0:
+                    vd = diff / max_ships
+                    obs[ch + 2, gy, gx] = 1.0 if vd >= 1.0 else vd
+                elif diff < 0.0:
+                    vd = (-diff) / max_ships
+                    obs[ch + 3, gy, gx] = 1.0 if vd >= 1.0 else vd
 
     def _landing_bucket_index(self, eta_seconds: float) -> int:
         for bucket_index, (lower, upper) in enumerate(self.LANDING_BUCKETS):
@@ -1317,7 +2290,51 @@ class GalconEnv(BaseEnv):
         np.random.seed(seed)
 
     def close(self) -> None:
-        pass
+        if getattr(self, '_cpp_sim', None) is not None:
+            self._cpp_sim.close()
+            self._cpp_sim = None
+            self._cpp_p_snap = []
+            self._cpp_f_snap = []
+
+    def __del__(self) -> None:
+        try:
+            cpp_sim = getattr(self, '_cpp_sim', None)
+            if cpp_sim is not None:
+                cpp_sim.close()
+                self._cpp_sim = None
+        except Exception:
+            pass
+
+    def __deepcopy__(self, memo: dict) -> 'GalconEnv':
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        skip_keys = {
+            '_cpp_sim',
+            '_cpp_p_snap',
+            '_cpp_f_snap',
+            '_cpp_planets_sorted',
+            '_cpp_pid_to_idx',
+            '_cpp_cfg_sig',
+            '_cpp_bucket_lowers',
+            '_cpp_bucket_uppers',
+            '_ptr_cpp_bucket_lowers',
+            '_ptr_cpp_bucket_uppers',
+        }
+        for k, v in self.__dict__.items():
+            if k in skip_keys:
+                continue
+            setattr(result, k, copy.deepcopy(v, memo))
+        result._cpp_sim = None
+        result._cpp_gen = 0
+        result._cpp_units_materialized = False
+        result._cpp_cfg_sig = None
+        result._cpp_planets_sorted = []
+        result._cpp_pid_to_idx = {}
+        result._cpp_p_snap = []
+        result._cpp_f_snap = []
+        result._init_cpp_bucket_buffers()
+        return result
 
     def render(self, mode: Optional[str] = None) -> None:
         """

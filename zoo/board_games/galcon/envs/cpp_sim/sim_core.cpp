@@ -63,8 +63,11 @@ struct PhysicsScratch {
     double p_land_r2_guard[SIM_MAX_PLANETS];
     double p_prod_sub[SIM_MAX_PLANETS];
     int32_t tgt_head[SIM_MAX_PLANETS];
-    int32_t tgt_tail[SIM_MAX_PLANETS];
-    int32_t tgt_cnt[SIM_MAX_PLANETS];
+    int32_t grp_head[SIM_MAX_FLEETS];
+    int32_t grp_tail[SIM_MAX_FLEETS];
+    int32_t grp_cnt[SIM_MAX_FLEETS];
+    int32_t grp_owner[SIM_MAX_FLEETS];
+    int32_t grp_next[SIM_MAX_FLEETS];
     int32_t fl_next[SIM_MAX_FLEETS];
     int32_t grp_uids[SIM_MAX_UNITS];
     double grp_x[SIM_MAX_UNITS];
@@ -514,8 +517,11 @@ static int32_t run_physics_substeps_core(
     double* __restrict__ p_land_r2_guard,
     double* __restrict__ p_prod_sub,
     int32_t* __restrict__ tgt_head,
-    int32_t* __restrict__ tgt_tail,
-    int32_t* __restrict__ tgt_cnt,
+    int32_t* __restrict__ grp_head,
+    int32_t* __restrict__ grp_tail,
+    int32_t* __restrict__ grp_cnt,
+    int32_t* __restrict__ grp_owner,
+    int32_t* __restrict__ grp_next,
     int32_t* __restrict__ fl_next,
     int32_t* __restrict__ grp_uids,
     double* __restrict__ grp_x,
@@ -581,24 +587,35 @@ static int32_t run_physics_substeps_core(
         if (fl_unit_count[f] > 0) ++active_fleets;
     }
 
-    // Group fleets by target planet index (preserving ascending fleet index order)
+    // Group fleets by (owner, target planet index) preserving ascending fleet index order.
+    // Real Galcon 2 (collide_do @0x43db40) keys unit separation by ((owner << 12) | target) << 8,
+    // so opposing-owner fleets converging on the same planet pass through each other.
     for (int32_t p = 0; p < n_planets; ++p) {
         tgt_head[p] = -1;
-        tgt_tail[p] = -1;
-        tgt_cnt[p] = 0;
     }
+    int32_t n_groups = 0;
     for (int32_t f = 0; f < n_fleets; ++f) {
         fl_next[f] = -1;
         const int32_t tgt = fl_target_idx[f];
         if (tgt < 0 || tgt >= n_planets) continue;
-        if (tgt_head[tgt] < 0) {
-            tgt_head[tgt] = f;
-            tgt_tail[tgt] = f;
-        } else {
-            fl_next[tgt_tail[tgt]] = f;
-            tgt_tail[tgt] = f;
+        const int32_t own = fl_owner[f];
+        int32_t g = tgt_head[tgt];
+        while (g >= 0 && grp_owner[g] != own) {
+            g = grp_next[g];
         }
-        tgt_cnt[tgt] += 1;
+        if (g < 0) {
+            g = n_groups++;
+            grp_owner[g] = own;
+            grp_head[g] = f;
+            grp_tail[g] = f;
+            grp_cnt[g] = 1;
+            grp_next[g] = tgt_head[tgt];
+            tgt_head[tgt] = g;
+        } else {
+            fl_next[grp_tail[g]] = f;
+            grp_tail[g] = f;
+            grp_cnt[g] += 1;
+        }
     }
 
     for (int32_t t = 0; t < n_ticks; ++t) {
@@ -624,18 +641,18 @@ static int32_t run_physics_substeps_core(
             }
         }
 
-        // 2. Same-target ship-ship circle separation
+        // 2. Same-owner same-target ship-ship circle separation
         if (sep_stiffness > 0.0) {
             const bool ship_cap = (sep_mode == 1 && max_sep_push > 0.0);
             const bool pair_cap = (sep_mode == 0 && max_sep_push > 0.0);
             const double cap2 = (max_sep_push > 0.0) ? (max_sep_push * max_sep_push) : 0.0;
 
-            for (int32_t tgt = 0; tgt < n_planets; ++tgt) {
-                const int32_t nf_tgt = tgt_cnt[tgt];
-                if (nf_tgt <= 0) continue;
+            for (int32_t g = 0; g < n_groups; ++g) {
+                const int32_t nf_grp = grp_cnt[g];
+                if (nf_grp <= 0) continue;
 
-                if (nf_tgt == 1) {
-                    const int32_t f = tgt_head[tgt];
+                if (nf_grp == 1) {
+                    const int32_t f = grp_head[g];
                     const int32_t alive_c = fl_alive_cnt[f];
                     if (alive_c <= 1) continue;
                     const int32_t start = fl_unit_start[f];
@@ -709,7 +726,7 @@ static int32_t run_physics_substeps_core(
                     double sl_x0[MAX_SLICES], sl_x1[MAX_SLICES], sl_y0[MAX_SLICES], sl_y1[MAX_SLICES];
                     int32_t n_slices = 0;
                     int32_t m = 0;
-                    for (int32_t f = tgt_head[tgt]; f >= 0; f = fl_next[f]) {
+                    for (int32_t f = grp_head[g]; f >= 0; f = fl_next[f]) {
                         const int32_t alive_c = fl_alive_cnt[f];
                         if (alive_c <= 0) continue;
                         const int32_t start = fl_unit_start[f];
@@ -1249,8 +1266,11 @@ int32_t run_physics_substeps(
     double* __restrict__ p_land_r2_guard,
     double* __restrict__ p_prod_sub,
     int32_t* __restrict__ tgt_head,
-    int32_t* __restrict__ tgt_tail,
-    int32_t* __restrict__ tgt_cnt,
+    int32_t* __restrict__ grp_head,
+    int32_t* __restrict__ grp_tail,
+    int32_t* __restrict__ grp_cnt,
+    int32_t* __restrict__ grp_owner,
+    int32_t* __restrict__ grp_next,
     int32_t* __restrict__ fl_next,
     int32_t* __restrict__ grp_uids,
     double* __restrict__ grp_x,
@@ -1267,7 +1287,7 @@ int32_t run_physics_substeps(
         u_alive, fl_alive_cnt, tmp_x, tmp_y,
         arr_buckets, dirty_planets, near_planets,
         p_min_r, p_min_r2, p_land_r, p_land_r2_guard, p_prod_sub,
-        tgt_head, tgt_tail, tgt_cnt, fl_next, grp_uids, grp_x, grp_y,
+        tgt_head, grp_head, grp_tail, grp_cnt, grp_owner, grp_next, fl_next, grp_uids, grp_x, grp_y,
         1,
         nullptr,
         nullptr
@@ -1691,7 +1711,7 @@ struct SimState {
             s.u_alive, s.fl_alive_cnt, s.tmp_x, s.tmp_y,
             s.arr_buckets, s.dirty_planets, s.near_planets,
             s.p_min_r, s.p_min_r2, s.p_land_r, s.p_land_r2_guard, s.p_prod_sub,
-            s.tgt_head, s.tgt_tail, s.tgt_cnt, s.fl_next, s.grp_uids, s.grp_x, s.grp_y
+            s.tgt_head, s.grp_head, s.grp_tail, s.grp_cnt, s.grp_owner, s.grp_next, s.fl_next, s.grp_uids, s.grp_x, s.grp_y
         );
 
         int32_t wf = 0;
@@ -1760,7 +1780,7 @@ struct SimState {
             s.u_alive, s.fl_alive_cnt, s.tmp_x, s.tmp_y,
             s.arr_buckets, s.dirty_planets, s.near_planets,
             s.p_min_r, s.p_min_r2, s.p_land_r, s.p_land_r2_guard, s.p_prod_sub,
-            s.tgt_head, s.tgt_tail, s.tgt_cnt, s.fl_next, s.grp_uids, s.grp_x, s.grp_y,
+            s.tgt_head, s.grp_head, s.grp_tail, s.grp_cnt, s.grp_owner, s.grp_next, s.fl_next, s.grp_uids, s.grp_x, s.grp_y,
             n_ticks,
             &SimState::on_multi_tick_end,
             &ctx
@@ -1909,7 +1929,7 @@ int32_t step_physics_cpp(
             s.u_alive, s.fl_alive_cnt, s.tmp_x, s.tmp_y,
             s.arr_buckets, s.dirty_planets, s.near_planets,
             s.p_min_r, s.p_min_r2, s.p_land_r, s.p_land_r2_guard, s.p_prod_sub,
-            s.tgt_head, s.tgt_tail, s.tgt_cnt, s.fl_next, s.grp_uids, s.grp_x, s.grp_y
+            s.tgt_head, s.grp_head, s.grp_tail, s.grp_cnt, s.grp_owner, s.grp_next, s.fl_next, s.grp_uids, s.grp_x, s.grp_y
         );
     }
 
@@ -1930,8 +1950,11 @@ int32_t step_physics_cpp(
     std::vector<double> p_land_r2_guard(sz_p);
     std::vector<double> p_prod_sub(sz_p);
     std::vector<int32_t> tgt_head(sz_p);
-    std::vector<int32_t> tgt_tail(sz_p);
-    std::vector<int32_t> tgt_cnt(sz_p);
+    std::vector<int32_t> grp_head(sz_f);
+    std::vector<int32_t> grp_tail(sz_f);
+    std::vector<int32_t> grp_cnt(sz_f);
+    std::vector<int32_t> grp_owner(sz_f);
+    std::vector<int32_t> grp_next(sz_f);
     std::vector<int32_t> fl_next(sz_f);
     std::vector<int32_t> grp_uids(sz_u);
     std::vector<double> grp_x(sz_u);
@@ -1948,7 +1971,7 @@ int32_t step_physics_cpp(
         u_alive.data(), fl_alive_cnt.data(), tmp_x.data(), tmp_y.data(),
         arr_buckets.data(), dirty_planets.data(), near_planets.data(),
         p_min_r.data(), p_min_r2.data(), p_land_r.data(), p_land_r2_guard.data(), p_prod_sub.data(),
-        tgt_head.data(), tgt_tail.data(), tgt_cnt.data(), fl_next.data(), grp_uids.data(), grp_x.data(), grp_y.data()
+        tgt_head.data(), grp_head.data(), grp_tail.data(), grp_cnt.data(), grp_owner.data(), grp_next.data(), fl_next.data(), grp_uids.data(), grp_x.data(), grp_y.data()
     );
 }
 
@@ -2460,6 +2483,664 @@ double sim_eval_heuristic(const SimState* st, int32_t player, int32_t horizon) {
     const double fut_prod_adv = (fut_my_prod - fut_en_prod) / fut_denom;
     const double raw = 0.45 * ship_adv + 0.90 * fut_ship_adv + 0.50 * prod_adv + 1.10 * fut_prod_adv;
     return std::tanh(raw);
+}
+
+int32_t sim_update_planets(
+    SimState* st,
+    int32_t n_planets,
+    const int32_t* p_id,
+    const int32_t* p_owner,
+    const double* p_ships,
+    const double* p_x,
+    const double* p_y,
+    const double* p_prod,
+    const double* p_radius,
+    double fleet_speed,
+    double tick_dt,
+    int32_t substeps,
+    int32_t clear_fleets
+) {
+    if (!st || n_planets < 0 || n_planets > SIM_MAX_PLANETS) return -1;
+    st->fleet_speed = fleet_speed;
+    st->tick_dt = tick_dt;
+    st->substeps = substeps < 1 ? 1 : substeps;
+    st->n_planets = n_planets;
+    for (int32_t i = 0; i < n_planets; ++i) {
+        st->p_id[i] = p_id[i];
+        st->p_owner[i] = p_owner[i];
+        st->p_ships[i] = p_ships[i];
+        st->p_x[i] = p_x[i];
+        st->p_y[i] = p_y[i];
+        st->p_prod[i] = p_prod[i];
+        st->p_radius[i] = p_radius[i];
+    }
+    if (clear_fleets) {
+        st->n_fleets = 0;
+        st->n_units = 0;
+        st->tick = 0;
+        st->done = 0;
+        st->winner = 0;
+    }
+    return 0;
+}
+
+int32_t sim_spawn_fleet_exact(
+    SimState* st,
+    int32_t owner,
+    int32_t src_idx,
+    int32_t dst_idx,
+    double ships_to_send,
+    int32_t fleet_id,
+    double* out_cx,
+    double* out_cy,
+    double* out_radius,
+    int32_t* out_num_units
+) {
+    if (!st) return -1;
+    if (src_idx < 0 || src_idx >= st->n_planets || dst_idx < 0 || dst_idx >= st->n_planets) return -1;
+
+    double total_planet_ships = 0.0;
+    for (int32_t i = 0; i < st->n_planets; ++i) {
+        if (st->p_ships[i] > 0.0) {
+            total_planet_ships += st->p_ships[i];
+        }
+    }
+    const int32_t parts = physical_ship_count_cpp(
+        ships_to_send, total_planet_ships, st->item_count(), st->items_max, st->items_reserved
+    );
+    if (parts <= 0) return 1;
+    if (st->n_fleets >= SIM_MAX_FLEETS || st->n_units + parts > SIM_MAX_UNITS) return -1;
+
+    const double rem = st->p_ships[src_idx] - ships_to_send;
+    st->p_ships[src_idx] = rem > 0.0 ? rem : 0.0;
+
+    const double dx = st->p_x[dst_idx] - st->p_x[src_idx];
+    const double dy = st->p_y[dst_idx] - st->p_y[src_idx];
+    const double raw_d = std::hypot(dx, dy);
+    const double d = (raw_d > 1e-6) ? raw_d : 1e-6;
+    const double hx0 = (raw_d > 1e-6) ? (dx / d) : 1.0;
+    const double hy0 = (raw_d > 1e-6) ? (dy / d) : 0.0;
+    const double spawn_r = st->p_radius[src_idx] + st->ship_radius;
+    const double sx = st->p_x[src_idx] + hx0 * spawn_r;
+    const double sy = st->p_y[src_idx] + hy0 * spawn_r;
+
+    const int32_t f = st->n_fleets++;
+    const int32_t u_start = st->n_units;
+    st->fl_id[f] = fleet_id;
+    st->fl_owner[f] = owner;
+    st->fl_source_id[f] = st->p_id[src_idx];
+    st->fl_target_idx[f] = dst_idx;
+    st->fl_spu[f] = ships_to_send / (double)parts;
+    st->fl_unit_start[f] = u_start;
+    st->fl_unit_count[f] = parts;
+    st->fl_ships[f] = ships_to_send;
+
+    if (parts == 1) {
+        st->ux[u_start] = sx;
+        st->uy[u_start] = sy;
+        st->uhx[u_start] = hx0;
+        st->uhy[u_start] = hy0;
+        st->fl_cx[f] = sx;
+        st->fl_cy[f] = sy;
+        st->fl_radius[f] = st->ship_radius;
+    } else {
+        double* const fux = st->ux + u_start;
+        double* const fuy = st->uy + u_start;
+        double* const fuhx = st->uhx + u_start;
+        double* const fuhy = st->uhy + u_start;
+        const double two_pi = 2.0 * PI;
+        const uint32_t seed_base = static_cast<uint32_t>(fleet_id) * 1000003u;
+        const double spawn_disc_r = SPAWN_AREA_RADIUS * std::sqrt(static_cast<double>(parts));
+        const double tx = st->p_x[dst_idx];
+        const double ty = st->p_y[dst_idx];
+        double sum_x = 0.0;
+        double sum_y = 0.0;
+        for (int32_t j = 0; j < parts; ++j) {
+            const uint32_t uj = static_cast<uint32_t>(j);
+            const double u1 = spawn_hash_u01(seed_base + uj * 2u + 1u);
+            const double u2 = spawn_hash_u01(seed_base + uj * 2u + 2u);
+            const double r = spawn_disc_r * std::sqrt(u1);
+            const double ang = two_pi * u2;
+            const double xj = sx + r * std::cos(ang);
+            const double yj = sy + r * std::sin(ang);
+            fux[j] = xj;
+            fuy[j] = yj;
+            sum_x += xj;
+            sum_y += yj;
+            const double hdx = tx - xj;
+            const double hdy = ty - yj;
+            const double hd2 = hdx * hdx + hdy * hdy;
+            if (hd2 > EPS_DIST2) {
+                const double hd = std::sqrt(hd2);
+                fuhx[j] = hdx / hd;
+                fuhy[j] = hdy / hd;
+            } else {
+                fuhx[j] = hx0;
+                fuhy[j] = hy0;
+            }
+        }
+        const double cx = sum_x / (double)parts;
+        const double cy = sum_y / (double)parts;
+        double max_d2 = 0.0;
+        for (int32_t j = 0; j < parts; ++j) {
+            const double ddx = fux[j] - cx;
+            const double ddy = fuy[j] - cy;
+            const double dd2 = ddx * ddx + ddy * ddy;
+            if (dd2 > max_d2) max_d2 = dd2;
+        }
+        st->fl_cx[f] = cx;
+        st->fl_cy[f] = cy;
+        st->fl_radius[f] = std::sqrt(max_d2) + st->ship_radius;
+    }
+
+    st->n_units += parts;
+    if (out_cx) *out_cx = st->fl_cx[f];
+    if (out_cy) *out_cy = st->fl_cy[f];
+    if (out_radius) *out_radius = st->fl_radius[f];
+    if (out_num_units) *out_num_units = parts;
+    return 0;
+}
+
+int32_t sim_set_fleet_target_by_id(SimState* st, int32_t fleet_id, int32_t dst_idx) {
+    if (!st || dst_idx < 0 || dst_idx >= st->n_planets) return 0;
+    for (int32_t f = 0; f < st->n_fleets; ++f) {
+        if (st->fl_id[f] == fleet_id) {
+            st->fl_target_idx[f] = dst_idx;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int32_t sim_step_physics_and_read(
+    SimState* st,
+    int32_t* out_p_owner,
+    double* out_p_ships,
+    int32_t* out_fl_id,
+    int32_t* out_fl_cnt,
+    double* out_fl_ships,
+    double* out_fl_cx,
+    double* out_fl_cy,
+    double* out_fl_rad
+) {
+    if (!st || st->n_planets <= 0) return 0;
+
+    for (int32_t f = 0; f < st->n_fleets; ++f) {
+        const int32_t c = st->fl_unit_count[f];
+        st->fl_spu[f] = st->fl_ships[f] / (double)(c > 1 ? c : 1);
+    }
+
+    PhysicsScratch& s = get_physics_scratch();
+    st->n_units = run_physics_substeps(
+        st->n_planets,
+        st->p_owner, st->p_ships, st->p_x, st->p_y, st->p_prod, st->p_radius,
+        st->n_fleets,
+        st->fl_owner, st->fl_target_idx, st->fl_spu, st->fl_unit_start, st->fl_unit_count,
+        st->fl_ships, st->fl_cx, st->fl_cy, st->fl_radius,
+        st->n_units, st->ux, st->uy, st->uhx, st->uhy,
+        st->tick_dt, st->fleet_speed, st->substeps, st->ship_radius,
+        st->sep_stiffness, st->max_sep_push, st->sep_mode, st->prod_divisor, st->obstacle_escape_eps,
+        st->turn_rate, st->turn_min_speed_factor,
+        s.u_alive, s.fl_alive_cnt, s.tmp_x, s.tmp_y,
+        s.arr_buckets, s.dirty_planets, s.near_planets,
+        s.p_min_r, s.p_min_r2, s.p_land_r, s.p_land_r2_guard, s.p_prod_sub,
+        s.tgt_head, s.grp_head, s.grp_tail, s.grp_cnt, s.grp_owner, s.grp_next, s.fl_next, s.grp_uids, s.grp_x, s.grp_y
+    );
+
+    int32_t wf = 0;
+    for (int32_t f = 0; f < st->n_fleets; ++f) {
+        if (st->fl_unit_count[f] > 0) {
+            if (wf != f) {
+                st->fl_id[wf] = st->fl_id[f];
+                st->fl_owner[wf] = st->fl_owner[f];
+                st->fl_source_id[wf] = st->fl_source_id[f];
+                st->fl_target_idx[wf] = st->fl_target_idx[f];
+                st->fl_spu[wf] = st->fl_spu[f];
+                st->fl_unit_start[wf] = st->fl_unit_start[f];
+                st->fl_unit_count[wf] = st->fl_unit_count[f];
+                st->fl_ships[wf] = st->fl_ships[f];
+                st->fl_cx[wf] = st->fl_cx[f];
+                st->fl_cy[wf] = st->fl_cy[f];
+                st->fl_radius[wf] = st->fl_radius[f];
+            }
+            ++wf;
+        }
+    }
+    st->n_fleets = wf;
+
+    const int32_t np = st->n_planets;
+    std::memcpy(out_p_owner, st->p_owner, (size_t)np * sizeof(int32_t));
+    std::memcpy(out_p_ships, st->p_ships, (size_t)np * sizeof(double));
+    if (wf > 0) {
+        std::memcpy(out_fl_id, st->fl_id, (size_t)wf * sizeof(int32_t));
+        std::memcpy(out_fl_cnt, st->fl_unit_count, (size_t)wf * sizeof(int32_t));
+        std::memcpy(out_fl_ships, st->fl_ships, (size_t)wf * sizeof(double));
+        std::memcpy(out_fl_cx, st->fl_cx, (size_t)wf * sizeof(double));
+        std::memcpy(out_fl_cy, st->fl_cy, (size_t)wf * sizeof(double));
+        std::memcpy(out_fl_rad, st->fl_radius, (size_t)wf * sizeof(double));
+    }
+    return wf;
+}
+
+int32_t sim_read_fleet_units_by_id(
+    const SimState* st,
+    int32_t fleet_id,
+    double* out_ux,
+    double* out_uy,
+    double* out_uhx,
+    double* out_uhy,
+    int32_t max_units
+) {
+    if (!st) return -1;
+    for (int32_t f = 0; f < st->n_fleets; ++f) {
+        if (st->fl_id[f] == fleet_id) {
+            const int32_t cnt = st->fl_unit_count[f];
+            if (cnt > max_units) return -1;
+            const int32_t start = st->fl_unit_start[f];
+            if (cnt > 0) {
+                std::memcpy(out_ux, st->ux + start, (size_t)cnt * sizeof(double));
+                std::memcpy(out_uy, st->uy + start, (size_t)cnt * sizeof(double));
+                std::memcpy(out_uhx, st->uhx + start, (size_t)cnt * sizeof(double));
+                std::memcpy(out_uhy, st->uhy + start, (size_t)cnt * sizeof(double));
+            }
+            return cnt;
+        }
+    }
+    return -1;
+}
+
+static inline float clamp01_f32(double v) {
+    if (v <= 0.0) return 0.0f;
+    if (v >= 1.0) return 1.0f;
+    return static_cast<float>(v);
+}
+
+int32_t sim_encode_obs_and_mask(
+    const SimState* st,
+    int32_t cur_player,
+    int32_t grid_width,
+    int32_t grid_height,
+    double grid_max_x,
+    double grid_max_y,
+    double grid_square_size,
+    int32_t fleet_top_k,
+    double max_expected_ships,
+    double max_expected_production,
+    double max_fleet_radius,
+    double max_expected_eta,
+    double send_ratio,
+    double min_send_ships,
+    int32_t enable_fleet_redirection,
+    int32_t n_buckets,
+    const double* bucket_lowers,
+    const double* bucket_uppers,
+    float* out_obs,
+    int8_t* out_mask
+) {
+    constexpr int32_t MAX_GRID_CELLS = 1024;
+    constexpr int32_t MAX_BUCKETS = 16;
+    if (!st) return -1;
+    const int32_t grid_cells = grid_width * grid_height;
+    if (grid_cells <= 0 || grid_cells > MAX_GRID_CELLS) return -1;
+    if (n_buckets < 0 || n_buckets > MAX_BUCKETS) return -1;
+
+    const int32_t np = st->n_planets;
+    const int32_t nf = st->n_fleets;
+    const int32_t pair_action_count = grid_cells * grid_cells;
+    const int32_t total_actions = enable_fleet_redirection ? (2 * pair_action_count + 1) : (pair_action_count + 1);
+
+    const int32_t fleet_slot_per_side = fleet_top_k + 1;
+    const int32_t fleet_ch_cnt = 2 * fleet_slot_per_side * 5;
+    const int32_t total_ch = 8 + fleet_ch_cnt + n_buckets * 4;
+
+    if (out_obs) {
+        std::memset(out_obs, 0, static_cast<size_t>(total_ch) * static_cast<size_t>(grid_cells) * sizeof(float));
+    }
+    if (out_mask) {
+        std::memset(out_mask, 0, static_cast<size_t>(total_actions));
+        out_mask[0] = 1;
+    }
+
+    const int32_t w_m1 = grid_width - 1;
+    const int32_t h_m1 = grid_height - 1;
+    const double span_x = 2.0 * grid_max_x;
+    const double span_y = 2.0 * grid_max_y;
+    const double speed = (st->fleet_speed > 1e-6) ? st->fleet_speed : 1e-6;
+    const double max_rad = (max_fleet_radius > 1e-6) ? max_fleet_radius : 1e-6;
+
+    // Per-planet grid coords & per-cell target/friendly lookup
+    int32_t p_gx[SIM_MAX_PLANETS];
+    int32_t p_gy[SIM_MAX_PLANETS];
+    int32_t cell_tgt_id[MAX_GRID_CELLS];
+    int32_t cell_fr_id[MAX_GRID_CELLS];
+    uint8_t cell_can_send[MAX_GRID_CELLS];
+    int32_t tgt_cells[SIM_MAX_PLANETS];
+    int32_t src_cells[SIM_MAX_PLANETS];
+    int32_t n_tgt = 0;
+    int32_t n_src = 0;
+
+    if (out_mask) {
+        for (int32_t c = 0; c < grid_cells; ++c) {
+            cell_tgt_id[c] = -1;
+            cell_fr_id[c] = -1;
+            cell_can_send[c] = 0;
+        }
+    }
+
+    for (int32_t i = 0; i < np; ++i) {
+        const double px = st->p_x[i];
+        const double py = st->p_y[i];
+        int32_t gx = static_cast<int32_t>(std::floor((px + grid_max_x) / grid_square_size));
+        if (gx < 0) gx = 0;
+        else if (gx > w_m1) gx = w_m1;
+        int32_t gy = static_cast<int32_t>(std::floor((py + grid_max_y) / grid_square_size));
+        if (gy < 0) gy = 0;
+        else if (gy > h_m1) gy = h_m1;
+        p_gx[i] = gx;
+        p_gy[i] = gy;
+        const int32_t cell = gy * grid_width + gx;
+
+        if (out_obs) {
+            const float lx = clamp01_f32((px - (-grid_max_x + static_cast<double>(gx) * grid_square_size)) / grid_square_size);
+            const float ly = clamp01_f32((py - (-grid_max_y + static_cast<double>(gy) * grid_square_size)) / grid_square_size);
+            const float sv = clamp01_f32(st->p_ships[i] / max_expected_ships);
+            const float pv = clamp01_f32(st->p_prod[i] / max_expected_production);
+            out_obs[0 * grid_cells + cell] = lx;
+            out_obs[1 * grid_cells + cell] = ly;
+            const int32_t own = st->p_owner[i];
+            if (own == cur_player) {
+                out_obs[2 * grid_cells + cell] = sv;
+                out_obs[5 * grid_cells + cell] = pv;
+            } else if (own == 0) {
+                out_obs[4 * grid_cells + cell] = sv;
+                out_obs[7 * grid_cells + cell] = pv;
+            } else {
+                out_obs[3 * grid_cells + cell] = sv;
+                out_obs[6 * grid_cells + cell] = pv;
+            }
+        }
+
+        if (out_mask) {
+            const int32_t pid = st->p_id[i];
+            if (cell_tgt_id[cell] < 0) {
+                cell_tgt_id[cell] = pid;
+                tgt_cells[n_tgt++] = cell;
+            }
+            if (st->p_owner[i] == cur_player) {
+                if (cell_fr_id[cell] < 0) {
+                    cell_fr_id[cell] = pid;
+                }
+                const double ships = st->p_ships[i];
+                if (ships > 0.0) {
+                    const double scaled = ships * send_ratio;
+                    const double to_send = std::floor(ships < scaled ? ships : scaled);
+                    if (to_send >= min_send_ships && to_send > 0.0) {
+                        if (!cell_can_send[cell]) {
+                            cell_can_send[cell] = 1;
+                            src_cells[n_src++] = cell;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (out_mask) {
+        for (int32_t si = 0; si < n_src; ++si) {
+            const int32_t sc = src_cells[si];
+            const int32_t src_id = cell_fr_id[sc];
+            const int32_t row_base = sc * grid_cells + 1;
+            for (int32_t ti = 0; ti < n_tgt; ++ti) {
+                const int32_t tc = tgt_cells[ti];
+                if (src_id != cell_tgt_id[tc]) {
+                    out_mask[row_base + tc] = 1;
+                }
+            }
+        }
+    }
+
+    if (nf <= 0) {
+        return 0;
+    }
+
+    // Single pass over fleets:
+    //  - compute ETA once
+    //  - bucket into friendly/enemy per-cell linked lists (preserving insertion order)
+    //  - accumulate redirect mask per-cell target status
+    //  - accumulate landing schedule per target planet & bucket
+    int32_t fr_head[MAX_GRID_CELLS];
+    int32_t fr_tail[MAX_GRID_CELLS];
+    int32_t en_head[MAX_GRID_CELLS];
+    int32_t en_tail[MAX_GRID_CELLS];
+    int32_t fr_occ_cells[SIM_MAX_FLEETS];
+    int32_t en_occ_cells[SIM_MAX_FLEETS];
+    int32_t n_fr_occ = 0;
+    int32_t n_en_occ = 0;
+    int32_t fl_next[SIM_MAX_FLEETS];
+    double fl_eta[SIM_MAX_FLEETS];
+
+    int32_t redir_cell_tgt[MAX_GRID_CELLS];
+    int32_t redir_cells[SIM_MAX_FLEETS];
+    int32_t n_redir_cells = 0;
+
+    float land_fr[SIM_MAX_PLANETS * MAX_BUCKETS];
+    float land_en[SIM_MAX_PLANETS * MAX_BUCKETS];
+    uint8_t tgt_has_land[SIM_MAX_PLANETS];
+
+    if (out_obs) {
+        for (int32_t c = 0; c < grid_cells; ++c) {
+            fr_head[c] = -1;
+            en_head[c] = -1;
+        }
+        std::memset(tgt_has_land, 0, static_cast<size_t>(np));
+    }
+    if (out_mask && enable_fleet_redirection) {
+        for (int32_t c = 0; c < grid_cells; ++c) {
+            redir_cell_tgt[c] = -2; // sentinel: no friendly fleet in cell
+        }
+    }
+
+    const bool default_3_buckets = (
+        n_buckets == 3
+        && bucket_lowers[0] == 0.0 && bucket_uppers[0] == 1.0
+        && bucket_lowers[1] == 1.0 && bucket_uppers[1] == 2.0
+        && bucket_lowers[2] == 2.0 && std::isinf(bucket_uppers[2])
+    );
+
+    for (int32_t f = 0; f < nf; ++f) {
+        int32_t gx = static_cast<int32_t>(std::floor((st->fl_cx[f] + grid_max_x) / grid_square_size));
+        if (gx < 0) gx = 0;
+        else if (gx > w_m1) gx = w_m1;
+        int32_t gy = static_cast<int32_t>(std::floor((st->fl_cy[f] + grid_max_y) / grid_square_size));
+        if (gy < 0) gy = 0;
+        else if (gy > h_m1) gy = h_m1;
+        const int32_t cell = gy * grid_width + gx;
+        const int32_t tidx = st->fl_target_idx[f];
+        const bool is_fr = (st->fl_owner[f] == cur_player);
+
+        if (out_mask && enable_fleet_redirection && is_fr && tidx >= 0 && tidx < np) {
+            const int32_t tid = st->p_id[tidx];
+            const int32_t prev = redir_cell_tgt[cell];
+            if (prev == -2) {
+                redir_cell_tgt[cell] = tid;
+                redir_cells[n_redir_cells++] = cell;
+            } else if (prev != -1 && prev != tid) {
+                redir_cell_tgt[cell] = -1;
+            }
+        }
+
+        if (out_obs) {
+            double eta = 0.0;
+            if (tidx >= 0 && tidx < np) {
+                const double dist_edge = std::hypot(st->fl_cx[f] - st->p_x[tidx], st->fl_cy[f] - st->p_y[tidx]) - st->p_radius[tidx];
+                if (dist_edge > 0.0) {
+                    eta = dist_edge / speed;
+                }
+            }
+            fl_eta[f] = eta;
+            fl_next[f] = -1;
+
+            if (is_fr) {
+                if (fr_head[cell] < 0) {
+                    fr_head[cell] = f;
+                    fr_tail[cell] = f;
+                    fr_occ_cells[n_fr_occ++] = cell;
+                } else {
+                    fl_next[fr_tail[cell]] = f;
+                    fr_tail[cell] = f;
+                }
+            } else {
+                if (en_head[cell] < 0) {
+                    en_head[cell] = f;
+                    en_tail[cell] = f;
+                    en_occ_cells[n_en_occ++] = cell;
+                } else {
+                    fl_next[en_tail[cell]] = f;
+                    en_tail[cell] = f;
+                }
+            }
+
+            if (tidx >= 0 && tidx < np && n_buckets > 0) {
+                if (!tgt_has_land[tidx]) {
+                    tgt_has_land[tidx] = 1;
+                    const int32_t base = tidx * n_buckets;
+                    for (int32_t b = 0; b < n_buckets; ++b) {
+                        land_fr[base + b] = 0.0f;
+                        land_en[base + b] = 0.0f;
+                    }
+                }
+                int32_t b_idx = n_buckets - 1;
+                if (default_3_buckets) {
+                    b_idx = (eta < 1.0) ? 0 : ((eta < 2.0) ? 1 : 2);
+                } else {
+                    for (int32_t b = 0; b < n_buckets; ++b) {
+                        if (eta >= bucket_lowers[b] && eta < bucket_uppers[b]) {
+                            b_idx = b;
+                            break;
+                        }
+                    }
+                }
+                const int32_t idx_lb = tidx * n_buckets + b_idx;
+                if (is_fr) {
+                    land_fr[idx_lb] += static_cast<float>(st->fl_ships[f]);
+                } else {
+                    land_en[idx_lb] += static_cast<float>(st->fl_ships[f]);
+                }
+            }
+        }
+    }
+
+    if (out_mask && enable_fleet_redirection && n_redir_cells > 0) {
+        const int32_t redir_offset = pair_action_count + 1;
+        for (int32_t ri = 0; ri < n_redir_cells; ++ri) {
+            const int32_t sc = redir_cells[ri];
+            const int32_t only_tgt = redir_cell_tgt[sc];
+            const int32_t row_base = sc * grid_cells + redir_offset;
+            if (only_tgt == -1) {
+                for (int32_t ti = 0; ti < n_tgt; ++ti) {
+                    out_mask[row_base + tgt_cells[ti]] = 1;
+                }
+            } else {
+                for (int32_t ti = 0; ti < n_tgt; ++ti) {
+                    const int32_t tc = tgt_cells[ti];
+                    if (cell_tgt_id[tc] != only_tgt) {
+                        out_mask[row_base + tc] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!out_obs) {
+        return 0;
+    }
+
+    auto encode_side_cells = [&](const int32_t* occ_cells, int32_t n_occ, const int32_t* heads, int32_t base_ch) {
+        int32_t tmp_fl[SIM_MAX_FLEETS];
+        for (int32_t ci = 0; ci < n_occ; ++ci) {
+            const int32_t cell = occ_cells[ci];
+            int32_t cnt = 0;
+            for (int32_t f = heads[cell]; f >= 0; f = fl_next[f]) {
+                tmp_fl[cnt++] = f;
+            }
+            // Stable descending insertion sort by fl_ships (preserves insertion order on ties)
+            for (int32_t a = 1; a < cnt; ++a) {
+                const int32_t key_f = tmp_fl[a];
+                const double key_s = st->fl_ships[key_f];
+                int32_t b = a - 1;
+                while (b >= 0 && st->fl_ships[tmp_fl[b]] < key_s) {
+                    tmp_fl[b + 1] = tmp_fl[b];
+                    --b;
+                }
+                tmp_fl[b + 1] = key_f;
+            }
+            const int32_t n_top = (cnt > fleet_top_k) ? fleet_top_k : cnt;
+            for (int32_t s = 0; s < n_top; ++s) {
+                const int32_t f = tmp_fl[s];
+                const int32_t tidx = st->fl_target_idx[f];
+                const double tx = (tidx >= 0 && tidx < np) ? st->p_x[tidx] : 0.0;
+                const double ty = (tidx >= 0 && tidx < np) ? st->p_y[tidx] : 0.0;
+                const int32_t ch = base_ch + s * 5;
+                out_obs[(ch + 0) * grid_cells + cell] = clamp01_f32((tx + grid_max_x) / span_x);
+                out_obs[(ch + 1) * grid_cells + cell] = clamp01_f32((ty + grid_max_y) / span_y);
+                out_obs[(ch + 2) * grid_cells + cell] = clamp01_f32(st->fl_radius[f] / max_rad);
+                out_obs[(ch + 3) * grid_cells + cell] = clamp01_f32(st->fl_ships[f] / max_expected_ships);
+                out_obs[(ch + 4) * grid_cells + cell] = clamp01_f32(fl_eta[f] / max_expected_eta);
+            }
+            if (cnt > fleet_top_k) {
+                double tot_s = 0.0;
+                for (int32_t s = fleet_top_k; s < cnt; ++s) {
+                    tot_s += st->fl_ships[tmp_fl[s]];
+                }
+                if (tot_s > 0.0) {
+                    double w_tx = 0.0, w_ty = 0.0, w_rad = 0.0, w_eta = 0.0;
+                    for (int32_t s = fleet_top_k; s < cnt; ++s) {
+                        const int32_t f = tmp_fl[s];
+                        const int32_t tidx = st->fl_target_idx[f];
+                        const double tx = (tidx >= 0 && tidx < np) ? st->p_x[tidx] : 0.0;
+                        const double ty = (tidx >= 0 && tidx < np) ? st->p_y[tidx] : 0.0;
+                        const double w = st->fl_ships[f] / tot_s;
+                        w_tx += tx * w;
+                        w_ty += ty * w;
+                        w_rad += st->fl_radius[f] * w;
+                        w_eta += fl_eta[f] * w;
+                    }
+                    const int32_t ch = base_ch + fleet_top_k * 5;
+                    out_obs[(ch + 0) * grid_cells + cell] = clamp01_f32((w_tx + grid_max_x) / span_x);
+                    out_obs[(ch + 1) * grid_cells + cell] = clamp01_f32((w_ty + grid_max_y) / span_y);
+                    out_obs[(ch + 2) * grid_cells + cell] = clamp01_f32(w_rad / max_rad);
+                    out_obs[(ch + 3) * grid_cells + cell] = clamp01_f32(tot_s / max_expected_ships);
+                    out_obs[(ch + 4) * grid_cells + cell] = clamp01_f32(w_eta / max_expected_eta);
+                }
+            }
+        }
+    };
+
+    encode_side_cells(fr_occ_cells, n_fr_occ, fr_head, 8);
+    encode_side_cells(en_occ_cells, n_en_occ, en_head, 8 + fleet_slot_per_side * 5);
+
+    const int32_t land_base_ch = 8 + fleet_ch_cnt;
+    for (int32_t i = 0; i < np; ++i) {
+        if (!tgt_has_land[i]) continue;
+        const int32_t cell = p_gy[i] * grid_width + p_gx[i];
+        const int32_t base = i * n_buckets;
+        for (int32_t b = 0; b < n_buckets; ++b) {
+            const double fr = static_cast<double>(land_fr[base + b]);
+            const double en = static_cast<double>(land_en[base + b]);
+            if (fr == 0.0 && en == 0.0) continue;
+            const int32_t ch = land_base_ch + b * 4;
+            if (fr > 0.0) out_obs[(ch + 0) * grid_cells + cell] = clamp01_f32(fr / max_expected_ships);
+            if (en > 0.0) out_obs[(ch + 1) * grid_cells + cell] = clamp01_f32(en / max_expected_ships);
+            const double diff = fr - en;
+            if (diff > 0.0) {
+                out_obs[(ch + 2) * grid_cells + cell] = clamp01_f32(diff / max_expected_ships);
+            } else if (diff < 0.0) {
+                out_obs[(ch + 3) * grid_cells + cell] = clamp01_f32((-diff) / max_expected_ships);
+            }
+        }
+    }
+
+    return 0;
 }
 
 } // extern "C"

@@ -257,6 +257,38 @@ def _load_or_build_lib() -> Optional[ctypes.CDLL]:
         lib.sim_eval_heuristic.argtypes = [_C_VP, _C_I32, _C_I32]
         lib.sim_eval_heuristic.restype = _C_F64
 
+        lib.sim_update_planets.argtypes = [
+            _C_VP, _C_I32, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP,
+            _C_F64, _C_F64, _C_I32, _C_I32,
+        ]
+        lib.sim_update_planets.restype = _C_I32
+
+        lib.sim_spawn_fleet_exact.argtypes = [
+            _C_VP, _C_I32, _C_I32, _C_I32, _C_F64, _C_I32,
+            _C_VP, _C_VP, _C_VP, _C_VP,
+        ]
+        lib.sim_spawn_fleet_exact.restype = _C_I32
+
+        lib.sim_set_fleet_target_by_id.argtypes = [_C_VP, _C_I32, _C_I32]
+        lib.sim_set_fleet_target_by_id.restype = _C_I32
+
+        lib.sim_step_physics_and_read.argtypes = [
+            _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP, _C_VP,
+        ]
+        lib.sim_step_physics_and_read.restype = _C_I32
+
+        lib.sim_read_fleet_units_by_id.argtypes = [
+            _C_VP, _C_I32, _C_VP, _C_VP, _C_VP, _C_VP, _C_I32,
+        ]
+        lib.sim_read_fleet_units_by_id.restype = _C_I32
+
+        lib.sim_encode_obs_and_mask.argtypes = [
+            _C_VP, _C_I32, _C_I32, _C_I32, _C_F64, _C_F64, _C_F64, _C_I32,
+            _C_F64, _C_F64, _C_F64, _C_F64, _C_F64, _C_F64, _C_I32, _C_I32,
+            _C_VP, _C_VP, _C_VP, _C_VP,
+        ]
+        lib.sim_encode_obs_and_mask.restype = _C_I32
+
         return lib
     except Exception:
         return None
@@ -283,6 +315,14 @@ class _PhysicsScratch:
         self.cfg_i32 = (ctypes.c_int32 * 4)()
         self.ptr_cfg_f64 = ctypes.addressof(self.cfg_f64)
         self.ptr_cfg_i32 = ctypes.addressof(self.cfg_i32)
+        self.spawn_cx = ctypes.c_double(0.0)
+        self.spawn_cy = ctypes.c_double(0.0)
+        self.spawn_rad = ctypes.c_double(0.0)
+        self.spawn_nu = ctypes.c_int32(0)
+        self.ptr_spawn_cx = ctypes.addressof(self.spawn_cx)
+        self.ptr_spawn_cy = ctypes.addressof(self.spawn_cy)
+        self.ptr_spawn_rad = ctypes.addressof(self.spawn_rad)
+        self.ptr_spawn_nu = ctypes.addressof(self.spawn_nu)
 
     def _alloc_planets(self, cap: int) -> None:
         self.p_cap = cap
@@ -1170,8 +1210,434 @@ class FastGalconCppSim:
         return int(self._read_meta()[5])
 
 
+class EnvCppSimHandle:
+    """Persistent C++17 POD ``SimState*`` backing ``GalconEnv`` with zero per-tick unit marshalling.
+
+    Keeps physical ship unit arrays resident in C++ across ticks while exposing scalar planet/fleet
+    updates in one C ABI call and lazy per-fleet unit reads on demand (e.g. ``render()`` or tests).
+    """
+
+    __slots__ = ("_handle", "_lib")
+
+    def __init__(self, handle: int) -> None:
+        if not HAS_FAST_SIM_CPP or _LIB is None or not handle:
+            raise RuntimeError("EnvCppSimHandle requires compiled C++ sim_core library and valid handle")
+        self._handle: Optional[int] = int(handle)
+        self._lib: ctypes.CDLL = _LIB
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is not None:
+            self._handle = None
+            lib = self._lib
+            if lib is not None:
+                lib.sim_destroy(handle)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def clone(self) -> Optional["EnvCppSimHandle"]:
+        handle = self._handle
+        if handle is None or self._lib is None:
+            return None
+        new_handle = self._lib.sim_clone(handle)
+        if not new_handle:
+            return None
+        return EnvCppSimHandle(new_handle)
+
+    @classmethod
+    def create(
+        cls,
+        planets_sorted: Sequence[object],
+        *,
+        width: float,
+        height: float,
+        fleet_speed: float,
+        tick_dt: float,
+        physics_substeps: int,
+        allow_redirect: bool,
+    ) -> Optional["EnvCppSimHandle"]:
+        if not HAS_FAST_SIM_CPP or _LIB is None:
+            return None
+        n_planets = len(planets_sorted)
+        if n_planets <= 0 or n_planets > _SIM_MAX_PLANETS:
+            return None
+        sc = _get_scratch()
+        sc.ensure_planets(n_planets)
+        p_id = sc.p_id
+        p_owner = sc.p_owner
+        p_ships = sc.p_ships
+        p_x = sc.p_x
+        p_y = sc.p_y
+        p_prod = sc.p_prod
+        p_radius = sc.p_radius
+        for i, p in enumerate(planets_sorted):
+            p_id[i] = p.id
+            p_owner[i] = p.owner
+            p_ships[i] = p.ships
+            p_x[i] = p.x
+            p_y[i] = p.y
+            p_prod[i] = p.production
+            p_radius[i] = p.radius
+        handle = _LIB.sim_create(
+            n_planets,
+            sc.ptr_p_id,
+            sc.ptr_p_owner,
+            sc.ptr_p_ships,
+            sc.ptr_p_x,
+            sc.ptr_p_y,
+            sc.ptr_p_prod,
+            sc.ptr_p_radius,
+            float(width),
+            float(height),
+            float(fleet_speed),
+            float(tick_dt),
+            1_000_000_000,
+            max(1, int(physics_substeps)),
+            _SHIP_RADIUS,
+            _SHIP_SEP_STIFFNESS,
+            _SHIP_SEP_MAX_DISP,
+            _SEP_MODE_PER_SHIP_CAP,
+            1 if allow_redirect else 0,
+            _ANTIPODE_ESCAPE_TANGENT,
+            _SHIP_TURN_RATE,
+            _SHIP_TURN_MIN_SPEED_FACTOR,
+        )
+        if not handle:
+            return None
+        return cls(handle)
+
+    def update_planets(
+        self,
+        planets_sorted: Sequence[object],
+        *,
+        fleet_speed: float,
+        tick_dt: float,
+        physics_substeps: int,
+        clear_fleets: bool = False,
+    ) -> bool:
+        handle = self._handle
+        if handle is None:
+            return False
+        n_planets = len(planets_sorted)
+        if n_planets <= 0 or n_planets > _SIM_MAX_PLANETS:
+            return False
+        sc = _get_scratch()
+        sc.ensure_planets(n_planets)
+        p_id = sc.p_id
+        p_owner = sc.p_owner
+        p_ships = sc.p_ships
+        p_x = sc.p_x
+        p_y = sc.p_y
+        p_prod = sc.p_prod
+        p_radius = sc.p_radius
+        for i, p in enumerate(planets_sorted):
+            p_id[i] = p.id
+            p_owner[i] = p.owner
+            p_ships[i] = p.ships
+            p_x[i] = p.x
+            p_y[i] = p.y
+            p_prod[i] = p.production
+            p_radius[i] = p.radius
+        rc = self._lib.sim_update_planets(
+            handle,
+            n_planets,
+            sc.ptr_p_id,
+            sc.ptr_p_owner,
+            sc.ptr_p_ships,
+            sc.ptr_p_x,
+            sc.ptr_p_y,
+            sc.ptr_p_prod,
+            sc.ptr_p_radius,
+            float(fleet_speed),
+            float(tick_dt),
+            max(1, int(physics_substeps)),
+            1 if clear_fleets else 0,
+        )
+        return rc == 0
+
+    def load_fleets(
+        self,
+        fleets: Sequence[object],
+        planet_by_id: Dict[int, object],
+        id_to_idx: Dict[int, int],
+    ) -> bool:
+        handle = self._handle
+        if handle is None:
+            return False
+        n_fleets = len(fleets)
+        if n_fleets > _SIM_MAX_FLEETS:
+            return False
+        if n_fleets == 0:
+            rc = self._lib.sim_load_fleets(
+                handle, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            )
+            return rc == 0
+
+        unit_lists: List[List[List[float]]] = []
+        heading_lists: List[List[List[float]]] = []
+        total_units = 0
+        for fl in fleets:
+            units = fl.units
+            if not units:
+                units = _materialize_fleet_units_local(fl.x, fl.y, fl.num_units)
+            m = len(units)
+            fl.num_units = m
+            headings = fl.unit_headings
+            if headings is None or len(headings) != m:
+                headings = _materialize_unit_headings_local(units, planet_by_id.get(fl.target))
+            unit_lists.append(units)
+            heading_lists.append(headings)
+            total_units += m
+            if total_units > _SIM_MAX_UNITS:
+                return False
+
+        sc = _get_scratch()
+        sc.ensure_fleets(n_fleets)
+        sc.ensure_units(max(1, total_units))
+        fl_id = sc.fl_id
+        fl_owner = sc.fl_owner
+        fl_source = sc.fl_source
+        fl_tgt = sc.fl_tgt
+        fl_ships = sc.fl_ships
+        fl_cx = sc.fl_cx
+        fl_cy = sc.fl_cy
+        fl_rad = sc.fl_rad
+        fl_start = sc.fl_start
+        fl_cnt = sc.fl_cnt
+        ux = sc.ux
+        uy = sc.uy
+        uhx = sc.uhx
+        uhy = sc.uhy
+
+        pos = 0
+        for fi, (fl, units, headings) in enumerate(zip(fleets, unit_lists, heading_lists)):
+            m = len(units)
+            fl_id[fi] = fl.id
+            fl_owner[fi] = fl.owner
+            fl_source[fi] = fl.source
+            fl_tgt[fi] = id_to_idx.get(fl.target, -1)
+            fl_ships[fi] = fl.ships
+            fl_cx[fi] = fl.x
+            fl_cy[fi] = fl.y
+            fl_rad[fi] = fl.radius
+            fl_start[fi] = pos
+            fl_cnt[fi] = m
+            for u, h in zip(units, headings):
+                ux[pos] = u[0]
+                uy[pos] = u[1]
+                uhx[pos] = h[0]
+                uhy[pos] = h[1]
+                pos += 1
+
+        rc = self._lib.sim_load_fleets(
+            handle,
+            n_fleets,
+            sc.ptr_fl_id,
+            sc.ptr_fl_owner,
+            sc.ptr_fl_source,
+            sc.ptr_fl_tgt,
+            sc.ptr_fl_ships,
+            sc.ptr_fl_cx,
+            sc.ptr_fl_cy,
+            sc.ptr_fl_rad,
+            sc.ptr_fl_start,
+            sc.ptr_fl_cnt,
+            total_units,
+            sc.ptr_ux,
+            sc.ptr_uy,
+            sc.ptr_uhx,
+            sc.ptr_uhy,
+        )
+        return rc == 0
+
+    def spawn_fleet_exact(
+        self,
+        owner: int,
+        src_idx: int,
+        dst_idx: int,
+        ships_to_send: float,
+        fleet_id: int,
+    ) -> tuple:
+        handle = self._handle
+        if handle is None:
+            return (-1, 0.0, 0.0, 0.0, 0)
+        sc = _get_scratch()
+        rc = self._lib.sim_spawn_fleet_exact(
+            handle,
+            owner,
+            src_idx,
+            dst_idx,
+            ships_to_send,
+            fleet_id,
+            sc.ptr_spawn_cx,
+            sc.ptr_spawn_cy,
+            sc.ptr_spawn_rad,
+            sc.ptr_spawn_nu,
+        )
+        return (rc, sc.spawn_cx.value, sc.spawn_cy.value, sc.spawn_rad.value, sc.spawn_nu.value)
+
+    def set_fleet_target(self, fleet_id: int, dst_idx: int) -> bool:
+        handle = self._handle
+        if handle is None:
+            return False
+        return bool(self._lib.sim_set_fleet_target_by_id(handle, fleet_id, dst_idx))
+
+    def step_physics_and_read(self, planets_sorted: Sequence[object], fleets: List[object]) -> List[object]:
+        handle = self._handle
+        if handle is None:
+            raise RuntimeError("EnvCppSimHandle handle is closed")
+        n_planets = len(planets_sorted)
+        sc = _get_scratch()
+        sc.ensure_planets(n_planets)
+        n_fleets_before = len(fleets)
+        if n_fleets_before > 0:
+            sc.ensure_fleets(n_fleets_before)
+        n_surviving = self._lib.sim_step_physics_and_read(
+            handle,
+            sc.ptr_p_owner,
+            sc.ptr_p_ships,
+            sc.ptr_fl_id,
+            sc.ptr_fl_cnt,
+            sc.ptr_fl_ships,
+            sc.ptr_fl_cx,
+            sc.ptr_fl_cy,
+            sc.ptr_fl_rad,
+        )
+
+        p_owner = sc.p_owner
+        p_ships = sc.p_ships
+        for i, p in enumerate(planets_sorted):
+            own = p_owner[i]
+            p.owner = own
+            p.ships = p_ships[i]
+            p.neutral = (own == 0)
+
+        if n_surviving <= 0:
+            if n_fleets_before > 0:
+                return []
+            return fleets
+
+        fl_id = sc.fl_id
+        fl_cnt = sc.fl_cnt
+        fl_ships = sc.fl_ships
+        fl_cx = sc.fl_cx
+        fl_cy = sc.fl_cy
+        fl_rad = sc.fl_rad
+
+        if n_surviving == n_fleets_before:
+            for i in range(n_surviving):
+                fl = fleets[i]
+                fl.num_units = fl_cnt[i]
+                fl.ships = fl_ships[i]
+                fl.x = fl_cx[i]
+                fl.y = fl_cy[i]
+                fl.radius = fl_rad[i]
+                fl._units = None
+                fl._unit_headings = None
+            return fleets
+
+        surviving: List[object] = []
+        j = 0
+        for i in range(n_surviving):
+            target_fid = fl_id[i]
+            while fleets[j].id != target_fid:
+                j += 1
+            fl = fleets[j]
+            fl.num_units = fl_cnt[i]
+            fl.ships = fl_ships[i]
+            fl.x = fl_cx[i]
+            fl.y = fl_cy[i]
+            fl.radius = fl_rad[i]
+            fl._units = None
+            fl._unit_headings = None
+            surviving.append(fl)
+            j += 1
+        return surviving
+
+    def read_fleet_units(self, fleet_id: int) -> tuple:
+        handle = self._handle
+        if handle is None:
+            return None, None
+        sc = _get_scratch()
+        sc.ensure_units(_SIM_MAX_UNITS)
+        cnt = self._lib.sim_read_fleet_units_by_id(
+            handle,
+            fleet_id,
+            sc.ptr_ux,
+            sc.ptr_uy,
+            sc.ptr_uhx,
+            sc.ptr_uhy,
+            sc.u_cap,
+        )
+        if cnt < 0:
+            return None, None
+        if cnt == 0:
+            return [], []
+        ux = sc.ux
+        uy = sc.uy
+        uhx = sc.uhx
+        uhy = sc.uhy
+        units = list(map(list, zip(ux[:cnt], uy[:cnt])))
+        headings = list(map(list, zip(uhx[:cnt], uhy[:cnt])))
+        return units, headings
+
+    def encode_obs_and_mask(
+        self,
+        cur_player: int,
+        grid_width: int,
+        grid_height: int,
+        grid_max_x: float,
+        grid_max_y: float,
+        grid_square_size: float,
+        fleet_top_k: int,
+        max_expected_ships: float,
+        max_expected_production: float,
+        max_fleet_radius: float,
+        max_expected_eta: float,
+        send_ratio: float,
+        min_send_ships: float,
+        enable_fleet_redirection: bool,
+        n_buckets: int,
+        ptr_bucket_lowers: int,
+        ptr_bucket_uppers: int,
+        ptr_out_obs: int,
+        ptr_out_mask: int,
+    ) -> bool:
+        handle = self._handle
+        if handle is None:
+            return False
+        rc = self._lib.sim_encode_obs_and_mask(
+            handle,
+            cur_player,
+            grid_width,
+            grid_height,
+            grid_max_x,
+            grid_max_y,
+            grid_square_size,
+            fleet_top_k,
+            max_expected_ships,
+            max_expected_production,
+            max_fleet_radius,
+            max_expected_eta,
+            send_ratio,
+            min_send_ships,
+            1 if enable_fleet_redirection else 0,
+            n_buckets,
+            ptr_bucket_lowers,
+            ptr_bucket_uppers,
+            ptr_out_obs,
+            ptr_out_mask,
+        )
+        return rc == 0
+
+
 __all__ = [
     "COrder",
+    "EnvCppSimHandle",
     "FastGalconCppSim",
     "HAS_FAST_SIM_CPP",
     "step_physics_cpp",

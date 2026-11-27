@@ -1078,3 +1078,229 @@ class TestGalconEnv:
         gifs = list(tmp_path.glob('*.gif'))
         assert len(gifs) == 1 and gifs[0].stat().st_size > 0
 
+    def test_opposing_owner_same_target_fleets_do_not_separate(self) -> None:
+        """Opposing-owner fleets targeting the same planet pass through each other (real G2 rule),
+        while same-owner fleets targeting the same planet still separate; C++ and Python match bit-for-bit.
+        """
+        import math
+        from zoo.board_games.galcon.envs.cpp_sim import FastGalconCppSim, GalconSim, HAS_FAST_SIM_CPP, SendOrder
+        from zoo.board_games.galcon.envs.cpp_sim.sim import Planet as SimPlanet
+
+        def make_planets():
+            return [
+                SimPlanet(id=0, owner=1, ships=200.0, x=100.0, y=160.0, production=100.0, radius=24.0),
+                SimPlanet(id=1, owner=2, ships=200.0, x=100.0, y=162.0, production=100.0, radius=24.0),
+                SimPlanet(id=2, owner=0, ships=500.0, x=350.0, y=160.0, production=50.0, radius=16.941176470588236),
+            ]
+
+        # 1. Solo P1 fleet baseline
+        solo_py = GalconSim(planets=make_planets(), use_cpp=False)
+        solo_py.step({1: [SendOrder(0, 2, 50)]})
+        for _ in range(12):
+            solo_py.step({})
+        solo_units = [list(u) for u in next(f for f in solo_py.fleets.values() if f.source == 0).units]
+
+        # 2. Contested P1 + P2 fleets launched side-by-side toward the same target planet 2
+        for use_cpp in ([False, True] if HAS_FAST_SIM_CPP else [False]):
+            contested = GalconSim(planets=make_planets(), use_cpp=use_cpp)
+            contested.step({1: [SendOrder(0, 2, 50)], 2: [SendOrder(1, 2, 50)]})
+            for _ in range(12):
+                contested.step({})
+            p1_fleet = next(f for f in contested.fleets.values() if f.owner == 1)
+            assert len(p1_fleet.units) == len(solo_units)
+            for u_got, u_exp in zip(p1_fleet.units, solo_units):
+                assert u_got == pytest.approx(u_exp, abs=1e-12), (
+                    f"Opposing-owner fleet perturbed P1 unit position (use_cpp={use_cpp}): {u_got} vs {u_exp}"
+                )
+
+        # 3. Same-owner fleets targeting the same planet MUST still separate, and C++ == Python bit-for-bit
+        def make_same_owner_planets():
+            ps = make_planets()
+            ps[1].owner = 1
+            return ps
+
+        same_py = GalconSim(planets=make_same_owner_planets(), use_cpp=False)
+        same_py.step({1: [SendOrder(0, 2, 50), SendOrder(1, 2, 50)]})
+        for _ in range(12):
+            same_py.step({})
+        same_p1_units = [list(u) for u in next(f for f in same_py.fleets.values() if f.source == 0).units]
+        max_shift = max(
+            math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip(same_p1_units, solo_units)
+        )
+        assert max_shift > 1.0, f"Same-owner overlapping fleets should separate, got max_shift={max_shift}"
+
+        if HAS_FAST_SIM_CPP:
+            same_cpp = GalconSim(planets=make_same_owner_planets(), use_cpp=True)
+            same_cpp.step({1: [SendOrder(0, 2, 50), SendOrder(1, 2, 50)]})
+            for _ in range(12):
+                same_cpp.step({})
+            same_cpp_f0 = next(f for f in same_cpp.fleets.values() if f.source == 0)
+            for u_c, u_p in zip(same_cpp_f0.units, same_p1_units):
+                assert u_c == u_p
+
+            # Also check FastGalconCppSim (POD SimState) matches solo trajectory for opposing owners
+            fast = FastGalconCppSim.from_sim(GalconSim(planets=make_planets(), use_cpp=True))
+            try:
+                fast.step({1: [SendOrder(0, 2, 50)], 2: [SendOrder(1, 2, 50)]})
+                for _ in range(12):
+                    fast.step({})
+                out_sim = fast.to_sim()
+                p1_fast = next(f for f in out_sim.fleets.values() if f.owner == 1)
+                for u_f, u_exp in zip(p1_fast.units, solo_units):
+                    assert u_f == u_exp
+            finally:
+                fast.close()
+
+    def test_persistent_cpp_sim_respects_direct_planet_and_fleet_mutations(self) -> None:
+        """Direct external mutations of env.planets, env.fleets, and fleet.units must never
+        suffer from stale persistent C++ SimState caches across observe(), _advance_one_tick(), and step().
+        """
+        cfg = EasyDict(self.cfg)
+        cfg.update(dict(use_cpp_sim=True, enable_fleet_redirection=True, max_episode_steps=100))
+        env = GalconEnv(cfg)
+        env.reset()
+
+        # Launch a real C++ multi-ship fleet so the persistent C++ handle has active fleets
+        sx, sy = env._world_to_grid(env.planets[0].x, env.planets[0].y)
+        tx, ty = env._world_to_grid(env.planets[1].x, env.planets[1].y)
+        send_act = env.encode_action(sx, sy, tx, ty)
+        env.step(send_act)
+        assert len(env.fleets) == 1
+        fl0 = env.fleets[0]
+        assert fl0.num_units > 1
+
+        # 1. Direct planet mutation (ships, owner, production) must take effect in both observe() and physics
+        # Note: after 1 self-play step, current_player is PLAYER_2, so PLAYER_1 planets are in the enemy channel.
+        env.planets[0].ships = 12.0
+        env.planets[0].production = 0.0
+        env.planets[2].owner = GalconEnv.PLAYER_1
+        env.planets[2].neutral = False
+        env.planets[2].ships = 40.0
+        env.planets[2].production = 50.0
+        obs_mut = env.observe()
+        p2_gx, p2_gy = env._world_to_grid(env.planets[2].x, env.planets[2].y)
+        assert np.isclose(
+            obs_mut['observation'][env.PLANET_ENEMY_SHIPS_CHANNEL, p2_gy, p2_gx],
+            40.0 / env.max_expected_ships,
+        )
+        env._advance_one_tick()
+        assert np.isclose(env.planets[0].ships, 12.0)
+        assert np.isclose(env.planets[2].ships, 40.0 + (50.0 / 50.0) * env.tick_seconds)
+
+        # 2. Direct fleet target & ships mutation must take effect in physics
+        orig_units = fl0.num_units
+        fl0.ships = 77.0
+        fl0.target = env.planets[3].id
+        env._advance_one_tick()
+        assert fl0 in env.fleets
+        assert fl0.target == env.planets[3].id
+        assert np.isclose(fl0.ships, 77.0 * (fl0.num_units / orig_units))
+        remaining_ships = fl0.ships
+
+        # 3. In-place mutation of fleet.units (even with an observe() call in between) must take effect
+        units_ref = fl0.units
+        assert units_ref is not None and len(units_ref) == fl0.num_units
+        p3 = env.planets[3]
+        p3.owner = GalconEnv.PLAYER_1
+        p3.neutral = False
+        p3.production = 0.0
+        p3.ships = 10.0
+        # Move all units onto p3's center so all of them land immediately on the next tick
+        for u in units_ref:
+            u[0] = p3.x
+            u[1] = p3.y
+        _ = env.observe()
+        env._advance_one_tick()
+        assert fl0 not in env.fleets
+        assert np.isclose(p3.ships, 10.0 + remaining_ships)
+
+        # 4. Appending a manually constructed Fleet and replacing env.planets entirely
+        env.planets = [
+            Planet(id=0, owner=GalconEnv.PLAYER_1, ships=20.0, x=-100.0, y=0.0, production=0.0, radius=20.0, neutral=False),
+            Planet(id=1, owner=GalconEnv.PLAYER_2, ships=30.0, x=100.0, y=0.0, production=0.0, radius=20.0, neutral=False),
+        ]
+        env.fleets = [
+            Fleet(
+                id=500,
+                owner=GalconEnv.PLAYER_1,
+                ships=15.0,
+                x=100.0,
+                y=21.0,
+                source=0,
+                target=1,
+                radius=env.DUMMY_FLEET_RADIUS,
+            )
+        ]
+        env._advance_one_tick()
+        assert len(env.fleets) == 0
+        assert np.isclose(env.planets[1].ships, 15.0)
+        assert env.planets[1].owner == GalconEnv.PLAYER_2
+
+        # 5. Clearing env.fleets must remove fleets from C++ as well
+        env.planets[0].ships = 100.0
+        sx0, sy0 = env._world_to_grid(env.planets[0].x, env.planets[0].y)
+        tx1, ty1 = env._world_to_grid(env.planets[1].x, env.planets[1].y)
+        env._current_player = GalconEnv.PLAYER_1
+        env.step(env.encode_action(sx0, sy0, tx1, ty1))
+        assert len(env.fleets) == 1
+        env.fleets.clear()
+        env._advance_one_tick()
+        assert len(env.fleets) == 0
+
+    @pytest.mark.parametrize('enable_redir', [False, True])
+    @pytest.mark.parametrize('use_cpp_sim', [False, True])
+    def test_optimized_obs_mask_physics_and_deepcopy_parity(self, enable_redir: bool, use_cpp_sim: bool) -> None:
+        """Verify exact parity between C++ and Python observation/mask encoding, exact physics parity
+        with GalconSim(use_cpp=False), render() with lazy fleet.units, and copy.deepcopy(env).
+        """
+        import copy
+
+        cfg = EasyDict(self.cfg)
+        cfg.update(dict(
+            num_planets=8,
+            map_seed=7,
+            max_episode_steps=40,
+            enable_fleet_redirection=enable_redir,
+            use_cpp_sim=use_cpp_sim,
+            battle_mode='self_play_mode',
+        ))
+        env = GalconEnv(cfg)
+        env.reset()
+
+        rng = np.random.RandomState(123)
+        for step_idx in range(15):
+            legal = env.legal_actions
+            # Verify action_mask matches legal_actions bit-for-bit
+            obs_dict = env.observe()
+            mask = obs_dict['action_mask']
+            expected_mask = np.zeros(env.total_num_actions, dtype=np.int8)
+            for a in legal:
+                expected_mask[a] = 1
+            assert np.array_equal(mask, expected_mask)
+
+            # Verify C++ observation matches pure-Python encoder to < 1e-6
+            py_obs = np.zeros(env._observation_shape, dtype=np.float32)
+            env._encode_planets(py_obs)
+            env._encode_fleets(py_obs)
+            env._encode_landing_schedule(py_obs)
+            assert np.max(np.abs(obs_dict['observation'] - py_obs)) < 1e-6
+
+            non_pass = [a for a in legal if a != env.pass_action]
+            act = int(non_pass[rng.randint(len(non_pass))]) if non_pass else env.pass_action
+            ts = env.step(act)
+            if ts.done:
+                break
+
+            # Exercise deepcopy + render mid-flight when fleets exist
+            if step_idx == 6 and env.fleets:
+                env_copy = copy.deepcopy(env)
+                ts_orig = env.step(env.pass_action)
+                ts_copy = env_copy.step(env_copy.pass_action)
+                assert np.array_equal(ts_orig.obs['action_mask'], ts_copy.obs['action_mask'])
+                assert np.allclose(ts_orig.obs['observation'], ts_copy.obs['observation'], atol=1e-6)
+                frame = env_copy._render_to_rgb_array()
+                assert frame.ndim == 3 and frame.shape[2] == 4 and frame.size > 0
+                env_copy.close()
+
+        env.close()
+
