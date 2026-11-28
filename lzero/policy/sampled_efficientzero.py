@@ -1433,7 +1433,28 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         """
         self._learn_model.load_state_dict(state_dict['model'])
         self._target_model.load_state_dict(state_dict['target_model'])
+        prev_fused = [bool(g.get('fused', False)) for g in self._optimizer.param_groups]
         self._optimizer.load_state_dict(state_dict['optimizer'])
+        # Keep each param group's ``fused`` flag aligned with the live optimizer rather than the
+        # saved checkpoint (so unfused -> fused CUDA resumes stay fused, and fused CUDA -> CPU
+        # resumes stay unfused with CPU step tensors).
+        if 'fused' in getattr(self._optimizer, 'defaults', {}):
+            for group, was_fused in zip(self._optimizer.param_groups, prev_fused):
+                can_fuse = (
+                    was_fused
+                    and bool(group['params'])
+                    and all(p.is_cuda and p.is_floating_point() for p in group['params'])
+                )
+                group['fused'] = can_fuse
+                target_step_device = group['params'][0].device if can_fuse else torch.device('cpu')
+                for p in group['params']:
+                    st = self._optimizer.state.get(p)
+                    if (
+                        st is not None
+                        and isinstance(st.get('step'), torch.Tensor)
+                        and st['step'].device != target_step_device
+                    ):
+                        st['step'] = st['step'].to(target_step_device)
         if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None and 'lr_scheduler' in state_dict:
             self.lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
 

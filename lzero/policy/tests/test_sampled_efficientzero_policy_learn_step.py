@@ -493,3 +493,88 @@ class TestSampledEfficientZeroPolicyLearn:
         total.backward()
         assert logits.grad is not None
         assert torch.isfinite(logits.grad).all()
+
+    def test_configure_optimizers_nanogpt_fused_selection(self):
+        """configure_optimizers_nanogpt should enable fused AdamW on CUDA models
+        and safely keep fused=False on CPU models (even if device_type='cuda').
+        """
+        from lzero.policy.utils import configure_optimizers_nanogpt
+
+        cpu_model = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 4))
+        opt_cpu = configure_optimizers_nanogpt(
+            model=cpu_model, weight_decay=1e-4, learning_rate=1e-3, betas=(0.9, 0.95), device_type='cpu'
+        )
+        assert all(not g.get('fused', False) for g in opt_cpu.param_groups)
+
+        # CPU params with device_type='cuda' must NOT crash or enable fused=True
+        opt_cpu_guard = configure_optimizers_nanogpt(
+            model=cpu_model, weight_decay=1e-4, learning_rate=1e-3, betas=(0.9, 0.95), device_type='cuda'
+        )
+        assert all(not g.get('fused', False) for g in opt_cpu_guard.param_groups)
+
+        if torch.cuda.is_available():
+            cuda_model = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 4)).cuda()
+            opt_cuda = configure_optimizers_nanogpt(
+                model=cuda_model, weight_decay=1e-4, learning_rate=1e-3, betas=(0.9, 0.95), device_type='cuda'
+            )
+            assert all(g.get('fused', False) is True for g in opt_cuda.param_groups)
+
+    def test_load_state_dict_preserves_optimizer_fused_mode(self):
+        """Resuming across unfused <-> fused AdamW checkpoints must preserve the live
+        optimizer's fused mode and keep optimizer step tensors on the matching device.
+        """
+        import copy
+
+        cfg_cpu = _make_test_policy_and_buffer_cfg(grid_h=2, grid_w=2, channels=4, num_sampled_actions=4)
+        cfg_cpu.optim_type = 'AdamW'
+        policy_cpu = SampledEfficientZeroPolicy(cfg_cpu)
+        policy_cpu._collect_mcts_temperature = 1.0
+
+        buf = SampledEfficientZeroGameBuffer(cfg_cpu)
+        seg = _make_dummy_segment(cfg_cpu, num_steps=8)
+        meta = {
+            'done': True,
+            'priorities': np.ones(8, dtype=np.float32),
+            'unroll_plus_td_steps': cfg_cpu.num_unroll_steps + cfg_cpu.td_steps,
+        }
+        buf.push_game_segments(([seg], [meta]))
+        batch = buf.sample(batch_size=cfg_cpu.batch_size, policy=policy_cpu)
+        policy_cpu._forward_learn(copy.deepcopy(batch))
+        cpu_ckpt = copy.deepcopy(policy_cpu.learn_mode.state_dict())
+
+        # Simulate loading a fused-flagged checkpoint onto a CPU policy
+        fake_fused_ckpt = copy.deepcopy(cpu_ckpt)
+        for g in fake_fused_ckpt['optimizer']['param_groups']:
+            g['fused'] = True
+        policy_cpu.learn_mode.load_state_dict(fake_fused_ckpt)
+        assert all(not g.get('fused', False) for g in policy_cpu._optimizer.param_groups)
+        out_cpu = policy_cpu._forward_learn(copy.deepcopy(batch))
+        assert np.isfinite(float(out_cpu['weighted_total_loss']))
+
+        if torch.cuda.is_available():
+            cfg_cuda = _make_test_policy_and_buffer_cfg(grid_h=2, grid_w=2, channels=4, num_sampled_actions=4)
+            cfg_cuda.optim_type = 'AdamW'
+            cfg_cuda.cuda = True
+            cfg_cuda.device = 'cuda'
+            policy_cuda = SampledEfficientZeroPolicy(cfg_cuda)
+            policy_cuda._collect_mcts_temperature = 1.0
+            assert all(g.get('fused', False) is True for g in policy_cuda._optimizer.param_groups)
+
+            # Loading an unfused checkpoint into a fused CUDA policy must stay fused=True
+            policy_cuda.learn_mode.load_state_dict(copy.deepcopy(cpu_ckpt))
+            assert all(g.get('fused', False) is True for g in policy_cuda._optimizer.param_groups)
+            for st in policy_cuda._optimizer.state.values():
+                if 'step' in st and isinstance(st['step'], torch.Tensor):
+                    assert st['step'].is_cuda
+            out_cuda = policy_cuda._forward_learn(copy.deepcopy(batch))
+            assert np.isfinite(float(out_cuda['weighted_total_loss']))
+
+            # Loading a real fused CUDA checkpoint back into a CPU policy must reset fused=False & step->cpu
+            cuda_ckpt = copy.deepcopy(policy_cuda.learn_mode.state_dict())
+            policy_cpu.learn_mode.load_state_dict(cuda_ckpt)
+            assert all(not g.get('fused', False) for g in policy_cpu._optimizer.param_groups)
+            for st in policy_cpu._optimizer.state.values():
+                if 'step' in st and isinstance(st['step'], torch.Tensor):
+                    assert st['step'].device.type == 'cpu'
+            out_cpu2 = policy_cpu._forward_learn(copy.deepcopy(batch))
+            assert np.isfinite(float(out_cpu2['weighted_total_loss']))
