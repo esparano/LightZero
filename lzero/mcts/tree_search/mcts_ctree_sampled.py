@@ -604,10 +604,10 @@ class SampledEfficientZeroMCTSCtree(object):
                     next_h = next_h.masked_fill(reset_mask, 0.0)
                 c_pool[current_latent_state_index] = next_c
                 h_pool[current_latent_state_index] = next_h
-                is_reset_list = reset_idx.astype(np.int32).tolist()
 
                 # Transfer ONLY the outputs needed by C++ batch_backpropagate (value, value_prefix,
-                # policy_logits), coalesced into a single D2H copy when shapes/dtypes allow.
+                # policy_logits), coalesced into a single D2H copy and passed as zero-copy float32
+                # NumPy views into Cython (avoiding Python list conversion on large action spaces).
                 val_t = self.value_inverse_scalar_transform_handle(network_output.value).detach()
                 vp_t = self.reward_inverse_scalar_transform_handle(network_output.value_prefix).detach()
                 logits_t = network_output.policy_logits.detach()
@@ -617,25 +617,28 @@ class SampledEfficientZeroMCTSCtree(object):
                     and logits_t.shape[0] == batch_size
                     and val_t.numel() == batch_size
                     and vp_t.numel() == batch_size
-                    and val_t.dtype == logits_t.dtype
-                    and vp_t.dtype == logits_t.dtype
+                    and logits_t.dtype == torch.float32
+                    and val_t.dtype == torch.float32
+                    and vp_t.dtype == torch.float32
                 ):
                     packed = torch.cat(
                         (val_t.reshape(batch_size, 1), vp_t.reshape(batch_size, 1), logits_t),
                         dim=1,
                     ).cpu().numpy()
-                    value_pool = packed[:, 0].tolist()
-                    value_prefix_pool = packed[:, 1].tolist()
-                    policy_logits_pool = packed[:, 2:].tolist()
+                    value_pool = packed[:, 0]
+                    value_prefix_pool = packed[:, 1]
+                    policy_logits_pool = packed[:, 2:]
+                    is_reset_payload = reset_idx.astype(np.int32)
                 else:
                     value_pool = val_t.cpu().numpy().reshape(-1).tolist()
                     value_prefix_pool = vp_t.cpu().numpy().reshape(-1).tolist()
                     policy_logits_pool = logits_t.cpu().numpy().tolist()
+                    is_reset_payload = reset_idx.astype(np.int32).tolist()
 
                 # In ``batch_backpropagate()``, we first expand the leaf node using ``the policy_logits`` and
                 # ``reward`` predicted by the model, then perform backpropagation along the search path to update the
                 # statistics.
                 tree_sampled_efficientzero.batch_backpropagate(
                     current_latent_state_index, discount_factor, value_prefix_pool, value_pool, policy_logits_pool,
-                    min_max_stats_lst, results, is_reset_list, virtual_to_play_batch
+                    min_max_stats_lst, results, is_reset_payload, virtual_to_play_batch
                 )

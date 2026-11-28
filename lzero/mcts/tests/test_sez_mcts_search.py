@@ -637,7 +637,11 @@ def test_device_resident_latent_pool_bit_for_bit_parity_galcon_4097_factored(dev
         return orig_rec(lat, rhs, act)
 
     def _spy_backprop(cur_idx, df, vp_pool, val_pool, logits_pool, mms, results, is_reset_list, vtp):
-        new_backprop_payloads.append((list(vp_pool), list(val_pool), [list(r) for r in logits_pool], list(is_reset_list)))
+        vp_list = vp_pool.tolist() if isinstance(vp_pool, np.ndarray) else list(vp_pool)
+        val_list = val_pool.tolist() if isinstance(val_pool, np.ndarray) else list(val_pool)
+        logits_list = logits_pool.tolist() if isinstance(logits_pool, np.ndarray) else [list(r) for r in logits_pool]
+        rst_list = is_reset_list.tolist() if isinstance(is_reset_list, np.ndarray) else list(is_reset_list)
+        new_backprop_payloads.append((vp_list, val_list, logits_list, rst_list))
         return orig_backprop(cur_idx, df, vp_pool, val_pool, logits_pool, mms, results, is_reset_list, vtp)
 
     tree_sampled_efficientzero.batch_traverse = _spy_traverse
@@ -791,7 +795,11 @@ def test_device_resident_latent_pool_bit_for_bit_parity_continuous(device_str):
         return orig_rec(lat, rhs, act)
 
     def _spy_backprop(cur_idx, df, vp_pool, val_pool, logits_pool, mms, results, is_reset_list, vtp):
-        new_backprop_payloads.append((list(vp_pool), list(val_pool), [list(r) for r in logits_pool], list(is_reset_list)))
+        vp_list = vp_pool.tolist() if isinstance(vp_pool, np.ndarray) else list(vp_pool)
+        val_list = val_pool.tolist() if isinstance(val_pool, np.ndarray) else list(val_pool)
+        logits_list = logits_pool.tolist() if isinstance(logits_pool, np.ndarray) else [list(r) for r in logits_pool]
+        rst_list = is_reset_list.tolist() if isinstance(is_reset_list, np.ndarray) else list(is_reset_list)
+        new_backprop_payloads.append((vp_list, val_list, logits_list, rst_list))
         return orig_backprop(cur_idx, df, vp_pool, val_pool, logits_pool, mms, results, is_reset_list, vtp)
 
     tree_sampled_efficientzero.batch_traverse = _spy_traverse
@@ -846,3 +854,102 @@ def test_device_resident_latent_pool_bit_for_bit_parity_continuous(device_str):
             assert got_val == val_np.reshape(-1).tolist()
             assert got_logits == logits_np.tolist()
             assert got_reset == reset_idx.astype(np.int32).tolist()
+
+
+@pytest.mark.unittest
+def test_batch_backpropagate_numpy_strided_matches_list_bit_for_bit():
+    """Verify zero-copy strided float32 NumPy views passed to ezs_tree.batch_backpropagate
+    produce bit-for-bit identical tree state to the legacy Python list path."""
+    from lzero.mcts.ctree.ctree_sampled_efficientzero import ezs_tree
+
+    B = 4
+    A = 1
+    K = 1
+    legal = [[0] for _ in range(B)]
+    root_vp = [0.0] * B
+    root_logits = [[0.0] for _ in range(B)]
+    to_play = [1, 2, 1, 2]
+
+    roots_np = ezs_tree.Roots(B, legal, A, K, False)
+    roots_list = ezs_tree.Roots(B, legal, A, K, False)
+    roots_np.prepare_no_noise(root_vp, root_logits, list(to_play))
+    roots_list.prepare_no_noise(root_vp, root_logits, list(to_play))
+
+    mms_np = ezs_tree.MinMaxStatsList(B)
+    mms_list = ezs_tree.MinMaxStatsList(B)
+    mms_np.set_delta(0.01)
+    mms_list.set_delta(0.01)
+
+    rng = np.random.default_rng(123)
+    for sim in range(8):
+        res_np = ezs_tree.ResultsWrapper(num=B)
+        res_list = ezs_tree.ResultsWrapper(num=B)
+        ix_np, iy_np, act_np, vtp_np = ezs_tree.batch_traverse(
+            roots_np, 19652, 1.25, 0.99, mms_np, res_np, list(to_play), False
+        )
+        ix_l, iy_l, act_l, vtp_l = ezs_tree.batch_traverse(
+            roots_list, 19652, 1.25, 0.99, mms_list, res_list, list(to_play), False
+        )
+        assert (ix_np, iy_np, act_np, vtp_np) == (ix_l, iy_l, act_l, vtp_l)
+
+        # Packed (B, 2 + A) float32 buffer matching mcts_ctree_sampled.py layout
+        packed = rng.standard_normal((B, 2 + A)).astype(np.float32)
+        reset_arr = np.array([1 if (sim + b) % 3 == 0 else 0 for b in range(B)], dtype=np.int32)
+
+        ezs_tree.batch_backpropagate(
+            sim + 1, 0.99, packed[:, 1], packed[:, 0], packed[:, 2:], mms_np, res_np, reset_arr, vtp_np
+        )
+        ezs_tree.batch_backpropagate(
+            sim + 1, 0.99, packed[:, 1].tolist(), packed[:, 0].tolist(), packed[:, 2:].tolist(),
+            mms_list, res_list, reset_arr.tolist(), vtp_l
+        )
+
+    assert roots_np.get_distributions() == roots_list.get_distributions()
+    assert roots_np.get_sampled_actions() == roots_list.get_sampled_actions()
+    assert roots_np.get_values() == roots_list.get_values()
+    assert roots_np.get_children_q_values(0.99) == roots_list.get_children_q_values(0.99)
+
+
+@pytest.mark.unittest
+def test_log_space_topk_efraimidis_spirakis_sampling_on_4097_actions():
+    """Verify the C++ log-space Efraimidis-Spirakis + size-K min-heap sampler on A=4097 actions:
+    - samples exactly K=16 unique actions without replacement
+    - strongly favors high-logit actions (no underflow corruption on 4097 actions)
+    - preserves exact visit counts across multi-depth search."""
+    from lzero.mcts.ctree.ctree_sampled_efficientzero import ezs_tree
+
+    B = 8
+    A = 4097
+    K = 16
+    hot_actions = {0, 17, 512, 2048, 4096}
+    logits = np.full((B, A), -2.0, dtype=np.float32)
+    for a in hot_actions:
+        logits[:, a] = 8.0
+
+    # Unrestricted legal_actions ([-1]) exercises the non-root/unmasked A=4097 fast path
+    roots = ezs_tree.Roots(B, [[-1] for _ in range(B)], A, K, False)
+    roots.prepare_no_noise([0.0] * B, logits.tolist(), [1] * B)
+
+    sampled_batch = roots.get_sampled_actions()
+    assert len(sampled_batch) == B
+    for b in range(B):
+        acts = [int(a[0]) for a in sampled_batch[b]]
+        assert len(acts) == K
+        assert len(set(acts)) == K, f"Expected {K} unique actions without replacement, got {acts}"
+        assert all(0 <= a < A for a in acts)
+        assert hot_actions.issubset(set(acts)), f"High-logit actions {hot_actions} missing from {acts}"
+
+    # Run 25 sims via zero-copy strided NumPy batch_backpropagate and verify visit totals
+    mms = ezs_tree.MinMaxStatsList(B)
+    mms.set_delta(0.01)
+    packed = np.zeros((B, 2 + A), dtype=np.float32)
+    packed[:, 2:] = logits
+    reset_arr = np.zeros(B, dtype=np.int32)
+    for sim in range(25):
+        res = ezs_tree.ResultsWrapper(num=B)
+        _, _, _, vtp = ezs_tree.batch_traverse(roots, 19652, 1.25, 0.99, mms, res, [1] * B, False)
+        ezs_tree.batch_backpropagate(sim + 1, 0.99, packed[:, 1], packed[:, 0], packed[:, 2:], mms, res, reset_arr, vtp)
+
+    dists = roots.get_distributions()
+    for b in range(B):
+        assert sum(dists[b]) == 25, f"Expected 25 total root child visits, got {sum(dists[b])}"

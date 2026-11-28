@@ -89,4 +89,20 @@ cdef extern from "lib/cnode.h" namespace "tree":
     cdef void cbackpropagate(vector[CNode*] &search_path, CMinMaxStats &min_max_stats, int to_play, float value, float discount_factor)
     void cbatch_backpropagate(int current_latent_state_index, float discount_factor, vector[float] value_prefixs, vector[float] values, vector[vector[float]] policies,
                                CMinMaxStatsList *min_max_stats_lst, CSearchResults &results, vector[int] is_reset_list, vector[int] &to_play_batch)
+    void cbatch_backpropagate_strided(
+        int current_latent_state_index,
+        float discount_factor,
+        const float *value_prefixs,
+        int vp_stride,
+        const float *values,
+        int val_stride,
+        const float *policies,
+        int policy_dim,
+        int policy_row_stride,
+        CMinMaxStatsList *min_max_stats_lst,
+        CSearchResults &results,
+        const int *is_reset_list,
+        int reset_stride,
+        const vector[int] &to_play_batch
+    )
     void cbatch_traverse(CRoots *roots, int pb_c_base, float pb_c_init, float discount_factor, CMinMaxStatsList *min_max_stats_lst, CSearchResults &results, vector[int] &virtual_to_play_batch, bool continuous_action_space)

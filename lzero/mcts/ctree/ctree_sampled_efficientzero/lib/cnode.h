@@ -25,13 +25,15 @@ namespace tree
         std::vector<float> value;
         std::vector<size_t> hash;
         int is_root_action;
+        mutable std::size_t cached_combined_hash;
+        mutable bool has_cached_hash;
 
         CAction();
         CAction(std::vector<float> value, int is_root_action);
         ~CAction();
 
-        std::vector<size_t> get_hash(void);
-        std::size_t get_combined_hash(void);
+        std::vector<size_t> get_hash(void) const;
+        std::size_t get_combined_hash(void) const;
     };
 
     class CNode
@@ -56,6 +58,7 @@ namespace tree
         ~CNode();
 
         void expand(int to_play, int current_latent_state_index, int batch_index, float value_prefix, const std::vector<float> &policy_logits);
+        void expand_ptr(int to_play, int current_latent_state_index, int batch_index, float value_prefix, const float *policy_logits, int policy_len);
         void add_exploration_noise(float exploration_fraction, const std::vector<float> &noises);
         float compute_mean_q(int isRoot, float parent_q, float discount_factor);
         void print_out();
@@ -68,7 +71,7 @@ namespace tree
         std::vector<std::vector<float> > get_trajectory();
         std::vector<int> get_children_distribution();
         std::vector<float> get_children_q_values(float discount_factor);
-        CNode *get_child(CAction action);
+        CNode *get_child(const CAction &action);
     };
 
     class CRoots
@@ -118,6 +121,22 @@ namespace tree
     void update_tree_q(CNode *root, tools::CMinMaxStats &min_max_stats, float discount_factor, int players);
     void cbackpropagate(std::vector<CNode *> &search_path, tools::CMinMaxStats &min_max_stats, int to_play, float value, float discount_factor);
     void cbatch_backpropagate(int current_latent_state_index, float discount_factor, const std::vector<float> &value_prefixs, const std::vector<float> &values, const std::vector<std::vector<float> > &policies, tools::CMinMaxStatsList *min_max_stats_lst, CSearchResults &results, std::vector<int> is_reset_list, std::vector<int> &to_play_batch);
+    void cbatch_backpropagate_strided(
+        int current_latent_state_index,
+        float discount_factor,
+        const float *value_prefixs,
+        int vp_stride,
+        const float *values,
+        int val_stride,
+        const float *policies,
+        int policy_dim,
+        int policy_row_stride,
+        tools::CMinMaxStatsList *min_max_stats_lst,
+        CSearchResults &results,
+        const int *is_reset_list,
+        int reset_stride,
+        const std::vector<int> &to_play_batch
+    );
     CAction cselect_child(CNode *root, tools::CMinMaxStats &min_max_stats, int pb_c_base, float pb_c_init, float discount_factor, float mean_q, int players, bool continuous_action_space);
     float cucb_score(CNode *parent, CNode *child, tools::CMinMaxStats &min_max_stats, float parent_mean_q, int is_reset, float total_children_visit_counts, float parent_value_prefix, float pb_c_base, float pb_c_init, float discount_factor, int players, bool continuous_action_space);
     void cbatch_traverse(CRoots *roots, int pb_c_base, float pb_c_init, float discount_factor, tools::CMinMaxStatsList *min_max_stats_lst, CSearchResults &results, std::vector<int> &virtual_to_play_batch, bool continuous_action_space);
