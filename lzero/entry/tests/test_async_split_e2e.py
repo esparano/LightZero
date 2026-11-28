@@ -381,3 +381,291 @@ def test_cli_parser_subcommands():
     launch_args = parser.parse_args(['launch', '--run-dir', '/tmp/r', '--num-actors', '3'])
     assert launch_args.command == 'launch'
     assert launch_args.num_actors == 3
+
+
+@pytest.mark.unittest
+def test_build_worker_env_hides_cuda_only_for_cpu_device():
+    from lzero.entry.async_split.cli import _build_worker_env
+
+    cpu_env = _build_worker_env(
+        num_actors=4,
+        include_evaluator=True,
+        worker_threads=1,
+        base_env={'CUDA_VISIBLE_DEVICES': '0'},
+        device='cpu',
+    )
+    assert cpu_env['CUDA_VISIBLE_DEVICES'] == ''
+    assert cpu_env['OMP_NUM_THREADS'] == '1'
+
+    cpu_env_unset = _build_worker_env(
+        num_actors=4,
+        include_evaluator=True,
+        worker_threads=1,
+        base_env={},
+        device='cpu',
+    )
+    assert cpu_env_unset['CUDA_VISIBLE_DEVICES'] == ''
+
+    for dev in ('cuda', 'auto', None):
+        non_cpu_env = _build_worker_env(
+            num_actors=4,
+            include_evaluator=True,
+            worker_threads=1,
+            base_env={'CUDA_VISIBLE_DEVICES': '0'},
+            device=dev,
+        )
+        assert non_cpu_env['CUDA_VISIBLE_DEVICES'] == '0'
+
+        non_cpu_unset = _build_worker_env(
+            num_actors=4,
+            include_evaluator=True,
+            worker_threads=1,
+            base_env={},
+            device=dev,
+        )
+        assert 'CUDA_VISIBLE_DEVICES' not in non_cpu_unset
+
+
+@pytest.mark.unittest
+def test_spawned_cpu_worker_env_sees_zero_cuda_devices(tmp_path):
+    """Verify pre-spawn CUDA_VISIBLE_DEVICES='' from _build_worker_env(device='cpu')
+    completely hides CUDA (is_available() == False, device_count() == 0, is_initialized() == False)
+    even across SelfPlayActor, AsyncEvaluator, and AsyncLearner(device='cpu').
+    """
+    import subprocess
+    import sys
+    from lzero.entry.async_split.cli import _build_worker_env
+
+    worker_env = _build_worker_env(
+        num_actors=2,
+        include_evaluator=True,
+        worker_threads=1,
+        device='cpu',
+    )
+    script = f"""
+import torch
+assert not torch.cuda.is_available(), 'CUDA should be hidden for CPU worker!'
+assert torch.cuda.device_count() == 0
+from lzero.entry.async_split import AsyncEvaluator, AsyncLearner, SelfPlayActor
+from lzero.entry.tests.test_async_split_e2e import _make_tiny_galcon_async_cfg
+
+run_dir = {str(tmp_path / 'pre_spawn_hide_cuda')!r}
+cfg_pair = _make_tiny_galcon_async_cfg()
+learner = AsyncLearner(
+    input_cfg=cfg_pair,
+    run_dir=run_dir,
+    seed=0,
+    device='cpu',
+    publish_every_n_updates=1,
+    save_ckpt_every_n_updates=0,
+    min_transitions=4,
+    use_bg_reader=False,
+)
+actor = SelfPlayActor(
+    input_cfg=cfg_pair,
+    run_dir=run_dir,
+    actor_id='cpu_actor_0',
+    seed=10,
+    device='cpu',
+    env_manager_type='base',
+)
+evaluator = AsyncEvaluator(
+    input_cfg=cfg_pair,
+    run_dir=run_dir,
+    seed=20,
+    device='cpu',
+    evaluator_env_num=2,
+    n_evaluator_episode=2,
+    env_manager_type='base',
+    min_iter_gap=0,
+    eval_mode='both',
+    elo_games_per_opponent=2,
+    elo_opponents_per_eval=2,
+    elo_anchor_bots='random',
+)
+try:
+    actor.step_once(n_episode=2)
+    learner.ingest_pending_segments()
+    learner.train_step()
+    evaluator.eval_once_if_updated()
+    assert not torch.cuda.is_available()
+    assert not torch.cuda.is_initialized()
+finally:
+    actor.close()
+    evaluator.close()
+    learner.close()
+"""
+    proc = subprocess.run(
+        [sys.executable, '-c', script],
+        env=worker_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f'Subprocess failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}'
+
+
+@pytest.mark.unittest
+def test_run_launch_isolates_cuda_per_worker_device(tmp_path, monkeypatch):
+    import lzero.entry.async_split.cli as cli_mod
+
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    monkeypatch.setattr(cli_mod, 'load_config_from_py', lambda _path: cfg_pair)
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0')
+
+    spawned = []
+
+    class _FakeProc:
+        def __init__(self, cmd, env):
+            self.cmd = cmd
+            self.env = env
+            self._rc = 0 if cmd[3] == 'learner' else None
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            self._rc = 0
+
+        def wait(self, timeout=None):
+            self._rc = 0
+            return 0
+
+        def kill(self):
+            self._rc = -9
+
+    def _fake_popen(cmd, stdout=None, stderr=None, env=None):
+        proc = _FakeProc(cmd, dict(env or {}))
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli_mod.subprocess, 'Popen', _fake_popen)
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            'launch',
+            '--config',
+            'dummy.py',
+            '--run-dir',
+            str(tmp_path / 'run_cpu_actors'),
+            '--num-actors',
+            '2',
+            '--learner-device',
+            'cuda',
+            '--actor-device',
+            'cpu',
+            '--eval-device',
+            'cpu',
+            '--worker-threads',
+            '1',
+        ]
+    )
+    rc = cli_mod._run_launch(args)
+    assert rc == 0
+    assert len(spawned) == 4  # 1 learner + 2 actors + 1 evaluator
+
+    by_role = {}
+    for p in spawned:
+        role = p.cmd[3]
+        by_role.setdefault(role, []).append(p.env.get('CUDA_VISIBLE_DEVICES'))
+
+    assert by_role['learner'] == ['0']
+    assert by_role['actor'] == ['', '']
+    assert by_role['evaluator'] == ['']
+
+    # Verify GPU actors preserve CUDA_VISIBLE_DEVICES while CPU evaluator still hides it
+    spawned.clear()
+    args_gpu_actors = parser.parse_args(
+        [
+            'launch',
+            '--config',
+            'dummy.py',
+            '--run-dir',
+            str(tmp_path / 'run_gpu_actors'),
+            '--num-actors',
+            '1',
+            '--learner-device',
+            'cuda',
+            '--actor-device',
+            'cuda',
+            '--eval-device',
+            'cpu',
+            '--worker-threads',
+            '1',
+        ]
+    )
+    rc = cli_mod._run_launch(args_gpu_actors)
+    assert rc == 0
+    by_role2 = {}
+    for p in spawned:
+        role = p.cmd[3]
+        by_role2.setdefault(role, []).append(p.env.get('CUDA_VISIBLE_DEVICES'))
+    assert by_role2['learner'] == ['0']
+    assert by_role2['actor'] == ['0']
+    assert by_role2['evaluator'] == ['']
+
+
+@pytest.mark.unittest
+def test_cpu_actor_and_evaluator_do_not_initialize_cuda_in_process(tmp_path):
+    """Regression test: CPU SelfPlayActor / AsyncEvaluator must not trigger torch.cuda._lazy_init()
+    (e.g. via EasyTimer defaulting to cuda=True) even when CUDA is visible in the process.
+    """
+    import subprocess
+    import sys
+
+    script = f"""
+import torch
+from lzero.entry.async_split import AsyncEvaluator, AsyncLearner, SelfPlayActor
+from lzero.entry.tests.test_async_split_e2e import _make_tiny_galcon_async_cfg
+
+run_dir = {str(tmp_path / 'no_cuda_init')!r}
+cfg_pair = _make_tiny_galcon_async_cfg()
+learner = AsyncLearner(
+    input_cfg=cfg_pair,
+    run_dir=run_dir,
+    seed=0,
+    device='cpu',
+    publish_every_n_updates=1,
+    save_ckpt_every_n_updates=0,
+    min_transitions=4,
+    use_bg_reader=False,
+)
+actor = SelfPlayActor(
+    input_cfg=cfg_pair,
+    run_dir=run_dir,
+    actor_id='cpu_actor_0',
+    seed=10,
+    device='cpu',
+    env_manager_type='base',
+)
+evaluator = AsyncEvaluator(
+    input_cfg=cfg_pair,
+    run_dir=run_dir,
+    seed=20,
+    device='cpu',
+    evaluator_env_num=2,
+    n_evaluator_episode=2,
+    env_manager_type='base',
+    min_iter_gap=0,
+    eval_mode='both',
+    elo_games_per_opponent=2,
+    elo_opponents_per_eval=2,
+    elo_anchor_bots='random',
+)
+try:
+    actor.step_once(n_episode=2)
+    evaluator.eval_once_if_updated()
+    assert not torch.cuda.is_initialized(), 'CPU actor/evaluator unexpectedly initialized CUDA!'
+finally:
+    actor.close()
+    evaluator.close()
+    learner.close()
+"""
+    proc = subprocess.run(
+        [sys.executable, '-c', script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f'Subprocess failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}'

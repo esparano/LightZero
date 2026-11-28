@@ -114,7 +114,8 @@ class MuZeroEvaluator(ISerialEvaluator):
 
         logging.info(f'rank {self._rank}, self.task_id: {self.task_id}')
         self.reset(policy, env)
-        self._timer = EasyTimer()
+        use_cuda_timer = bool(policy_config.get('cuda', False)) if policy_config is not None else True
+        self._timer = EasyTimer(cuda=use_cuda_timer)
         self._default_n_episode = n_evaluator_episode
         self._stop_value = stop_value
 

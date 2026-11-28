@@ -64,7 +64,8 @@ class MuZeroCollector(ISerialCollector):
         self._exp_name = exp_name
         self._instance_name = instance_name
         self._collect_print_freq = collect_print_freq
-        self._timer = EasyTimer()
+        use_cuda_timer = bool(policy_config.get('cuda', False)) if policy_config is not None else True
+        self._timer = EasyTimer(cuda=use_cuda_timer)
         self._end_flag = False
 
         # Get distributed training info

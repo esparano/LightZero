@@ -63,12 +63,15 @@ def _build_worker_env(
     worker_threads: Optional[int] = None,
     base_env: Optional[Mapping[str, str]] = None,
     cpu_count: Optional[int] = None,
+    device: Optional[str] = None,
 ) -> Dict[str, str]:
-    """Build subprocess env with sensible default OpenMP/BLAS thread caps.
+    """Build subprocess env with sensible default OpenMP/BLAS thread caps and CUDA isolation.
 
     - If ``worker_threads`` is explicitly provided (> 0), it overrides all thread vars.
     - Otherwise, any variable already present in ``base_env`` is preserved, and missing
       ones default to ``_compute_default_worker_threads(...)``.
+    - If ``device == 'cpu'``, sets ``CUDA_VISIBLE_DEVICES=''`` so CPU-only worker processes
+      never lazily initialize a CUDA context or consume GPU VRAM.
     """
     env = dict(os.environ if base_env is None else base_env)
     if worker_threads is not None:
@@ -87,6 +90,8 @@ def _build_worker_env(
         )
         for var in _THREAD_ENV_VARS:
             env.setdefault(var, default_val)
+    if device is not None and str(device).strip().lower() == 'cpu':
+        env['CUDA_VISIBLE_DEVICES'] = ''
     return env
 
 
@@ -483,15 +488,18 @@ def _run_launch(args: argparse.Namespace) -> int:
     base_cmd = [sys.executable, '-m', 'lzero.entry.async_split']
     procs: List[Tuple[str, subprocess.Popen, object]] = []
 
-    def _spawn(name: str, cmd: List[str]) -> subprocess.Popen:
+    def _spawn(name: str, cmd: List[str], device: Optional[str] = None) -> subprocess.Popen:
         log_mode = 'a' if args.resume else 'w'
         log_file = open(proc_log_dir / f'{name}.log', log_mode, encoding='utf-8')
         if args.resume:
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
             log_file.write(f'\n=== [Launcher] Resumed {name} at {ts} ===\n')
             log_file.flush()
+        proc_env = dict(worker_env)
+        if device is not None and str(device).strip().lower() == 'cpu':
+            proc_env['CUDA_VISIBLE_DEVICES'] = ''
         logging.info(f'[Launcher] Starting {name}: {" ".join(cmd)}')
-        proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=worker_env)
+        proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=proc_env)
         procs.append((name, proc, log_file))
         return proc
 
@@ -533,7 +541,7 @@ def _run_launch(args: argparse.Namespace) -> int:
     exit_code = 0
     try:
         prev_weights_sig = _stat_signature(dirs.latest_weights_path)
-        learner_proc = _spawn('learner', learner_cmd)
+        learner_proc = _spawn('learner', learner_cmd, device=args.learner_device)
 
         # When resuming (or overwriting a directory that already has latest_weights.pt),
         # wait for the learner to validate checkpoints, reconcile TensorBoard/evaluator
@@ -573,7 +581,7 @@ def _run_launch(args: argparse.Namespace) -> int:
                 actor_cmd += ['--n-episode', str(args.actor_n_episode)]
             if args.env_manager is not None:
                 actor_cmd += ['--env-manager', args.env_manager]
-            _spawn(f'actor_{i}', actor_cmd)
+            _spawn(f'actor_{i}', actor_cmd, device=args.actor_device)
 
         if not args.no_evaluator:
             eval_cmd = base_cmd + [
@@ -606,7 +614,7 @@ def _run_launch(args: argparse.Namespace) -> int:
                 ]
             if args.env_manager is not None:
                 eval_cmd += ['--env-manager', args.env_manager]
-            _spawn('evaluator', eval_cmd)
+            _spawn('evaluator', eval_cmd, device=args.eval_device)
 
         while not stop_requested:
             rc = learner_proc.poll()
