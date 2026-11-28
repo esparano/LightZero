@@ -321,22 +321,19 @@ def configure_optimizers_nanogpt(
     print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
 
     # Create the AdamW optimizer.
-    # Check if a fused version of AdamW is available in the current PyTorch installation.
+    # Use fused AdamW on CUDA when supported by PyTorch and all managed parameters are CUDA floats.
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-    
-    # Note: The current logic creates a standard AdamW optimizer on CUDA-enabled systems.
-    # The 'fused' version is only considered on non-CUDA systems, where it will ultimately not be used
-    # because `device_type` would not be 'cuda'.
-    if torch.cuda.is_available():
-        # On a CUDA-enabled system, create a standard AdamW optimizer.
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
-    else:
-        # On a non-CUDA system, check if the fused optimizer can be used.
-        # This will be False if device_type is not 'cuda'.
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+    all_params = decay_params + nodecay_params
+    all_cuda_float = bool(all_params) and all(p.is_cuda and p.is_floating_point() for p in all_params)
+    use_fused = (
+        fused_available
+        and torch.cuda.is_available()
+        and str(device_type).startswith('cuda')
+        and all_cuda_float
+    )
+    extra_args = dict(fused=True) if use_fused else dict()
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+    print(f"using fused AdamW: {use_fused}")
 
     return optimizer
 

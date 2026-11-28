@@ -597,3 +597,30 @@ class TestPinnedMemoryPrefetchAndTensorBatch:
         finally:
             actor.close()
             learner.close()
+
+    def test_cli_compile_mode_arg_parsing_and_learner_cfg(self, tmp_path):
+        from lzero.entry.async_split.cli import build_parser
+
+        parser = build_parser()
+        args_default = parser.parse_args(['learner', '--run-dir', str(tmp_path)])
+        assert args_default.compile_mode is None
+
+        args_learner = parser.parse_args(['learner', '--run-dir', str(tmp_path), '--compile-mode', 'reduce-overhead'])
+        assert args_learner.compile_mode == 'reduce-overhead'
+
+        args_launch = parser.parse_args(['launch', '--run-dir', str(tmp_path), '--compile-mode', 'reduce-overhead'])
+        assert args_launch.compile_mode == 'reduce-overhead'
+
+        cfg, create_cfg = _make_tiny_galcon_cfg()
+        learner = AsyncLearner(
+            input_cfg=(cfg, create_cfg),
+            run_dir=tmp_path / 'run_compile_cpu',
+            seed=0,
+            device='cpu',
+            compile_mode='reduce-overhead',
+        )
+        try:
+            assert learner.cfg.policy.compile_mode == 'reduce-overhead'
+            assert learner.policy._compiled_learn_loss_disc is None  # CPU gracefully stays eager
+        finally:
+            learner.close()

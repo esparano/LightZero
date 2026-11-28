@@ -169,6 +169,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help='Max queued prefetched batches (defaults to max(2, prefetch_workers * 2)).',
     )
+    p_learner.add_argument(
+        '--compile-mode',
+        default=None,
+        choices=['default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'],
+        help=(
+            'Optional torch.compile mode for the discrete learn forward+loss step on CUDA '
+            "(e.g. 'reduce-overhead' for Inductor + CUDA Graphs; disabled by default)."
+        ),
+    )
 
     # --- evaluator ---
     p_eval = sub.add_parser('evaluator', help='Run the standalone async evaluator worker.')
@@ -408,6 +417,15 @@ def build_parser() -> argparse.ArgumentParser:
         help='Max queued prefetched batches on learner (defaults to max(2, prefetch_workers * 2)).',
     )
     p_launch.add_argument(
+        '--compile-mode',
+        default=None,
+        choices=['default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'],
+        help=(
+            'Optional torch.compile mode for the learner discrete forward+loss step on CUDA '
+            "(e.g. 'reduce-overhead' for Inductor + CUDA Graphs; disabled by default)."
+        ),
+    )
+    p_launch.add_argument(
         '--worker-threads',
         type=int,
         default=None,
@@ -548,6 +566,8 @@ def _run_launch(args: argparse.Namespace) -> int:
         learner_cmd += ['--prefetch-workers', str(args.prefetch_workers)]
     if args.prefetch_queue_size is not None:
         learner_cmd += ['--prefetch-queue-size', str(args.prefetch_queue_size)]
+    if getattr(args, 'compile_mode', None):
+        learner_cmd += ['--compile-mode', str(args.compile_mode)]
 
     stop_requested = False
 
@@ -745,6 +765,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             use_bg_reader=not args.no_bg_reader,
             prefetch_workers=args.prefetch_workers,
             prefetch_queue_size=args.prefetch_queue_size,
+            compile_mode=args.compile_mode,
         )
         learner.run(
             max_train_iter=args.max_train_iter,
