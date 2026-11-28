@@ -669,3 +669,50 @@ finally:
         check=False,
     )
     assert proc.returncode == 0, f'Subprocess failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}'
+
+
+@pytest.mark.unittest
+def test_galcon_async_split_on_the_fly_symmetry_e2e(tmp_path):
+    """AsyncLearner with symmetric_augment_on_the_fly='auto' wires GalconEnv.reflect_batch,
+    stores 1x raw segments (no 4x deepcopy on ingest), and trains cleanly with finite loss.
+    """
+    run_dir = tmp_path / 'galcon_async_otf_sym'
+    main_cfg, create_cfg = _make_tiny_galcon_async_cfg()
+    main_cfg.policy.symmetric_augment_on_the_fly = 'auto'
+
+    learner = AsyncLearner(
+        input_cfg=(main_cfg, create_cfg),
+        run_dir=run_dir,
+        seed=0,
+        device='cpu',
+        publish_every_n_updates=2,
+        save_ckpt_every_n_updates=0,
+        max_replay_ratio=0.5,
+        min_transitions=4,
+        use_bg_reader=False,
+    )
+    actor = SelfPlayActor(
+        input_cfg=(main_cfg, create_cfg),
+        run_dir=run_dir,
+        actor_id='actor_0',
+        seed=10,
+        device='cpu',
+        env_manager_type='base',
+        weight_sync_interval=1,
+    )
+    try:
+        assert learner.replay_buffer.reflect_batch_fn is not None
+        batch_info = actor.step_once(n_episode=2)
+        ingest_stats = learner.ingest_pending_segments()
+        assert ingest_stats.files_ingested == 1
+        assert learner.replay_buffer.get_num_of_game_segments() == ingest_stats.raw_segments
+        assert ingest_stats.augmented_transitions == ingest_stats.raw_transitions
+
+        for _ in range(2):
+            lv = learner.train_step()
+            assert lv is not None
+            assert np.isfinite(float(lv['total_loss']))
+        assert learner.learner.train_iter == 2
+    finally:
+        actor.close()
+        learner.close()

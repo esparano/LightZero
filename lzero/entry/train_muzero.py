@@ -112,6 +112,8 @@ def train_muzero(
     replay_buffer = GameBuffer(policy_config)
     if hasattr(env_fn, 'reflect_game_segment'):
         replay_buffer.reflect_fn = env_fn.reflect_game_segment
+    if hasattr(env_fn, 'reflect_batch'):
+        replay_buffer.reflect_batch_fn = env_fn.reflect_batch
     collector = Collector(
         env=collector_env,
         policy=policy.collect_mode,

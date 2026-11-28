@@ -150,6 +150,47 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         else:
             batch_target_policies = batch_target_policies_non_re
 
+        if self._use_on_the_fly_symmetric_augment():
+            reflect_batch_fn = self._get_reflect_batch_fn()
+            augment_x = bool(self._cfg.get('symmetric_augment_x', False))
+            augment_y = bool(self._cfg.get('symmetric_augment_y', False))
+            b_size = int(current_batch[0].shape[0])
+            # Sampled batch rows are already randomly ordered, so assigning contiguous orientation
+            # blocks with exact Binomial/Multinomial counts is distributionally identical to
+            # per-row i.i.d. coin flips while enabling contiguous SIMD slice flips in reflect_batch.
+            rx_mask = np.zeros(b_size, dtype=np.bool_)
+            ry_mask = np.zeros(b_size, dtype=np.bool_)
+            if augment_x and augment_y:
+                n_id, n_x, n_y, _ = np.random.multinomial(b_size, [0.25, 0.25, 0.25, 0.25])
+                rx_mask[n_id:n_id + n_x] = True
+                ry_mask[n_id + n_x:n_id + n_x + n_y] = True
+                rx_mask[n_id + n_x + n_y:] = True
+                ry_mask[n_id + n_x + n_y:] = True
+            elif augment_x:
+                n_id = int(np.random.binomial(b_size, 0.5))
+                rx_mask[n_id:] = True
+            elif augment_y:
+                n_id = int(np.random.binomial(b_size, 0.5))
+                ry_mask[n_id:] = True
+            img_ch = self._cfg.model.get('image_channel', None)
+            if img_ch is None:
+                obs_shape = self._cfg.model.get('observation_shape', None)
+                if obs_shape is not None and len(obs_shape) >= 3:
+                    img_ch = int(obs_shape[0])
+            obs_ref, act_ref, sampled_ref = reflect_batch_fn(
+                current_batch[0],
+                current_batch[1],
+                current_batch[2],
+                rx_mask,
+                ry_mask,
+                image_channel=None if img_ch is None else int(img_ch),
+                action_space_size=int(self._cfg.model.action_space_size),
+                inplace=True,
+            )
+            current_batch[0] = obs_ref
+            current_batch[1] = act_ref
+            current_batch[2] = sampled_ref
+
         target_batch = [batch_value_prefixs, batch_target_values, batch_target_policies]
         # a batch contains the current_batch and the target_batch
         train_data = [current_batch, target_batch]

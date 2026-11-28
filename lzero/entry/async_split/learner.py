@@ -570,11 +570,13 @@ class AsyncLearner:
         if self.resume and resumed_envsteps > 0:
             self.learner._collector_envstep = resumed_envsteps
 
-        # Initialize replay buffer with exact env_fn.reflect_game_segment attachment
+        # Initialize replay buffer with exact env_fn symmetry hooks
         buffer_cls = _select_game_buffer_cls(self.create_cfg.policy.type)
         self.replay_buffer = buffer_cls(self.cfg.policy)
         if hasattr(env_fn, 'reflect_game_segment'):
             self.replay_buffer.reflect_fn = env_fn.reflect_game_segment
+        if hasattr(env_fn, 'reflect_batch'):
+            self.replay_buffer.reflect_batch_fn = env_fn.reflect_batch
 
         effective_min = (
             int(min_transitions)

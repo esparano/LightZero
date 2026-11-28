@@ -161,6 +161,7 @@ galcon_sez_config = dict(
         symmetric_augment_y=augment_data_with_symmetry,
         # Use the Galcon obs and action space encoding 
         symmetric_augment_type='Galcon',
+        symmetric_augment_on_the_fly='auto',
     ),
 )
 

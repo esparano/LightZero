@@ -2685,6 +2685,260 @@ class GalconEnv(BaseEnv):
         cfg.battle_mode = 'eval_mode'
         return [cfg for _ in range(evaluator_env_num)]
 
+    _ACTION_REFLECT_PERM_CACHE: Dict[Tuple[int, int, int, bool, bool], np.ndarray] = {}
+
+    @classmethod
+    def _get_action_reflection_perm(
+        cls,
+        grid_h: int,
+        grid_w: int,
+        num_actions: int,
+        reflect_x: bool,
+        reflect_y: bool,
+    ) -> np.ndarray:
+        """Return a cached action-index permutation for reflecting Galcon actions.
+
+        Supports arbitrary grid dimensions ``(grid_h, grid_w)`` and both planet-only
+        (``N + 1``) and planet+redirect (``2N + 1``) action spaces, where
+        ``N = (grid_w * grid_h) ** 2``.
+        """
+        key = (int(grid_h), int(grid_w), int(num_actions), bool(reflect_x), bool(reflect_y))
+        cached = cls._ACTION_REFLECT_PERM_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        grid_cell_count = int(grid_w) * int(grid_h)
+        pair_action_count = grid_cell_count * grid_cell_count
+        if int(num_actions) == pair_action_count + 1:
+            has_redirect_layer = False
+        elif int(num_actions) == 2 * pair_action_count + 1:
+            has_redirect_layer = True
+        else:
+            raise ValueError(
+                f"Unexpected Galcon action_space_size={num_actions} for grid ({grid_h}, {grid_w}): "
+                f"expected {pair_action_count + 1} or {2 * pair_action_count + 1}."
+            )
+
+        if not reflect_x and not reflect_y:
+            perm = np.arange(int(num_actions), dtype=np.int64)
+        else:
+            shifted = np.arange(pair_action_count, dtype=np.int64)
+            source_cell = shifted // grid_cell_count
+            target_cell = shifted % grid_cell_count
+
+            source_y = source_cell // grid_w
+            source_x = source_cell % grid_w
+            target_y = target_cell // grid_w
+            target_x = target_cell % grid_w
+
+            if reflect_x:
+                source_x = grid_w - 1 - source_x
+                target_x = grid_w - 1 - target_x
+            if reflect_y:
+                source_y = grid_h - 1 - source_y
+                target_y = grid_h - 1 - target_y
+
+            new_source_cell = source_y * grid_w + source_x
+            new_target_cell = target_y * grid_w + target_x
+            perm = np.zeros(int(num_actions), dtype=np.int64)
+            base_perm = new_source_cell * grid_cell_count + new_target_cell + 1
+            perm[1:pair_action_count + 1] = base_perm
+            if has_redirect_layer:
+                perm[pair_action_count + 1:] = base_perm + pair_action_count
+
+        perm.setflags(write=False)
+        cls._ACTION_REFLECT_PERM_CACHE[key] = perm
+        return perm
+
+    @classmethod
+    def _reflect_obs_channels_inplace(cls, obs: np.ndarray, reflect_x: bool, reflect_y: bool) -> None:
+        """Invert planet local x/y and fleet target x/y coordinate channels in-place on ``obs`` ``(..., C, H, W)``."""
+        C = int(obs.shape[-3])
+        planet_channels = cls.PLANET_CHANNEL_COUNT
+        landing_channels = len(cls.LANDING_BUCKETS) * cls.LANDING_FEATURE_COUNT_PER_BUCKET
+        fleet_features = cls.FLEET_FEATURE_COUNT
+        fleet_channels = C - planet_channels - landing_channels
+        if fleet_channels < 0 or fleet_channels % (2 * fleet_features) != 0:
+            raise ValueError(
+                f"Unexpected Galcon observation channel count C={C} "
+                f"(planet={planet_channels}, landing={landing_channels}, "
+                f"fleet_features={fleet_features})"
+            )
+        slot_count_per_side = fleet_channels // (2 * fleet_features)
+
+        # Planet channels: local x/y offsets within cell if any planet info exists in channels 2..planet_channels
+        planet_mask = np.sum(obs[..., 2:planet_channels, :, :], axis=-3) > 0
+        if reflect_x:
+            lx = obs[..., cls.PLANET_LOCAL_X_CHANNEL, :, :]
+            np.subtract(1.0, lx, out=lx)
+            lx *= planet_mask
+        if reflect_y:
+            ly = obs[..., cls.PLANET_LOCAL_Y_CHANNEL, :, :]
+            np.subtract(1.0, ly, out=ly)
+            ly *= planet_mask
+
+        # Fleet channels (both friendly and enemy slots): target world x/y normalized in [0, 1]
+        if slot_count_per_side > 0:
+            fleet_end = planet_channels + 2 * slot_count_per_side * fleet_features
+            fleet_view = obs[..., planet_channels:fleet_end, :, :]
+            # Channel offset +3 is ships (> 0 iff a fleet is present in this slot)
+            fleet_mask = fleet_view[..., 3::fleet_features, :, :] > 0
+            if reflect_x:
+                tx = fleet_view[..., 0::fleet_features, :, :]
+                np.subtract(1.0, tx, out=tx)
+                tx *= fleet_mask
+            if reflect_y:
+                ty = fleet_view[..., 1::fleet_features, :, :]
+                np.subtract(1.0, ty, out=ty)
+                ty *= fleet_mask
+
+    @classmethod
+    def _reflect_obs_array(cls, obs: np.ndarray, reflect_x: bool, reflect_y: bool) -> np.ndarray:
+        """Reflect an observation tensor of shape ``(..., C, H, W)`` across X and/or Y.
+
+        Dynamically infers fleet slot count from ``C`` so it remains valid across any
+        observation channel configuration (planet + fleet slots + landing buckets).
+        """
+        if obs.ndim < 3:
+            raise ValueError(f"Expected obs with ndim >= 3 (..., C, H, W), got shape {obs.shape}")
+
+        if not reflect_x and not reflect_y:
+            # Validate channel count even on identity reflection
+            C = int(obs.shape[-3])
+            fleet_channels = C - cls.PLANET_CHANNEL_COUNT - len(cls.LANDING_BUCKETS) * cls.LANDING_FEATURE_COUNT_PER_BUCKET
+            if fleet_channels < 0 or fleet_channels % (2 * cls.FLEET_FEATURE_COUNT) != 0:
+                raise ValueError(f"Unexpected Galcon observation channel count C={C}")
+            return np.array(obs, copy=True)
+
+        # A. Flip spatial grids (copy to ensure contiguous positive-stride array)
+        out = obs
+        if reflect_x:
+            out = np.flip(out, axis=-1)
+        if reflect_y:
+            out = np.flip(out, axis=-2)
+        out = np.ascontiguousarray(out)
+
+        # B. Invert x/y coordinate channels on occupied cells in-place
+        cls._reflect_obs_channels_inplace(out, reflect_x=reflect_x, reflect_y=reflect_y)
+        return out
+
+    @staticmethod
+    def _remap_action_array(perm: np.ndarray, actions: np.ndarray) -> np.ndarray:
+        """Remap discrete action IDs via ``perm``, preserving negative padding sentinels (e.g. -1)."""
+        arr = np.asarray(actions, dtype=np.int64)
+        valid = arr >= 0
+        if np.all(valid):
+            return perm[arr]
+        safe = np.where(valid, arr, 0)
+        return np.where(valid, perm[safe], arr)
+
+    @classmethod
+    def reflect_batch(
+        cls,
+        obs_batch: np.ndarray,
+        action_batch: np.ndarray,
+        sampled_actions_batch: Optional[np.ndarray],
+        reflect_x_mask: np.ndarray,
+        reflect_y_mask: np.ndarray,
+        image_channel: Optional[int] = None,
+        action_space_size: Optional[int] = None,
+        inplace: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        """
+        Overview:
+            Vectorized on-the-fly X/Y symmetry reflection for a sampled training mini-batch.
+            Returns reflected ``(obs_batch, action_batch, sampled_actions_batch)`` arrays.
+            When ``inplace=False`` (default), returns fresh arrays without mutating caller inputs;
+            when ``inplace=True``, mutates freshly allocated caller arrays in-place to avoid
+            extra full-batch copies on the hot sampling path.
+
+            Supports ``obs_batch`` shaped either ``(B, T * C, H, W)`` (stacked frames + unroll
+            steps as produced by ``SampledEfficientZeroGameBuffer``) or ``(B, T, C, H, W)``,
+            with arbitrary channel count ``C`` (dynamically infers fleet slots) and arbitrary
+            grid size ``(H, W)`` / planet-only or redirect action space.
+        """
+        rx = np.asarray(reflect_x_mask, dtype=np.bool_)
+        ry = np.asarray(reflect_y_mask, dtype=np.bool_)
+        obs_in = np.asarray(obs_batch)
+        act_in = np.asarray(action_batch)
+        sa_in = None if sampled_actions_batch is None else np.asarray(sampled_actions_batch)
+
+        B = int(obs_in.shape[0])
+        if rx.shape != (B,) or ry.shape != (B,):
+            raise ValueError(
+                f"reflect_x_mask {rx.shape} and reflect_y_mask {ry.shape} must both have shape ({B},)"
+            )
+
+        if not np.any(rx) and not np.any(ry):
+            if inplace:
+                return obs_in, act_in, sa_in
+            return (
+                np.array(obs_in, copy=True),
+                np.array(act_in, copy=True),
+                None if sa_in is None else np.array(sa_in, copy=True),
+            )
+
+        was_4d = (obs_in.ndim == 4)
+        obs_work = obs_in if (inplace and obs_in.flags.writeable) else np.array(obs_in, copy=True)
+        if was_4d:
+            _, total_c, H, W = obs_work.shape
+            C = int(image_channel) if image_channel is not None else int(total_c)
+            if C <= 0 or total_c % C != 0:
+                raise ValueError(
+                    f"obs_batch channel dim {total_c} is not divisible by image_channel={C}"
+                )
+            T = total_c // C
+            obs_5d = obs_work.reshape(B, T, C, H, W)
+        elif obs_work.ndim == 5:
+            _, T, C, H, W = obs_work.shape
+            obs_5d = obs_work
+        else:
+            raise ValueError(f"Expected 4D or 5D obs_batch, got shape {obs_in.shape}")
+
+        pair_action_count = (int(W) * int(H)) ** 2
+        num_actions = int(action_space_size) if action_space_size is not None else (pair_action_count + 1)
+
+        act_out = act_in if (inplace and act_in.flags.writeable) else np.array(act_in, copy=True)
+        sa_out = None if sa_in is None else (
+            sa_in if (inplace and sa_in.flags.writeable) else np.array(sa_in, copy=True)
+        )
+
+        # Flip + invert coordinate channels per orientation group.
+        # Uses zero-scatter contiguous slice views whenever orientation rows form a contiguous block.
+        for do_x, do_y in ((True, False), (False, True), (True, True)):
+            idx = np.flatnonzero((rx == do_x) & (ry == do_y))
+            if idx.size == 0:
+                continue
+            is_contiguous = (int(idx[-1]) - int(idx[0]) + 1 == int(idx.size))
+            if is_contiguous:
+                sel = slice(int(idx[0]), int(idx[-1]) + 1)
+                view = obs_5d[sel]
+                if do_x and do_y:
+                    view[...] = view[:, :, :, ::-1, ::-1].copy()
+                elif do_x:
+                    view[...] = view[:, :, :, :, ::-1].copy()
+                else:
+                    view[...] = view[:, :, :, ::-1, :].copy()
+                cls._reflect_obs_channels_inplace(view, reflect_x=do_x, reflect_y=do_y)
+            else:
+                sel = idx
+                if do_x and do_y:
+                    sub = obs_5d[idx, :, :, ::-1, ::-1]
+                elif do_x:
+                    sub = obs_5d[idx, :, :, :, ::-1]
+                else:
+                    sub = obs_5d[idx, :, :, ::-1, :]
+                cls._reflect_obs_channels_inplace(sub, reflect_x=do_x, reflect_y=do_y)
+                obs_5d[idx] = sub
+
+            perm = cls._get_action_reflection_perm(H, W, num_actions, reflect_x=do_x, reflect_y=do_y)
+            act_out[sel] = cls._remap_action_array(perm, act_out[sel]).astype(act_out.dtype, copy=False)
+            if sa_out is not None:
+                sa_out[sel] = cls._remap_action_array(perm, sa_out[sel]).astype(sa_out.dtype, copy=False)
+
+        obs_out = obs_5d.reshape(obs_in.shape) if was_4d else obs_5d
+        return obs_out, act_out, sa_out
+
     @classmethod
     def reflect_game_segment(cls, game_segment: Any, reflect_x: bool, reflect_y: bool) -> Any:
         """
@@ -2698,50 +2952,9 @@ class GalconEnv(BaseEnv):
 
         obs_segment = np.asarray(reflected.obs_segment)
         # obs_segment shape: (T, C, H, W)
-        T, C, H, W = obs_segment.shape
+        _, _, H, W = obs_segment.shape
 
-        planet_channels = cls.PLANET_CHANNEL_COUNT
-        landing_channels = len(cls.LANDING_BUCKETS) * cls.LANDING_FEATURE_COUNT_PER_BUCKET
-        fleet_features = cls.FLEET_FEATURE_COUNT
-        fleet_channels = C - planet_channels - landing_channels
-        if fleet_channels < 0 or fleet_channels % (2 * fleet_features) != 0:
-            raise ValueError(
-                f"Unexpected Galcon observation channel count C={C} "
-                f"(planet={planet_channels}, landing={landing_channels}, "
-                f"fleet_features={fleet_features})"
-            )
-        slot_count_per_side = fleet_channels // (2 * fleet_features)
-
-        # A. Flip spatial grids (copy to ensure contiguous positive-stride array)
-        if reflect_x:
-            obs_segment = np.flip(obs_segment, axis=3)
-        if reflect_y:
-            obs_segment = np.flip(obs_segment, axis=2)
-        obs_segment = np.ascontiguousarray(obs_segment)
-
-        # B. Invert x/y coordinate channels on occupied cells
-        # Planet channels: local x/y offsets within cell if any planet info exists in channels 2..7
-        planet_mask = np.sum(obs_segment[:, 2:planet_channels], axis=1) > 0  # (T, H, W)
-        if reflect_x:
-            obs_segment[:, cls.PLANET_LOCAL_X_CHANNEL] = np.where(
-                planet_mask, 1.0 - obs_segment[:, cls.PLANET_LOCAL_X_CHANNEL], 0.0
-            )
-        if reflect_y:
-            obs_segment[:, cls.PLANET_LOCAL_Y_CHANNEL] = np.where(
-                planet_mask, 1.0 - obs_segment[:, cls.PLANET_LOCAL_Y_CHANNEL], 0.0
-            )
-
-        # Fleet channels (both friendly and enemy slots): target world x/y normalized in [0, 1]
-        for slot in range(2 * slot_count_per_side):
-            base_ch = planet_channels + slot * fleet_features
-            # Channel offset +3 is ships (> 0 iff a fleet is present in this slot)
-            fleet_mask = obs_segment[:, base_ch + 3] > 0
-            if reflect_x:
-                obs_segment[:, base_ch + 0] = np.where(fleet_mask, 1.0 - obs_segment[:, base_ch + 0], 0.0)
-            if reflect_y:
-                obs_segment[:, base_ch + 1] = np.where(fleet_mask, 1.0 - obs_segment[:, base_ch + 1], 0.0)
-
-        reflected.obs_segment = obs_segment
+        reflected.obs_segment = cls._reflect_obs_array(obs_segment, reflect_x=reflect_x, reflect_y=reflect_y)
 
         # C. Reflect actions, action masks, and root_sampled_actions
         # Supports both planet-only (N + 1) and planet+redirect (2N + 1) action spaces
@@ -2759,32 +2972,10 @@ class GalconEnv(BaseEnv):
         has_redirect_layer = (mask_len == 2 * pair_action_count + 1)
         num_actions = (2 * pair_action_count + 1) if has_redirect_layer else (pair_action_count + 1)
 
-        shifted = np.arange(pair_action_count, dtype=np.int64)
-        source_cell = shifted // grid_cell_count
-        target_cell = shifted % grid_cell_count
-
-        source_y = source_cell // W
-        source_x = source_cell % W
-        target_y = target_cell // W
-        target_x = target_cell % W
-
-        if reflect_x:
-            source_x = W - 1 - source_x
-            target_x = W - 1 - target_x
-        if reflect_y:
-            source_y = H - 1 - source_y
-            target_y = H - 1 - target_y
-
-        new_source_cell = source_y * W + source_x
-        new_target_cell = target_y * W + target_x
-        perm = np.zeros(num_actions, dtype=np.int64)
-        base_perm = new_source_cell * grid_cell_count + new_target_cell + 1
-        perm[1:pair_action_count + 1] = base_perm
-        if has_redirect_layer:
-            perm[pair_action_count + 1:] = base_perm + pair_action_count
+        perm = cls._get_action_reflection_perm(H, W, num_actions, reflect_x=reflect_x, reflect_y=reflect_y)
 
         if hasattr(reflected, 'action_segment') and reflected.action_segment is not None:
-            reflected.action_segment = perm[np.asarray(reflected.action_segment, dtype=np.int64)]
+            reflected.action_segment = cls._remap_action_array(perm, reflected.action_segment)
 
         if hasattr(reflected, 'action_mask_segment') and reflected.action_mask_segment is not None:
             if isinstance(reflected.action_mask_segment, np.ndarray):
@@ -2794,10 +2985,10 @@ class GalconEnv(BaseEnv):
 
         if hasattr(reflected, 'root_sampled_actions') and reflected.root_sampled_actions is not None:
             if isinstance(reflected.root_sampled_actions, np.ndarray):
-                reflected.root_sampled_actions = perm[reflected.root_sampled_actions.astype(np.int64)]
+                reflected.root_sampled_actions = cls._remap_action_array(perm, reflected.root_sampled_actions)
             else:
                 reflected.root_sampled_actions = [
-                    perm[np.asarray(actions, dtype=np.int64)] for actions in reflected.root_sampled_actions
+                    cls._remap_action_array(perm, actions) for actions in reflected.root_sampled_actions
                 ]
 
         return reflected

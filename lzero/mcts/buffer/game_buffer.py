@@ -44,6 +44,10 @@ class GameBuffer(ABC, object):
         priority_prob_alpha=0.6,
         # (float) Importance sampling exponent beta for prioritized experience replay.
         priority_prob_beta=0.4,
+        # (bool) When True and symmetric_augment_x/y are enabled, store 1x raw segments in
+        # push_game_segments() and apply vectorized random X/Y reflections on the fly inside
+        # sample() via reflect_batch_fn (requires reanalyze_ratio == 0).
+        symmetric_augment_on_the_fly=False,
     )
 
     def __init__(self, cfg: dict):
@@ -79,6 +83,7 @@ class GameBuffer(ABC, object):
         self.base_idx = 0
         self.clear_time = 0
         self.reflect_fn: Optional[Callable] = None
+        self.reflect_batch_fn: Optional[Callable] = None
 
     @abstractmethod
     def sample(
@@ -704,6 +709,63 @@ class GameBuffer(ABC, object):
             f"and is registered in ENV_REGISTRY, or set buffer.reflect_fn directly."
         )
 
+    def _get_reflect_batch_fn(self) -> Optional[Callable]:
+        """Resolve the environment-specific vectorized ``reflect_batch`` callable.
+
+        Uses ``self.reflect_batch_fn`` if explicitly attached (e.g. from ``AsyncLearner``
+        or ``train_muzero``), otherwise looks up ``symmetric_augment_type`` in
+        DI-engine's ``ENV_REGISTRY``.
+        """
+        if self.reflect_batch_fn is not None:
+            return self.reflect_batch_fn
+        env_type = self._cfg.get('symmetric_augment_type', None)
+        if env_type:
+            env_key = env_type if env_type in ENV_REGISTRY else env_type.lower()
+            if env_key in ENV_REGISTRY:
+                env_cls = ENV_REGISTRY.get(env_key)
+                reflect_batch_fn = getattr(env_cls, 'reflect_batch', None)
+                if reflect_batch_fn is not None:
+                    self.reflect_batch_fn = reflect_batch_fn
+                    return reflect_batch_fn
+        raise ValueError(
+            f"On-the-fly symmetric augmentation is enabled, but no reflect_batch() "
+            f"was found for symmetric_augment_type={env_type!r}. "
+            f"Ensure the environment class defines reflect_batch(...) and is registered "
+            f"in ENV_REGISTRY, or set buffer.reflect_batch_fn directly."
+        )
+
+    def _use_on_the_fly_symmetric_augment(self) -> bool:
+        """Return True if random X/Y symmetry reflection should be applied on sampled batches.
+
+        Supports ``symmetric_augment_on_the_fly`` values:
+        - ``False`` (default): pre-reflect segments in ``push_game_segments()`` (legacy 4x storage).
+        - ``True``: store 1x raw segments and reflect sampled mini-batches in ``sample()``
+          (raises ``ValueError`` if ``reanalyze_ratio > 0``).
+        - ``'auto'``: use on-the-fly batch reflection whenever ``reanalyze_ratio == 0``, and
+          fall back to 4x pre-reflection when ``reanalyze_ratio > 0``.
+        """
+        augment_x = bool(self._cfg.get('symmetric_augment_x', False))
+        augment_y = bool(self._cfg.get('symmetric_augment_y', False))
+        if not (augment_x or augment_y):
+            return False
+        mode = self._cfg.get('symmetric_augment_on_the_fly', False)
+        if mode is False or mode is None:
+            return False
+        if mode not in (True, 'auto'):
+            raise ValueError(
+                f"Invalid symmetric_augment_on_the_fly={mode!r}; expected False, True, or 'auto'."
+            )
+        reanalyze_ratio = float(self._cfg.get('reanalyze_ratio', 0.0) or 0.0)
+        if reanalyze_ratio > 0.0:
+            if mode == 'auto':
+                return False
+            raise ValueError(
+                f"symmetric_augment_on_the_fly=True requires reanalyze_ratio == 0.0 "
+                f"(got reanalyze_ratio={reanalyze_ratio}). Disable symmetric_augment_on_the_fly "
+                f"or use 'auto' when using reanalyze so target_model evaluates reflected observations consistently."
+            )
+        return True
+
     def push_game_segments(self, data_and_meta: Any) -> None:
         """
         Overview:
@@ -715,6 +777,14 @@ class GameBuffer(ABC, object):
                 - meta (:obj:`dict`): Meta information, e.g. priority, count, staleness.
         """
         data, meta = data_and_meta
+        if self._use_on_the_fly_symmetric_augment():
+            # Validate reflect_batch hook eagerly so misconfigurations fail fast,
+            # while storing only the 1x raw segment (reflections happen on the fly in sample()).
+            self._get_reflect_batch_fn()
+            for (data_game, meta_game) in zip(data, meta):
+                self._push_game_segment(data_game, meta_game)
+            return
+
         augment_x = self._cfg.get('symmetric_augment_x', False)
         augment_y = self._cfg.get('symmetric_augment_y', False)
         reflect_fn = self._get_reflect_fn() if (augment_x or augment_y) else None
