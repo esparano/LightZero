@@ -603,13 +603,16 @@ class TestPinnedMemoryPrefetchAndTensorBatch:
 
         parser = build_parser()
         args_default = parser.parse_args(['learner', '--run-dir', str(tmp_path)])
-        assert args_default.compile_mode is None
+        assert args_default.compile_mode == 'reduce-overhead'
 
-        args_learner = parser.parse_args(['learner', '--run-dir', str(tmp_path), '--compile-mode', 'reduce-overhead'])
-        assert args_learner.compile_mode == 'reduce-overhead'
+        args_launch_default = parser.parse_args(['launch', '--run-dir', str(tmp_path)])
+        assert args_launch_default.compile_mode == 'reduce-overhead'
 
-        args_launch = parser.parse_args(['launch', '--run-dir', str(tmp_path), '--compile-mode', 'reduce-overhead'])
-        assert args_launch.compile_mode == 'reduce-overhead'
+        args_none = parser.parse_args(['learner', '--run-dir', str(tmp_path), '--compile-mode', 'none'])
+        assert args_none.compile_mode == 'none'
+
+        args_launch_none = parser.parse_args(['launch', '--run-dir', str(tmp_path), '--compile-mode', 'none'])
+        assert args_launch_none.compile_mode == 'none'
 
         cfg, create_cfg = _make_tiny_galcon_cfg()
         learner = AsyncLearner(
@@ -617,10 +620,22 @@ class TestPinnedMemoryPrefetchAndTensorBatch:
             run_dir=tmp_path / 'run_compile_cpu',
             seed=0,
             device='cpu',
-            compile_mode='reduce-overhead',
         )
         try:
             assert learner.cfg.policy.compile_mode == 'reduce-overhead'
             assert learner.policy._compiled_learn_loss_disc is None  # CPU gracefully stays eager
         finally:
             learner.close()
+
+        learner_eager = AsyncLearner(
+            input_cfg=(cfg, create_cfg),
+            run_dir=tmp_path / 'run_compile_none',
+            seed=0,
+            device='cpu',
+            compile_mode='none',
+        )
+        try:
+            assert learner_eager.cfg.policy.compile_mode is None
+            assert learner_eager.policy._compiled_learn_loss_disc is None
+        finally:
+            learner_eager.close()

@@ -397,7 +397,7 @@ class AsyncLearner:
         use_bg_reader: bool = True,
         prefetch_workers: int = 0,
         prefetch_queue_size: Optional[int] = None,
-        compile_mode: Optional[str] = None,
+        compile_mode: Optional[str] = 'reduce-overhead',
     ) -> None:
         self.dirs = AsyncSplitDirs.from_root(run_dir)
         self.resume = bool(resume)
@@ -453,7 +453,9 @@ class AsyncLearner:
             use_cuda = (device == 'cuda' and torch.cuda.is_available())
         cfg.policy.cuda = use_cuda
         cfg.policy.device = 'cuda' if use_cuda else 'cpu'
-        if compile_mode is not None:
+        if compile_mode is None or str(compile_mode).strip().lower() in ('', 'none'):
+            cfg.policy.compile_mode = None
+        else:
             cfg.policy.compile_mode = str(compile_mode)
 
         cfg.exp_name = _ding_exp_name(self.dirs.root_dir)

@@ -341,8 +341,8 @@ Misc
 
 Experiment Backlog / TODOs
 --------------------------
-[ ] [Try Soon] Enable torch.compile with --compile-mode reduce-overhead (Inductor + CUDA Graphs) on async_split learners:
-    - Implemented as an opt-in flag (`--compile-mode reduce-overhead` on `async_split learner` / `launch`, or `policy.compile_mode='reduce-overhead'`; disabled by default).
+[x] Enable torch.compile with --compile-mode reduce-overhead (Inductor + CUDA Graphs) by default on CUDA learners:
+    - Confirmed stable & +57% updates (371,340 vs 236,354 iters over ~10h on identical envsteps) in live main_2 vs main_2_compile A/B; now enabled by default (pass `--compile-mode none` or `compile_mode=None` to run eager).
     - Benchmarks on RTX 5080 (WSL2, real main_1 40k buffer, prefetch_workers=1 + pinned/async H2D + fused AdamW):
       - BN: 8.44 -> 13.94 upd/s (+65%, 118.5 -> 71.8 ms/step), ~27s one-time startup compile, ~0 MiB extra driver VRAM (772 vs 776 MiB).
       - GN (GroupNorm(1, C)): 7.43 -> 11.60 upd/s (+56%, 134.5 -> 86.2 ms/step), ~57s one-time startup compile, +28 MiB driver VRAM (804 vs 776 MiB).

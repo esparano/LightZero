@@ -171,11 +171,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_learner.add_argument(
         '--compile-mode',
-        default=None,
-        choices=['default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'],
+        default='reduce-overhead',
+        choices=['none', 'default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'],
         help=(
-            'Optional torch.compile mode for the discrete learn forward+loss step on CUDA '
-            "(e.g. 'reduce-overhead' for Inductor + CUDA Graphs; disabled by default)."
+            'torch.compile mode for the discrete learn forward+loss step on CUDA '
+            "(default: 'reduce-overhead' for Inductor + CUDA Graphs; pass 'none' to run eager)."
         ),
     )
 
@@ -418,11 +418,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_launch.add_argument(
         '--compile-mode',
-        default=None,
-        choices=['default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'],
+        default='reduce-overhead',
+        choices=['none', 'default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'],
         help=(
-            'Optional torch.compile mode for the learner discrete forward+loss step on CUDA '
-            "(e.g. 'reduce-overhead' for Inductor + CUDA Graphs; disabled by default)."
+            'torch.compile mode for the learner discrete forward+loss step on CUDA '
+            "(default: 'reduce-overhead' for Inductor + CUDA Graphs; pass 'none' to run eager)."
         ),
     )
     p_launch.add_argument(

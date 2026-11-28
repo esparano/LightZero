@@ -221,9 +221,9 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         weight_decay=1e-4,
         momentum=0.9,
         grad_clip_value=10,
-        # (Optional[str]) Optional torch.compile mode for the discrete forward+loss step on CUDA
-        # (e.g. 'reduce-overhead' for Inductor + CUDA Graphs, 'default', or None to disable).
-        compile_mode=None,
+        # (Optional[str]) torch.compile mode for the discrete forward+loss step on CUDA
+        # ('reduce-overhead' by default for Inductor + CUDA Graphs; set None or 'none' to run eager).
+        compile_mode='reduce-overhead',
         # You can use either "n_sample" or "n_episode" in collector.collect.
         # Get "n_episode" episodes per collect.
         n_episode=8,
@@ -416,6 +416,9 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
 
         self._compiled_learn_loss_disc = None
         compile_mode = getattr(self._cfg, 'compile_mode', None)
+        if isinstance(compile_mode, str) and compile_mode.strip().lower() in ('', 'none'):
+            compile_mode = None
+            self._cfg.compile_mode = None
         if compile_mode:
             if (
                 not self._cfg.model.continuous_action_space
@@ -430,7 +433,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                     f'[SampledEfficientZeroPolicy] Enabled torch.compile(mode={compile_mode!r}) '
                     'for discrete learn forward+loss (model state_dict keys unchanged).'
                 )
-            else:
+            elif str(self._cfg.device).startswith('cuda'):
                 logging.warning(
                     f'[SampledEfficientZeroPolicy] Ignoring compile_mode={compile_mode!r} '
                     '(requires discrete action space, CUDA device, and torch.compile).'
