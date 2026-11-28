@@ -21,7 +21,7 @@ import copy
 import time
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -46,6 +46,13 @@ class MatchSummary:
     total_steps: int
     elapsed_sec: float
     map_seeds: List[int]
+    wins_a_as_p1: int = 0
+    draws_a_as_p1: int = 0
+    games_a_as_p1: int = 0
+    wins_a_as_p2: int = 0
+    draws_a_as_p2: int = 0
+    games_a_as_p2: int = 0
+    behavior_a: Dict[str, List[float]] = field(default_factory=dict)
 
     @property
     def total_games(self) -> int:
@@ -396,6 +403,13 @@ class HeadToHeadRunner:
         losses_a = 0
         p1_wins = 0
         p2_wins = 0
+        wins_a_as_p1 = 0
+        draws_a_as_p1 = 0
+        games_a_as_p1 = 0
+        wins_a_as_p2 = 0
+        draws_a_as_p2 = 0
+        games_a_as_p2 = 0
+        behavior_a: Dict[str, List[float]] = {}
         total_steps = 0
         played_map_seeds: List[int] = []
 
@@ -475,17 +489,48 @@ class HeadToHeadRunner:
 
                 if timestep.done:
                     winner_player = _extract_winner_player(timestep, acting_player)
+                    a_seat = slot['a_player_id']
+                    if a_seat == 1:
+                        games_a_as_p1 += 1
+                    else:
+                        games_a_as_p2 += 1
                     if winner_player == -1:
                         draws += 1
+                        if a_seat == 1:
+                            draws_a_as_p1 += 1
+                        else:
+                            draws_a_as_p2 += 1
                     else:
                         if winner_player == 1:
                             p1_wins += 1
                         elif winner_player == 2:
                             p2_wins += 1
-                        if winner_player == slot['a_player_id']:
+                        if winner_player == a_seat:
                             wins_a += 1
+                            if a_seat == 1:
+                                wins_a_as_p1 += 1
+                            else:
+                                wins_a_as_p2 += 1
                         else:
                             losses_a += 1
+
+                    # Collect per-episode behavioral metrics for Player A (candidate) when provided by env.
+                    t_info = timestep.info if isinstance(timestep.info, dict) else {}
+                    gm_by_player = t_info.get('galcon_metrics_by_player')
+                    gm_a = None
+                    if isinstance(gm_by_player, dict) and a_seat in gm_by_player and isinstance(gm_by_player[a_seat], dict):
+                        gm_a = gm_by_player[a_seat]
+                    elif isinstance(t_info.get('galcon_metrics'), dict):
+                        gm_a = t_info['galcon_metrics']
+                    if gm_a is not None:
+                        for mk, mv in gm_a.items():
+                            try:
+                                fv = float(mv)
+                            except (TypeError, ValueError):
+                                continue
+                            if np.isfinite(fv):
+                                behavior_a.setdefault(str(mk), []).append(fv)
+
                     finished_env_ids.append(env_id)
                 else:
                     next_obs = timestep.obs
@@ -512,4 +557,11 @@ class HeadToHeadRunner:
             total_steps=total_steps,
             elapsed_sec=elapsed,
             map_seeds=played_map_seeds,
+            wins_a_as_p1=wins_a_as_p1,
+            draws_a_as_p1=draws_a_as_p1,
+            games_a_as_p1=games_a_as_p1,
+            wins_a_as_p2=wins_a_as_p2,
+            draws_a_as_p2=draws_a_as_p2,
+            games_a_as_p2=games_a_as_p2,
+            behavior_a=behavior_a,
         )

@@ -506,6 +506,7 @@ class MuZeroCollector(ISerialCollector):
         # Buffers for priority calculation.
         search_values_lst = [[] for _ in range(env_nums)]
         pred_values_lst = [[] for _ in range(env_nums)]
+        segment_behavior_metrics: Dict[int, Dict[str, float]] = {}
         if self.policy_config.gumbel_algo:
             improved_policy_lst = [[] for _ in range(env_nums)]
 
@@ -689,6 +690,19 @@ class MuZeroCollector(ISerialCollector):
                     collected_episode += 1
                     reward = info['eval_episode_return']
                     log_info = {'reward': reward, 'time': self._env_info[env_id]['time'], 'step': self._env_info[env_id]['step']}
+                    gm_raw = info.get('galcon_metrics')
+                    gm_clean: Optional[Dict[str, float]] = None
+                    if isinstance(gm_raw, dict):
+                        gm_clean = {}
+                        for bk, bv in gm_raw.items():
+                            try:
+                                fv = float(bv.item()) if torch.is_tensor(bv) else float(bv)
+                            except (TypeError, ValueError):
+                                continue
+                            if np.isfinite(fv):
+                                gm_clean[str(bk)] = fv
+                        if gm_clean:
+                            log_info['galcon_metrics'] = gm_clean
                     if not collect_with_pure_policy:
                         log_info['visit_entropy'] = visit_entropies_lst[env_id] / eps_steps_lst[env_id] if eps_steps_lst[env_id] > 0 else 0
                         if self.policy_config.gumbel_algo:
@@ -707,6 +721,8 @@ class MuZeroCollector(ISerialCollector):
                     game_segments[env_id].game_segment_to_array()
                     if len(game_segments[env_id].reward_segment) > 0:
                         self.game_segment_pool.append((game_segments[env_id], priorities, dones[env_id]))
+                    if gm_clean and len(self.game_segment_pool) > 0:
+                        segment_behavior_metrics[len(self.game_segment_pool) - 1] = gm_clean
 
                     # Reset environment-specific states for a new episode.
                     if n_episode > self._env_num:
@@ -749,13 +765,19 @@ class MuZeroCollector(ISerialCollector):
             if collected_episode >= n_episode:
                 self._finalize_ppo_rollout()
                 # Prepare data for returning.
-                return_data = [
-                    [item[0] for item in self.game_segment_pool],
-                    [{
+                metas_out = []
+                for idx_pool, item in enumerate(self.game_segment_pool):
+                    meta_item: Dict[str, Any] = {
                         'priorities': item[1],
                         'done': item[2],
-                        'unroll_plus_td_steps': self.unroll_plus_td_steps
-                    } for item in self.game_segment_pool]
+                        'unroll_plus_td_steps': self.unroll_plus_td_steps,
+                    }
+                    if idx_pool in segment_behavior_metrics:
+                        meta_item['galcon_metrics'] = segment_behavior_metrics[idx_pool]
+                    metas_out.append(meta_item)
+                return_data = [
+                    [item[0] for item in self.game_segment_pool],
+                    metas_out,
                 ]
                 self.game_segment_pool.clear()
                 break
@@ -817,6 +839,16 @@ class MuZeroCollector(ISerialCollector):
             if self.policy_config.gumbel_algo:
                 completed_value = [d['completed_value'] for d in self._episode_info]
                 info['completed_value_mean'] = np.mean(completed_value)
+
+            behavior_pools: Dict[str, List[float]] = {}
+            for d in self._episode_info:
+                gm = d.get('galcon_metrics')
+                if isinstance(gm, dict):
+                    for bk, bv in gm.items():
+                        behavior_pools.setdefault(bk, []).append(float(bv))
+            for bk, bvals in sorted(behavior_pools.items()):
+                if bvals:
+                    info[f'behavior_{bk}'] = float(np.mean(bvals))
 
             self._episode_info.clear()
             

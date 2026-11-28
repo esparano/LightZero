@@ -595,6 +595,7 @@ class AsyncLearner:
         self._last_saved_ckpt_iter = resumed_iter
         self._recent_weight_lags: List[int] = []
         self._recent_throttled: List[float] = []
+        self._recent_behavior_metrics: Dict[str, List[float]] = {}
         self._last_balance_warn_time = 0.0
         self._bg_reader: Optional[_BackgroundSegmentReader] = None
         self._buffer_rwlock = _RWLock()
@@ -815,6 +816,20 @@ class AsyncLearner:
             self._recent_weight_lags.append(lag)
             if len(self._recent_weight_lags) > 100:
                 self._recent_weight_lags = self._recent_weight_lags[-100:]
+
+            for m in metas:
+                gm = m.get('galcon_metrics') if isinstance(m, dict) else None
+                if isinstance(gm, dict):
+                    for bk, bv in gm.items():
+                        try:
+                            fv = float(bv)
+                        except (TypeError, ValueError):
+                            continue
+                        if fv == fv and abs(fv) != float('inf'):
+                            hist = self._recent_behavior_metrics.setdefault(str(bk), [])
+                            hist.append(fv)
+                            if len(hist) > 100:
+                                del hist[:-100]
 
             stats.raw_segments += len(segments)
             stats.raw_transitions += raw_transitions
@@ -1044,6 +1059,11 @@ class AsyncLearner:
         if self._recent_weight_lags:
             mean_lag = sum(self._recent_weight_lags) / len(self._recent_weight_lags)
             self.tb_logger.add_scalar('async_learner/weight_lag_mean', mean_lag, cur_iter)
+        for bk, bvals in sorted(self._recent_behavior_metrics.items()):
+            if bvals:
+                self.tb_logger.add_scalar(
+                    f'async_learner/behavior_{bk}', sum(bvals) / len(bvals), cur_iter
+                )
         if self._batch_prefetcher is not None:
             self.tb_logger.add_scalar(
                 'async_learner/prefetch_queue_size', self._batch_prefetcher.queue.qsize(), cur_iter

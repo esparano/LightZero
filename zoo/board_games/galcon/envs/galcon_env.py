@@ -469,6 +469,7 @@ class GalconEnv(BaseEnv):
         if hasattr(self.bot, 'reset'):
             self.bot.reset()
 
+        self._init_behavioral_metrics()
         return self.observe()
 
     def _init_map_rng(self, seed: int, dynamic_seed: bool) -> np.random.RandomState:
@@ -692,6 +693,9 @@ class GalconEnv(BaseEnv):
             raise ValueError(f'Unsupported battle_mode: {self.battle_mode}')
 
     def _player_step(self, action: int, flag: str, need_obs: bool = True) -> BaseEnvTimestep:
+        if not hasattr(self, '_bm_early_steps'):
+            self._init_behavioral_metrics()
+        self._record_action_turn_metrics(self._current_player, action)
         if 0 < action < self.total_num_actions:
             self._apply_action(action)
 
@@ -773,8 +777,19 @@ class GalconEnv(BaseEnv):
                 reward = np.array(-reward_mag, dtype=np.float32)
                 eval_return = np.array(-1, dtype=np.float32)
         else:
+            ended_by_timeout = False
             reward = np.array(0, dtype=np.float32)
             eval_return = None
+
+        self._update_tick_behavioral_metrics(
+            p1_prod=p1_prod,
+            p2_prod=p2_prod,
+            p1_p_ships=p1_p_ships,
+            p2_p_ships=p2_p_ships,
+            p1_f_ships=p1_f_ships,
+            p2_f_ships=p2_f_ships,
+            done=done,
+        )
 
         info = {
             'winner': winner if done else -1,
@@ -798,6 +813,11 @@ class GalconEnv(BaseEnv):
             self.render(self.render_mode)
         if done:
             info['eval_episode_return'] = eval_return
+            metrics_by_player, summary_metrics = self._finalize_behavioral_metrics(
+                winner=winner, ended_by_timeout=ended_by_timeout
+            )
+            info['galcon_metrics_by_player'] = metrics_by_player
+            info['galcon_metrics'] = summary_metrics
             if self.render_mode == 'image_savefile_mode':
                 self.save_render_output(replay_name_suffix=self.replay_name_suffix, replay_path=self.replay_path,
                                         format=self.replay_format)
@@ -855,6 +875,8 @@ class GalconEnv(BaseEnv):
             dst_idx = self._cpp_pid_to_idx.get(target_id, -1) if cpp_sim is not None else -1
             f_snap = self._cpp_f_snap
             n_snap = len(f_snap)
+            redirected_ships = 0.0
+            redirected_count = 0
             for idx, fleet in enumerate(self.fleets):
                 if fleet.owner != cur_player:
                     continue
@@ -873,11 +895,21 @@ class GalconEnv(BaseEnv):
                 if gy != source_y:
                     continue
                 fleet.target = target_id
+                redirected_count += 1
+                redirected_ships += float(fleet.ships)
                 if cpp_sim is not None and fleet._cpp_env is self and dst_idx >= 0:
                     if cpp_sim.set_fleet_target(fleet.id, dst_idx):
                         if idx < n_snap and f_snap[idx][0] is fleet:
                             s = f_snap[idx]
                             f_snap[idx] = (s[0], s[1], s[2], s[3], s[4], s[5], target_id, s[7])
+            if redirected_count > 0:
+                self._record_applied_action_metrics(
+                    player=cur_player,
+                    target=target,
+                    source=None,
+                    ships_sent=redirected_ships,
+                    is_redirect=True,
+                )
             return
 
         # action_type == 'send': planet launch only (does not redirect flying fleets in this cell)
@@ -894,6 +926,13 @@ class GalconEnv(BaseEnv):
             return
 
         ships_to_send = self._ships_to_send(source.ships)
+        self._record_applied_action_metrics(
+            player=self._current_player,
+            target=target,
+            source=source,
+            ships_sent=float(ships_to_send),
+            is_redirect=False,
+        )
         if self.use_cpp_sim:
             self._spawn_cpp_fleet(source, target, ships_to_send)
             return
@@ -916,6 +955,364 @@ class GalconEnv(BaseEnv):
             )
         )
         self._next_fleet_id += 1
+
+    def _init_behavioral_metrics(self) -> None:
+        """Initialize lightweight per-episode behavioral counters for both players."""
+        tick_s = max(float(self.tick_seconds), 1e-6)
+        max_sec = max(1, int(self.max_episode_steps)) * tick_s
+        early_t_sec = min(10.0, 0.25 * max_sec)
+        early_payback_t_sec = min(15.0, 0.35 * max_sec)
+        self._bm_early_steps: int = max(1, int(round(early_t_sec / tick_s)))
+        self._bm_early_payback_steps: int = max(self._bm_early_steps, int(round(early_payback_t_sec / tick_s)))
+        self._bm_early_snapshot_taken: bool = False
+
+        p1_home = None
+        p2_home = None
+        p1_prod = 0.0
+        p2_prod = 0.0
+        p1_ships = 0.0
+        p2_ships = 0.0
+        for p in self.planets:
+            if p.owner == self.PLAYER_1:
+                if p1_home is None:
+                    p1_home = p
+                p1_prod += float(p.production)
+                p1_ships += float(p.ships)
+            elif p.owner == self.PLAYER_2:
+                if p2_home is None:
+                    p2_home = p
+                p2_prod += float(p.production)
+                p2_ships += float(p.ships)
+
+        self._bm_home_id: Dict[int, Optional[int]] = {
+            self.PLAYER_1: p1_home.id if p1_home is not None else None,
+            self.PLAYER_2: p2_home.id if p2_home is not None else None,
+        }
+        self._bm_home_pos: Dict[int, Optional[Tuple[float, float]]] = {
+            self.PLAYER_1: (float(p1_home.x), float(p1_home.y)) if p1_home is not None else None,
+            self.PLAYER_2: (float(p2_home.x), float(p2_home.y)) if p2_home is not None else None,
+        }
+
+        # Initial neutral planet metadata: pid -> (init_prod, init_payback_sec, own_half_owner)
+        self._bm_neutral_meta: Dict[int, Tuple[float, float, int]] = {}
+        self._bm_first_capturer: Dict[int, int] = {}
+        self._bm_first_capture_step: Dict[int, int] = {}
+        h1_pos = self._bm_home_pos[self.PLAYER_1]
+        h2_pos = self._bm_home_pos[self.PLAYER_2]
+        for p in self.planets:
+            if p.owner == self.PLAYER_NEUTRAL:
+                prod = float(p.production)
+                rate = float(self._production_to_ships_per_second(prod))
+                payback = (float(p.ships) / rate) if rate > 0.0 else float('inf')
+                half_owner = 0
+                if h1_pos is not None and h2_pos is not None:
+                    d1 = (p.x - h1_pos[0]) ** 2 + (p.y - h1_pos[1]) ** 2
+                    d2 = (p.x - h2_pos[0]) ** 2 + (p.y - h2_pos[1]) ** 2
+                    if d1 < d2 - 1e-6:
+                        half_owner = self.PLAYER_1
+                    elif d2 < d1 - 1e-6:
+                        half_owner = self.PLAYER_2
+                self._bm_neutral_meta[p.id] = (prod, payback, half_owner)
+                self._bm_first_capturer[p.id] = 0
+                self._bm_first_capture_step[p.id] = -1
+
+        self._bm_early_cheap_left: Dict[int, float] = {self.PLAYER_1: 0.0, self.PLAYER_2: 0.0}
+        self._bm_early_home_rush_ships: Dict[int, float] = {self.PLAYER_1: 0.0, self.PLAYER_2: 0.0}
+        self._bm_pass_history: Dict[int, List[int]] = {self.PLAYER_1: [], self.PLAYER_2: []}
+        self._bm_ahead_turns: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+        self._bm_ahead_pass_turns: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+
+        self._bm_non_pass: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+        self._bm_target_neutral: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+        self._bm_target_enemy: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+        self._bm_target_reinforce: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+        self._bm_target_defend: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+        self._bm_target_forward_relay: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+        self._bm_redirects: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+        self._bm_planet_sends: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+        self._bm_send_frac_sum: Dict[int, float] = {self.PLAYER_1: 0.0, self.PLAYER_2: 0.0}
+
+        self._bm_rear_share_sum: Dict[int, float] = {self.PLAYER_1: 0.0, self.PLAYER_2: 0.0}
+        self._bm_rear_share_ticks: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+        self._bm_flight_share_sum: Dict[int, float] = {self.PLAYER_1: 0.0, self.PLAYER_2: 0.0}
+        self._bm_flight_share_ticks: Dict[int, int] = {self.PLAYER_1: 0, self.PLAYER_2: 0}
+        self._bm_p1_prod_share_hist: List[float] = []
+
+        self._bm_prev_prod: Dict[int, float] = {self.PLAYER_1: p1_prod, self.PLAYER_2: p2_prod}
+        self._bm_prev_ships: Dict[int, float] = {self.PLAYER_1: p1_ships, self.PLAYER_2: p2_ships}
+
+    def _record_action_turn_metrics(self, player: int, action: int) -> None:
+        if player not in (self.PLAYER_1, self.PLAYER_2):
+            return
+        is_pass = 1 if int(action) == 0 else 0
+        self._bm_pass_history[player].append(is_pass)
+
+        opp = self.PLAYER_2 if player == self.PLAYER_1 else self.PLAYER_1
+        my_prod = self._bm_prev_prod[player]
+        tot_prod = my_prod + self._bm_prev_prod[opp]
+        my_ships = self._bm_prev_ships[player]
+        tot_ships = my_ships + self._bm_prev_ships[opp]
+        is_ahead = (
+            (tot_prod > 0.0 and (my_prod / tot_prod) >= 0.60)
+            or (tot_ships > 0.0 and (my_ships / tot_ships) >= 0.60)
+        )
+        if is_ahead:
+            self._bm_ahead_turns[player] += 1
+            if is_pass:
+                self._bm_ahead_pass_turns[player] += 1
+
+    def _record_applied_action_metrics(
+        self,
+        player: int,
+        target: Planet,
+        source: Optional[Planet],
+        ships_sent: float,
+        is_redirect: bool,
+    ) -> None:
+        if not hasattr(self, '_bm_non_pass') or player not in (self.PLAYER_1, self.PLAYER_2):
+            return
+        opp = self.PLAYER_2 if player == self.PLAYER_1 else self.PLAYER_1
+        self._bm_non_pass[player] += 1
+        if is_redirect:
+            self._bm_redirects[player] += 1
+
+        if target.owner == self.PLAYER_NEUTRAL:
+            self._bm_target_neutral[player] += 1
+        elif target.owner == opp:
+            self._bm_target_enemy[player] += 1
+        elif target.owner == player:
+            self._bm_target_reinforce[player] += 1
+            # Defend: own target planet has at least one incoming enemy fleet
+            is_under_attack = any(
+                fl.owner == opp and fl.target == target.id for fl in self.fleets
+            )
+            if is_under_attack:
+                self._bm_target_defend[player] += 1
+            elif source is not None:
+                opp_home_pos = self._bm_home_pos.get(opp)
+                if opp_home_pos is not None:
+                    d_src = (source.x - opp_home_pos[0]) ** 2 + (source.y - opp_home_pos[1]) ** 2
+                    d_tgt = (target.x - opp_home_pos[0]) ** 2 + (target.y - opp_home_pos[1]) ** 2
+                    if d_tgt < d_src - 1e-6:
+                        self._bm_target_forward_relay[player] += 1
+
+        if not is_redirect and source is not None:
+            self._bm_planet_sends[player] += 1
+            if source.ships > 1e-6:
+                self._bm_send_frac_sum[player] += min(1.0, max(0.0, float(ships_sent) / float(source.ships)))
+            if (
+                self._step_count < self._bm_early_steps
+                and self._bm_home_id.get(opp) is not None
+                and target.id == self._bm_home_id[opp]
+            ):
+                self._bm_early_home_rush_ships[player] += float(ships_sent)
+
+    def _update_tick_behavioral_metrics(
+        self,
+        p1_prod: float,
+        p2_prod: float,
+        p1_p_ships: float,
+        p2_p_ships: float,
+        p1_f_ships: float,
+        p2_f_ships: float,
+        done: bool,
+    ) -> None:
+        # 1. Track first-capture ownership of initially neutral planets
+        first_cap = self._bm_first_capturer
+        first_step = self._bm_first_capture_step
+        p1_planets = []
+        p2_planets = []
+        for p in self.planets:
+            own = p.owner
+            if own == self.PLAYER_1:
+                p1_planets.append(p)
+                if p.id in first_cap and first_cap[p.id] == 0:
+                    first_cap[p.id] = self.PLAYER_1
+                    first_step[p.id] = self._step_count
+            elif own == self.PLAYER_2:
+                p2_planets.append(p)
+                if p.id in first_cap and first_cap[p.id] == 0:
+                    first_cap[p.id] = self.PLAYER_2
+                    first_step[p.id] = self._step_count
+
+        # 2. Snapshot own-half cheap neutrals (payback <= 20s) still uncaptured at early checkpoint
+        if (not self._bm_early_snapshot_taken) and (self._step_count >= self._bm_early_steps or done):
+            self._bm_early_snapshot_taken = True
+            left_p1 = 0.0
+            left_p2 = 0.0
+            for pid, (prod, payback, half_owner) in self._bm_neutral_meta.items():
+                if first_cap[pid] == 0 and payback <= 20.0:
+                    if half_owner == self.PLAYER_1:
+                        left_p1 += prod
+                    elif half_owner == self.PLAYER_2:
+                        left_p2 += prod
+            self._bm_early_cheap_left[self.PLAYER_1] = left_p1
+            self._bm_early_cheap_left[self.PLAYER_2] = left_p2
+
+        # 3. Ships-in-flight share
+        p1_tot = p1_p_ships + p1_f_ships
+        if p1_tot > 1e-6:
+            self._bm_flight_share_sum[self.PLAYER_1] += p1_f_ships / p1_tot
+            self._bm_flight_share_ticks[self.PLAYER_1] += 1
+        p2_tot = p2_p_ships + p2_f_ships
+        if p2_tot > 1e-6:
+            self._bm_flight_share_sum[self.PLAYER_2] += p2_f_ships / p2_tot
+            self._bm_flight_share_ticks[self.PLAYER_2] += 1
+
+        # 4. Rear-planet ship share (landed ships on planets strictly farther from nearest enemy than median)
+        if p1_planets and p2_planets:
+            if len(p1_planets) >= 2 and p1_p_ships > 1e-6:
+                dists = [
+                    min((u.x - v.x) ** 2 + (u.y - v.y) ** 2 for v in p2_planets)
+                    for u in p1_planets
+                ]
+                s_dists = sorted(dists)
+                n = len(s_dists)
+                med = 0.5 * (s_dists[n // 2 - 1] + s_dists[n // 2]) if n % 2 == 0 else s_dists[n // 2]
+                rear_ships = sum(u.ships for u, d in zip(p1_planets, dists) if d > med + 1e-6)
+                self._bm_rear_share_sum[self.PLAYER_1] += rear_ships / p1_p_ships
+                self._bm_rear_share_ticks[self.PLAYER_1] += 1
+            if len(p2_planets) >= 2 and p2_p_ships > 1e-6:
+                dists = [
+                    min((u.x - v.x) ** 2 + (u.y - v.y) ** 2 for v in p1_planets)
+                    for u in p2_planets
+                ]
+                s_dists = sorted(dists)
+                n = len(s_dists)
+                med = 0.5 * (s_dists[n // 2 - 1] + s_dists[n // 2]) if n % 2 == 0 else s_dists[n // 2]
+                rear_ships = sum(u.ships for u, d in zip(p2_planets, dists) if d > med + 1e-6)
+                self._bm_rear_share_sum[self.PLAYER_2] += rear_ships / p2_p_ships
+                self._bm_rear_share_ticks[self.PLAYER_2] += 1
+
+        # 5. Production share history & cached state for next turn's pass_rate_when_ahead check
+        tot_prod = p1_prod + p2_prod
+        self._bm_p1_prod_share_hist.append((p1_prod / tot_prod) if tot_prod > 1e-6 else 0.5)
+        self._bm_prev_prod[self.PLAYER_1] = p1_prod
+        self._bm_prev_prod[self.PLAYER_2] = p2_prod
+        self._bm_prev_ships[self.PLAYER_1] = p1_tot
+        self._bm_prev_ships[self.PLAYER_2] = p2_tot
+
+    def _finalize_behavioral_metrics(
+        self, winner: int, ended_by_timeout: bool
+    ) -> Tuple[Dict[int, Dict[str, float]], Dict[str, float]]:
+        """Compute clean finite float behavioral metric dicts on episode end."""
+        final_step = max(1, int(self._step_count))
+        half_step = final_step // 2
+        hist = self._bm_p1_prod_share_hist
+        idx_10s = min(len(hist) - 1, max(0, self._bm_early_steps - 1)) if hist else 0
+        idx_half = (len(hist) // 2) if hist else 0
+        p1_share_10s = float(hist[idx_10s]) if hist else 0.5
+        p1_share_half = float(hist[idx_half]) if hist else 0.5
+
+        by_player: Dict[int, Dict[str, float]] = {}
+        for p in (self.PLAYER_1, self.PLAYER_2):
+            opp = self.PLAYER_2 if p == self.PLAYER_1 else self.PLAYER_1
+            m: Dict[str, float] = {}
+
+            # A. Opening & Expansion Economy
+            early_prod = 0.0
+            total_cap_prod = 0.0
+            late_cap_prod = 0.0
+            stolen_prod = 0.0
+            early_paybacks: List[float] = []
+            for pid, (prod, payback, half_owner) in self._bm_neutral_meta.items():
+                cap_by = self._bm_first_capturer[pid]
+                cap_step = self._bm_first_capture_step[pid]
+                if cap_by == p:
+                    total_cap_prod += prod
+                    if cap_step <= self._bm_early_steps:
+                        early_prod += prod
+                    if cap_step <= self._bm_early_payback_steps and math.isfinite(payback):
+                        early_paybacks.append(payback)
+                    if cap_step > half_step:
+                        late_cap_prod += prod
+                elif cap_by == opp and half_owner == p:
+                    stolen_prod += prod
+
+            m['early_neutral_prod_taken'] = float(early_prod)
+            m['early_cheap_neutrals_left'] = float(self._bm_early_cheap_left[p])
+            if early_paybacks:
+                m['mean_capture_payback_sec'] = float(sum(early_paybacks) / len(early_paybacks))
+            m['early_home_rush_ships'] = float(self._bm_early_home_rush_ships[p])
+            m['stolen_own_half_prod'] = float(stolen_prod)
+            if total_cap_prod > 1e-6:
+                m['late_neutral_capture_share'] = float(late_cap_prod / total_cap_prod)
+
+            # B. Action Mix & Tempo
+            ph = self._bm_pass_history[p]
+            n_turns = len(ph)
+            if n_turns > 0:
+                i1 = max(1, int(round(0.25 * n_turns)))
+                i2 = max(i1, int(round(0.65 * n_turns)))
+                seg_open = ph[:i1]
+                seg_mid = ph[i1:i2]
+                seg_late = ph[i2:]
+                if seg_open:
+                    m['pass_rate_opening'] = float(sum(seg_open) / len(seg_open))
+                if seg_mid:
+                    m['pass_rate_mid'] = float(sum(seg_mid) / len(seg_mid))
+                if seg_late:
+                    m['pass_rate_late'] = float(sum(seg_late) / len(seg_late))
+
+            if self._bm_ahead_turns[p] > 0:
+                m['pass_rate_when_ahead'] = float(self._bm_ahead_pass_turns[p] / self._bm_ahead_turns[p])
+
+            np_cnt = self._bm_non_pass[p]
+            if np_cnt > 0:
+                m['target_neutral_share'] = float(self._bm_target_neutral[p] / np_cnt)
+                m['target_enemy_share'] = float(self._bm_target_enemy[p] / np_cnt)
+                m['target_reinforce_share'] = float(self._bm_target_reinforce[p] / np_cnt)
+                m['target_defend_share'] = float(self._bm_target_defend[p] / np_cnt)
+                m['target_forward_relay_share'] = float(self._bm_target_forward_relay[p] / np_cnt)
+                if self.enable_fleet_redirection:
+                    m['redirect_share'] = float(self._bm_redirects[p] / np_cnt)
+
+            if self._bm_planet_sends[p] > 0:
+                m['send_fraction_mean'] = float(self._bm_send_frac_sum[p] / self._bm_planet_sends[p])
+
+            # C. Force Allocation & Positional Efficiency
+            if self._bm_rear_share_ticks[p] > 0:
+                m['rear_planet_ship_share'] = float(
+                    self._bm_rear_share_sum[p] / self._bm_rear_share_ticks[p]
+                )
+            if self._bm_flight_share_ticks[p] > 0:
+                m['ships_in_flight_share'] = float(
+                    self._bm_flight_share_sum[p] / self._bm_flight_share_ticks[p]
+                )
+            m['prod_share_at_10s'] = p1_share_10s if p == self.PLAYER_1 else (1.0 - p1_share_10s)
+            m['prod_share_at_half'] = p1_share_half if p == self.PLAYER_1 else (1.0 - p1_share_half)
+
+            # D. Game Decisiveness
+            m['timeout_rate'] = 1.0 if ended_by_timeout else 0.0
+            if winner == p:
+                m['avg_win_steps'] = float(final_step)
+            elif winner != -1:
+                m['avg_loss_steps'] = float(final_step)
+
+            by_player[p] = m
+
+        if self.battle_mode in ('play_with_bot_mode', 'eval_mode'):
+            summary = dict(by_player[self.PLAYER_1])
+        else:
+            # Self-play mode: average symmetric metrics across P1 and P2, plus p1_win_rate
+            summary = {}
+            all_keys = set(by_player[self.PLAYER_1].keys()) | set(by_player[self.PLAYER_2].keys())
+            for k in sorted(all_keys):
+                vals = [
+                    by_player[p][k]
+                    for p in (self.PLAYER_1, self.PLAYER_2)
+                    if k in by_player[p]
+                ]
+                if vals:
+                    summary[k] = float(sum(vals) / len(vals))
+            if winner == self.PLAYER_1:
+                summary['p1_win_rate'] = 1.0
+            elif winner == self.PLAYER_2:
+                summary['p1_win_rate'] = 0.0
+            else:
+                summary['p1_win_rate'] = 0.5
+
+        return by_player, summary
 
     def _init_or_reset_cpp_sim(self) -> None:
         planets = self.planets

@@ -297,6 +297,7 @@ class MuZeroEvaluator(ISerialEvaluator):
             target_episodes = balanced_episode_targets(env_nums, n_episode)
             completed_episodes = np.zeros(env_nums, dtype=np.int64)
             eps_steps_lst = np.zeros(env_nums)
+            behavior_pools: Dict[str, List[float]] = {}
             with self._timer:
                 while not eval_monitor.is_finished():
                     # Check if a timeout has occurred.
@@ -394,6 +395,15 @@ class MuZeroEvaluator(ISerialEvaluator):
                             saved_info = {'eval_episode_return': score}
                             if 'episode_info' in episode_timestep.info:
                                 saved_info.update(episode_timestep.info['episode_info'])
+                            gm = episode_timestep.info.get('galcon_metrics')
+                            if isinstance(gm, dict):
+                                for bk, bv in gm.items():
+                                    try:
+                                        fv = float(bv.item()) if torch.is_tensor(bv) else float(bv)
+                                    except (TypeError, ValueError):
+                                        continue
+                                    if np.isfinite(fv):
+                                        behavior_pools.setdefault(str(bk), []).append(fv)
                             eval_monitor.update_info(env_id, saved_info)
                             eval_monitor.update_reward(env_id, reward)
                             completed_episodes[env_id] += 1
@@ -461,6 +471,9 @@ class MuZeroEvaluator(ISerialEvaluator):
             episode_info = eval_monitor.get_episode_info()
             if episode_info is not None:
                 info.update(episode_info)
+            for bk, bvals in sorted(behavior_pools.items()):
+                if bvals:
+                    info[f'behavior_{bk}'] = float(np.mean(bvals))
 
             logging.info(f'rank {self._rank}, self.task_id: {self.task_id}')
             self._logger.info(self._logger.get_tabulate_vars_hor(info))

@@ -346,6 +346,13 @@ class AsyncEloEvaluator:
         total_draws = 0
         total_losses = 0
         total_p1_wins = 0
+        total_wins_as_p1 = 0
+        total_draws_as_p1 = 0
+        total_games_as_p1 = 0
+        total_wins_as_p2 = 0
+        total_draws_as_p2 = 0
+        total_games_as_p2 = 0
+        behavior_pools: Dict[str, List[float]] = {}
         total_steps = 0
         total_games = 0
         score_vs_champion: Optional[float] = None
@@ -386,6 +393,14 @@ class AsyncEloEvaluator:
             total_draws += summary.draws
             total_losses += summary.losses_a
             total_p1_wins += summary.p1_wins
+            total_wins_as_p1 += summary.wins_a_as_p1
+            total_draws_as_p1 += summary.draws_a_as_p1
+            total_games_as_p1 += summary.games_a_as_p1
+            total_wins_as_p2 += summary.wins_a_as_p2
+            total_draws_as_p2 += summary.draws_a_as_p2
+            total_games_as_p2 += summary.games_a_as_p2
+            for bk, bvals in summary.behavior_a.items():
+                behavior_pools.setdefault(bk, []).extend(bvals)
             total_steps += summary.total_steps
             total_games += summary.total_games
             scores_by_opp[opp.player_id] = summary.win_rate_a
@@ -579,6 +594,20 @@ class AsyncEloEvaluator:
                 safe_bot = bot_type.replace(':', '_')
                 scalars[f'win_rate_vs_bot_{safe_bot}'] = float(scores_by_opp[bot_pid])
 
+        behavior_summary: Dict[str, float] = {}
+        for bk, bvals in sorted(behavior_pools.items()):
+            if bvals:
+                mean_val = float(sum(bvals) / len(bvals))
+                if math.isfinite(mean_val):
+                    behavior_summary[bk] = mean_val
+                    scalars[f'behavior_{bk}'] = mean_val
+        if total_games_as_p1 > 0 and total_games_as_p2 > 0:
+            wr_p1 = (total_wins_as_p1 + 0.5 * total_draws_as_p1) / total_games_as_p1
+            wr_p2 = (total_wins_as_p2 + 0.5 * total_draws_as_p2) / total_games_as_p2
+            p1_minus_p2 = float(wr_p1 - wr_p2)
+            behavior_summary['p1_minus_p2_win_rate'] = p1_minus_p2
+            scalars['behavior_p1_minus_p2_win_rate'] = p1_minus_p2
+
         for tag, val in scalars.items():
             if not math.isfinite(val):
                 continue
@@ -603,6 +632,7 @@ class AsyncEloEvaluator:
             'games_played': int(total_games),
             'elapsed_sec': float(elapsed_total),
             'matches': match_results,
+            'behavior': behavior_summary,
         }
         self.ladder.eval_history.append(eval_record)
 
