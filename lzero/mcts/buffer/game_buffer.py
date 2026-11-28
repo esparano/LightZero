@@ -126,7 +126,7 @@ class GameBuffer(ABC, object):
         """
         assert self._beta > 0, "Beta should be greater than 0"
         num_of_transitions = self.get_num_of_transitions()
-        priorities = np.asarray(self.game_pos_priorities, dtype=np.float64)
+        priorities = np.asarray(self.game_pos_priorities)
         if priorities.shape != (num_of_transitions,):
             raise RuntimeError(
                 'Replay priority/index arrays are not transition-aligned: '
@@ -139,27 +139,54 @@ class GameBuffer(ABC, object):
         # epsilon to every entry resurrected those padded segment-tail roots and diluted every
         # useful batch.  Keep them exactly unsampleable in both PER and uniform replay.
         valid_priority_mask = priorities > 0
-        sampleable_count = int(valid_priority_mask.sum())
+        sampleable_count = int(np.count_nonzero(valid_priority_mask))
         if sampleable_count < batch_size:
             raise RuntimeError(
                 f'Replay has only {sampleable_count} sampleable transitions for batch_size={batch_size}; '
                 f'total stored transitions={num_of_transitions}'
             )
-        sampling_priorities = priorities if self._cfg.use_priority else valid_priority_mask.astype(np.float64)
-        probs = np.zeros_like(sampling_priorities, dtype=np.float64)
-        probs[valid_priority_mask] = sampling_priorities[valid_priority_mask] ** self._alpha
-        probability_sum = float(probs.sum())
-        if not np.isfinite(probability_sum) or probability_sum <= 0:
-            raise RuntimeError('Replay sampling distribution has no finite positive mass')
-        probs /= probability_sum
 
-        # sample according to transition index
-        batch_index_list = np.random.choice(num_of_transitions, batch_size, p=probs, replace=False)
-        
+        use_priority = bool(self._cfg.use_priority)
+        probs = None
+        if use_priority:
+            probs = np.zeros(num_of_transitions, dtype=np.float64)
+            probs[valid_priority_mask] = priorities[valid_priority_mask].astype(np.float64, copy=False) ** self._alpha
+            probability_sum = float(probs.sum())
+            if not np.isfinite(probability_sum) or probability_sum <= 0:
+                raise RuntimeError('Replay sampling distribution has no finite positive mass')
+            probs /= probability_sum
+            # sample according to transition index
+            batch_index_list = np.random.choice(num_of_transitions, batch_size, p=probs, replace=False)
+        else:
+            # Fast O(batch_size) uniform sampling without replacement (legacy np.random.choice
+            # shuffles all N transitions in O(N) on every batch).
+            if batch_size * 4 < sampleable_count:
+                raw_draws = np.random.randint(0, sampleable_count, size=batch_size).tolist()
+                seen = set()
+                chosen = []
+                for d in raw_draws:
+                    if d not in seen:
+                        seen.add(d)
+                        chosen.append(d)
+                while len(chosen) < batch_size:
+                    d = int(np.random.randint(0, sampleable_count))
+                    if d not in seen:
+                        seen.add(d)
+                        chosen.append(d)
+                drawn_pos = np.asarray(chosen, dtype=np.int64)
+            else:
+                drawn_pos = np.random.choice(sampleable_count, batch_size, replace=False)
+
+            if sampleable_count == num_of_transitions:
+                batch_index_list = drawn_pos
+            else:
+                valid_indices = valid_priority_mask.nonzero()[0]
+                batch_index_list = valid_indices[drawn_pos]
+
         if self._cfg.reanalyze_outdated:
             # Sort the batch indices if reanalyze is enabled
             batch_index_list.sort()
-        
+
         game_segment_list = []
         pos_in_game_segment_list = []
         # The position resampling inside the loop below may move a sample to a different transition
@@ -169,80 +196,43 @@ class GameBuffer(ABC, object):
         # ``segment_base + step_pos``, so the adjusted index is ``idx - orig_pos + new_pos``.)
         adjusted_index_list = []
 
-        for idx in batch_index_list:
-            game_segment_idx, pos_in_game_segment = self.game_segment_game_pos_look_up[idx]
+        is_varied_action = self._cfg.action_type == 'varied_action_space'
+        if is_varied_action:
+            # For varied action space environments (e.g., board games with short game length like TicTacToe)
+            # progressively relax sampling constraints to accommodate short games.
+            ideal_bound = self._cfg.game_segment_length - self._cfg.num_unroll_steps - self._cfg.td_steps
+            if ideal_bound > 0:
+                sampling_upper_bound = ideal_bound
+            else:
+                fallback_bound = self._cfg.game_segment_length - self._cfg.num_unroll_steps
+                if fallback_bound > 0:
+                    sampling_upper_bound = fallback_bound
+                else:
+                    sampling_upper_bound = max(1, int(self._cfg.game_segment_length))
+        else:
+            sampling_upper_bound = int(self._cfg.game_segment_length)
+
+        look_up = self.game_segment_game_pos_look_up
+        seg_buf = self.game_segment_buffer
+        base_idx = self.base_idx
+
+        for idx in batch_index_list.tolist():
+            game_segment_idx, pos_in_game_segment = look_up[idx]
             orig_pos_in_game_segment = pos_in_game_segment
-            game_segment_idx -= self.base_idx  # Adjust index based on base index
-            game_segment = self.game_segment_buffer[game_segment_idx]
+            game_segment = seg_buf[game_segment_idx - base_idx]
 
             game_segment_list.append(game_segment)
-            
-            if self._cfg.action_type == 'varied_action_space':
-                # For varied action space environments (e.g., board games with short game length like TicTacToe)
-                # We need to handle cases where game_segment_length might be smaller than num_unroll_steps + td_steps
-                # Strategy: progressively relax sampling constraints to accommodate short games
 
-                # Step 1: Calculate ideal sampling upper bound
-                # Ideally, reserve space for both num_unroll_steps and td_steps to ensure complete trajectories
-                ideal_bound = self._cfg.game_segment_length - self._cfg.num_unroll_steps - self._cfg.td_steps
+            if pos_in_game_segment >= sampling_upper_bound:
+                pos_in_game_segment = int(np.random.randint(0, sampling_upper_bound))
 
-                # Step 2: Handle different game length scenarios with graceful degradation
-                if ideal_bound > 0:
-                    # Case A: Normal/long games - enough space for full unroll + td steps
-                    # This is the standard case for most Atari games
-                    sampling_upper_bound = ideal_bound
+            # Runtime check against actual segment length (handles both GameSegment and list data in unittests)
+            segment_len = self._game_segment_transition_count(game_segment)
+            if pos_in_game_segment >= segment_len - 1:
+                if segment_len > 1:
+                    pos_in_game_segment = int(np.random.randint(0, segment_len - 1))
                 else:
-                    # Case B: Short games - need to relax constraints
-                    # Try to at least reserve space for unroll steps (most critical for training)
-                    fallback_bound = self._cfg.game_segment_length - self._cfg.num_unroll_steps
-
-                    if fallback_bound > 0:
-                        # Can still accommodate unroll steps, though td_steps might need padding
-                        sampling_upper_bound = fallback_bound
-                    else:
-                        # Case C: Very short games (e.g., TicTacToe with 5-9 moves)
-                        # Allow sampling from entire segment length, padding will be applied during unrolling
-                        # This allows sampling from position 0 (beginning of game) when necessary
-                        sampling_upper_bound = self._cfg.game_segment_length
-
-                        # Ensure at least 1 to avoid np.random.choice errors
-                        if sampling_upper_bound <= 0:
-                            sampling_upper_bound = 1
-
-                # Step 3: Resample position if it exceeds calculated bound
-                if pos_in_game_segment >= sampling_upper_bound:
-                    pos_in_game_segment = np.random.choice(sampling_upper_bound, 1).item()
-
-                # Step 4: Further adjust based on actual segment length (runtime check)
-                segment_len = self._game_segment_transition_count(game_segment)
-                if pos_in_game_segment >= segment_len - 1:
-                    # Position exceeds actual segment, resample within valid range
-                    if segment_len > 1:
-                        # Sample from [0, segment_len-1] to allow at least 1 step forward
-                        pos_in_game_segment = np.random.choice(segment_len - 1, 1).item()
-                    else:
-                        # Segment has 0 or 1 actions, can only use position 0
-                        pos_in_game_segment = 0
-
-            else:
-                # For environments with a fixed action space (e.g., Atari),
-                # we can safely sample from the entire game segment range.
-                if pos_in_game_segment >= self._cfg.game_segment_length:
-                    pos_in_game_segment = np.random.choice(self._cfg.game_segment_length, 1).item()
-
-                # Compatibility handling for both GameSegment objects and list data (for unittests)
-                segment_len = self._game_segment_transition_count(game_segment)
-
-                if pos_in_game_segment >= segment_len - 1:
-                    # If the segment is very short (length 0 or 1), we can't randomly sample a position
-                    # before the last one. The only safe position is 0.
-                    if segment_len > 1:
-                        # If the segment has at least 2 actions, we can safely sample from [0, len-2].
-                        # The upper bound for np.random.choice is exclusive, so (segment_len - 1) is correct.
-                        pos_in_game_segment = np.random.choice(segment_len - 1, 1).item()
-                    else:
-                        # If segment length is 0 or 1, the only valid/safe position is 0.
-                        pos_in_game_segment = 0
+                    pos_in_game_segment = 0
 
             pos_in_game_segment_list.append(pos_in_game_segment)
             adjusted_index_list.append(idx - orig_pos_in_game_segment + pos_in_game_segment)
@@ -251,15 +241,21 @@ class GameBuffer(ABC, object):
 
         # Calculate the IS weights from the probabilities of the transitions actually used (which may
         # differ from the originally sampled ones after the position resampling above).
-        if np.any(probs[adjusted_index_list] <= 0):
-            raise RuntimeError('Position resampling selected a structurally invalid replay root')
-        weights_list = (sampleable_count * probs[adjusted_index_list]) ** (-self._beta)
-        weights_list /= weights_list.max()  # Normalize weights
+        if use_priority:
+            if np.any(probs[adjusted_index_list] <= 0):
+                raise RuntimeError('Position resampling selected a structurally invalid replay root')
+            weights_list = (sampleable_count * probs[adjusted_index_list]) ** (-self._beta)
+            weights_list /= weights_list.max()  # Normalize weights
+        else:
+            if np.any(~valid_priority_mask[adjusted_index_list]):
+                raise RuntimeError('Position resampling selected a structurally invalid replay root')
+            weights_list = np.ones(len(adjusted_index_list), dtype=np.float64)
 
         # Record the actual sampling time: update_priority() only writes back priorities for samples
         # whose make_time is newer than the last buffer reset (clear_time). Using placeholder zeros
         # here would make that guard unconditionally False and silently drop ALL priority updates.
-        make_time = [time.time() for _ in range(len(adjusted_index_list))]
+        now = time.time()
+        make_time = [now] * len(adjusted_index_list)
 
         orig_data = (game_segment_list, pos_in_game_segment_list, adjusted_index_list, weights_list, make_time)
 

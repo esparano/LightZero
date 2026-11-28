@@ -114,44 +114,49 @@ class EfficientZeroGameBuffer(MuZeroGameBuffer):
         action_mask_segment, to_play_segment = [], []
 
         td_steps_list = []
-        for game_segment, state_index, idx in zip(game_segment_list, pos_in_game_segment_list, batch_index_list):
+        cfg_td_steps = int(self._cfg.td_steps)
+        num_unroll_steps = int(self._cfg.num_unroll_steps)
+        unroll_stride = num_unroll_steps + 1
+        frame_stack_num = int(self._cfg.model.frame_stack_num)
+        zeros_mask_chunk = [0] * unroll_stride
+        zeros_obs_chunk = [zero_obs] * unroll_stride
+
+        for game_segment, state_index in zip(game_segment_list, pos_in_game_segment_list):
             game_segment_len = len(game_segment)
             game_segment_lens.append(game_segment_len)
 
-            # ==============================================================
-            # EfficientZero related core code
-            # ==============================================================
-            # TODO(pu):
-            # for atari, off-policy correction: shorter horizon of td steps
-            # delta_td = (total_transitions - idx) // config.auto_td_steps
-            # td_steps = config.td_steps - delta_td
-            # td_steps = np.clip(td_steps, 1, 5).astype(np.int)
-            td_steps = np.clip(self._cfg.td_steps, 1, max(1, game_segment_len - state_index)).astype(np.int32)
-
-            # prepare the corresponding observations for bootstrapped values o_{t+k}
-            # o[t+ td_steps, t + td_steps + stack frames + num_unroll_steps]
-            # t=2+3 -> o[2+3, 2+3+4+5] -> o[5, 14]
-            game_obs = game_segment.get_unroll_obs(state_index + td_steps, self._cfg.num_unroll_steps)
+            # Plain Python clip avoids per-row NumPy generic dispatch overhead.
+            upper_td = game_segment_len - state_index
+            if upper_td < 1:
+                upper_td = 1
+            td_steps = cfg_td_steps if cfg_td_steps <= upper_td else upper_td
+            if td_steps < 1:
+                td_steps = 1
 
             rewards_list.append(game_segment.reward_segment)
-
             # for two_player board games
             action_mask_segment.append(game_segment.action_mask_segment)
             to_play_segment.append(game_segment.to_play_segment)
 
-            for current_index in range(state_index, state_index + self._cfg.num_unroll_steps + 1):
-                # get the <num_unroll_steps+1>  bootstrapped target obs
+            base_bootstrap = state_index + td_steps
+            if base_bootstrap >= game_segment_len:
+                # Every unroll step boots past episode end; skip get_unroll_obs entirely.
+                td_steps_list.extend([td_steps] * unroll_stride)
+                value_mask.extend(zeros_mask_chunk)
+                value_obs_list.extend(zeros_obs_chunk)
+                continue
+
+            # prepare the corresponding observations for bootstrapped values o_{t+k}
+            # o[t+ td_steps, t + td_steps + stack frames + num_unroll_steps]
+            game_obs = game_segment.get_unroll_obs(base_bootstrap, num_unroll_steps)
+
+            for offset in range(unroll_stride):
                 td_steps_list.append(td_steps)
-                # index of bootstrapped obs o_{t+td_steps}
-                bootstrap_index = current_index + td_steps
+                bootstrap_index = base_bootstrap + offset
 
                 if bootstrap_index < game_segment_len:
                     value_mask.append(1)
-                    # beg_index = bootstrap_index - (state_index + td_steps), max of beg_index is num_unroll_steps
-                    beg_index = current_index - state_index
-                    end_index = beg_index + self._cfg.model.frame_stack_num
-                    # the stacked obs in time t
-                    obs = game_obs[beg_index:end_index]
+                    obs = game_obs[offset:offset + frame_stack_num]
                 else:
                     value_mask.append(0)
                     obs = zero_obs

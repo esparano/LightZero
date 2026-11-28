@@ -50,6 +50,24 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         self.value_support = DiscreteSupport(*self._cfg.model.value_support_range)
         self.reward_support = DiscreteSupport(*self._cfg.model.reward_support_range)
         self._segment_update_lock = threading.Lock()
+        self._discount_powers = None
+        self._discount_powers_list = None
+        self._discount_powers_gamma = None
+
+    def _get_discount_powers(self, length: int) -> Tuple[np.ndarray, List[float]]:
+        """Return cached ``(ndarray, list)`` of ``[gamma**0, ..., gamma**(L-1)]`` with ``L >= length``."""
+        gamma = float(self._cfg.discount_factor)
+        pows = getattr(self, '_discount_powers', None)
+        pows_list = getattr(self, '_discount_powers_list', None)
+        cached_gamma = getattr(self, '_discount_powers_gamma', None)
+        if pows is None or pows_list is None or cached_gamma != gamma or len(pows) < length:
+            alloc_len = max(int(length), 256)
+            pows = gamma ** np.arange(alloc_len, dtype=np.float64)
+            pows_list = pows.tolist()
+            self._discount_powers = pows
+            self._discount_powers_list = pows_list
+            self._discount_powers_gamma = gamma
+        return pows, pows_list
 
     def _get_segment_update_lock(self) -> threading.Lock:
         """Return the per-buffer lock guarding paired (child_visit, root_sampled_actions) updates."""
@@ -62,11 +80,17 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
     def __getstate__(self):
         state = self.__dict__.copy()
         state.pop('_segment_update_lock', None)
+        state.pop('_discount_powers', None)
+        state.pop('_discount_powers_list', None)
+        state.pop('_discount_powers_gamma', None)
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._segment_update_lock = threading.Lock()
+        self._discount_powers = None
+        self._discount_powers_list = None
+        self._discount_powers_gamma = None
 
     def sample(self, batch_size: int, policy: Any) -> List[Any]:
         """
@@ -79,8 +103,13 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             - train_data (:obj:`List`): List of train data
         """
 
-        policy._target_model.to(self._cfg.device)
-        policy._target_model.eval()
+        target_model = policy._target_model
+        target_device = torch.device(self._cfg.device)
+        first_param = next(target_model.parameters(), None)
+        if first_param is None or first_param.device != target_device:
+            target_model.to(target_device)
+        if target_model.training:
+            target_model.eval()
 
         reward_value_context, policy_re_context, policy_non_re_context, current_batch = self._make_batch(
             batch_size, self._cfg.reanalyze_ratio
@@ -145,11 +174,39 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         orig_data = self._sample_orig_data(batch_size)
         game_lst, pos_in_game_segment_list, batch_index_list, weights_list, make_time_list = orig_data
         batch_size = len(batch_index_list)
-        obs_list, action_list, mask_list = [], [], []
+        num_unroll_steps = int(self._cfg.num_unroll_steps)
+        unroll_stride = num_unroll_steps + 1
+        continuous_action_space = bool(self._cfg.model.continuous_action_space)
+        action_space_size = int(self._cfg.model.action_space_size)
+        num_of_sampled_actions = int(self._cfg.model.num_of_sampled_actions)
+        reshape_sampled = bool(self._cfg.mcts_ctree)
+
+        obs_list, action_list = [], []
+        mask_arr = np.zeros((batch_size, unroll_stride), dtype=np.float64)
         root_sampled_actions_list = []
         reanalyze_num = int(batch_size * reanalyze_ratio)
         non_re_child_visit_snapshots = []
         seg_lock = self._get_segment_update_lock()
+
+        # Fast preallocated observation assembly for uniform conv np.ndarray frames (avoids double 16MB copy).
+        use_fast_conv_obs = False
+        obs_arr = None
+        unroll_frames = 0
+        expected_frame_shape = None
+        if (
+            batch_size > 0
+            and self._cfg.model.model_type == 'conv'
+            and not getattr(game_lst[0], 'transform2string', False)
+        ):
+            seg0_obs = getattr(game_lst[0], 'obs_segment', None)
+            if seg0_obs is not None and len(seg0_obs) > 0:
+                frame0 = seg0_obs[0]
+                if isinstance(frame0, np.ndarray) and frame0.ndim == 3:
+                    unroll_frames = int(game_lst[0].frame_stack_num) + num_unroll_steps
+                    expected_frame_shape = frame0.shape
+                    obs_arr = np.empty((batch_size, unroll_frames, *expected_frame_shape), dtype=frame0.dtype)
+                    use_fast_conv_obs = True
+
         # prepare the inputs of a batch
         for i in range(batch_size):
             game = game_lst[i]
@@ -157,8 +214,7 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             # ==============================================================
             # sampled related core code
             # ==============================================================
-            actions_slice = game.action_segment[pos_in_game_segment:pos_in_game_segment +
-                                              self._cfg.num_unroll_steps]
+            actions_slice = game.action_segment[pos_in_game_segment:pos_in_game_segment + num_unroll_steps]
             actions_tmp = actions_slice.tolist() if hasattr(actions_slice, 'tolist') else list(actions_slice)
 
             if reanalyze_ratio > 0:
@@ -168,7 +224,7 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                 with seg_lock:
                     # NOTE: self._cfg.num_unroll_steps + 1
                     root_sampled_actions_slice = game.root_sampled_actions[
-                        pos_in_game_segment:pos_in_game_segment + self._cfg.num_unroll_steps + 1
+                        pos_in_game_segment:pos_in_game_segment + unroll_stride
                     ]
                     root_sampled_actions_tmp = [
                         np.array(a, copy=True) if isinstance(a, np.ndarray) else copy.deepcopy(a)
@@ -176,7 +232,7 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                     ]
                     if i >= reanalyze_num:
                         cv = game.child_visit_segment
-                        end_idx = min(pos_in_game_segment + self._cfg.num_unroll_steps + 1, len(cv))
+                        end_idx = min(pos_in_game_segment + unroll_stride, len(cv))
                         non_re_child_visit_snapshots.append({
                             t: (cv[t].copy() if isinstance(cv[t], np.ndarray) else copy.deepcopy(cv[t]))
                             for t in range(pos_in_game_segment, end_idx)
@@ -184,107 +240,106 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
             else:
                 # NOTE: self._cfg.num_unroll_steps + 1
                 root_sampled_actions_tmp = list(
-                    game.root_sampled_actions[pos_in_game_segment:pos_in_game_segment + self._cfg.num_unroll_steps + 1]
+                    game.root_sampled_actions[pos_in_game_segment:pos_in_game_segment + unroll_stride]
                 )
 
             # add mask for invalid actions (out of trajectory), 1 for valid, 0 for invalid
-           
-            # VERSION 1: 
-            mask_tmp = [1. for i in range(len(root_sampled_actions_tmp))]
-            mask_tmp += [0. for _ in range(self._cfg.num_unroll_steps + 1 - len(mask_tmp))]
-           
-            # VERSION 2
-            # 1. Start with a list of 1s based on the length of actions
-            # sets the mask to 0 if the action is -1 (the "pad" action)
-            # mask_tmp = []
-            # for action in root_sampled_actions_tmp:
-            #     # Check if the action (which is a list or array) contains our padding value
-            #     # We use np.any() to see if ANY of the values in that specific slot are -1
-            #     is_pad_action = np.any(np.array(action) == -1)
-            #     mask_tmp.append(0.0 if is_pad_action else 1.0)
-            
-            # # 2. Pad the mask with 0s for the remaining unroll steps
-            # # This handles both the padding from the end of the trajectory 
-            # # AND any slots that were filled with our dummy -1s
-            # pad_len = self._cfg.num_unroll_steps + 1 - len(mask_tmp)
-            # mask_tmp += [0.0 for _ in range(pad_len)]
+            valid_len = len(root_sampled_actions_tmp)
+            if valid_len > 0:
+                mask_arr[i, :min(valid_len, unroll_stride)] = 1.0
 
-            # pad random action
-            if self._cfg.model.continuous_action_space:
-                actions_tmp += [
-                    np.random.randn(self._cfg.model.action_space_size)
-                    for _ in range(self._cfg.num_unroll_steps - len(actions_tmp))
-                ]
-                root_sampled_actions_tmp += [
-                    np.random.rand(self._cfg.model.num_of_sampled_actions, self._cfg.model.action_space_size)
-                    for _ in range(self._cfg.num_unroll_steps + 1 - len(root_sampled_actions_tmp))
-                ]
+            # pad random action only when actually needed (avoids ~10k zero-length calls)
+            act_pad = num_unroll_steps - len(actions_tmp)
+            rsa_pad = unroll_stride - valid_len
+            if continuous_action_space:
+                if act_pad > 0:
+                    actions_tmp += [np.random.randn(action_space_size) for _ in range(act_pad)]
+                if rsa_pad > 0:
+                    root_sampled_actions_tmp += [
+                        np.random.rand(num_of_sampled_actions, action_space_size) for _ in range(rsa_pad)
+                    ]
             else:
-                # generate random `padded actions_tmp`
-                actions_tmp += generate_random_actions_discrete(
-                    self._cfg.num_unroll_steps - len(actions_tmp),
-                    self._cfg.model.action_space_size,
-                    1  # Number of sampled actions for actions_tmp is 1
-                )
-
-                # generate random padded `root_sampled_actions_tmp`
-                # root_sampled_action have different shape in mcts_ctree and mcts_ptree, thus we need to pad differently
-                reshape = True if self._cfg.mcts_ctree else False
-                root_sampled_actions_tmp += generate_random_actions_discrete(
-                    self._cfg.num_unroll_steps + 1 - len(root_sampled_actions_tmp),
-                    self._cfg.model.action_space_size,
-                    self._cfg.model.num_of_sampled_actions,
-                    reshape=reshape
-                )
+                if act_pad > 0:
+                    actions_tmp += generate_random_actions_discrete(act_pad, action_space_size, 1)
+                if rsa_pad > 0:
+                    root_sampled_actions_tmp += generate_random_actions_discrete(
+                        rsa_pad, action_space_size, num_of_sampled_actions, reshape=reshape_sampled
+                    )
 
             # obtain the input observations
-            # stack+num_unroll_steps = 4+5
-            # pad if length of obs in game_segment is less than stack+num_unroll_steps
-            obs_list.append(
-                game_lst[i].get_unroll_obs(
-                    pos_in_game_segment_list[i], num_unroll_steps=self._cfg.num_unroll_steps, padding=True
+            if use_fast_conv_obs:
+                if getattr(game, 'transform2string', False):
+                    use_fast_conv_obs = False
+                    obs_list = [
+                        game_lst[j].get_unroll_obs(
+                            pos_in_game_segment_list[j], num_unroll_steps=num_unroll_steps, padding=True
+                        )
+                        for j in range(i)
+                    ]
+                else:
+                    frames = game.obs_segment[pos_in_game_segment:pos_in_game_segment + unroll_frames]
+                    n_avail = len(frames)
+                    if n_avail > 0:
+                        row_ok = True
+                        if n_avail == unroll_frames and isinstance(frames, np.ndarray) and frames.shape[1:] == expected_frame_shape:
+                            obs_arr[i] = frames
+                        else:
+                            for fi in range(n_avail):
+                                frame = frames[fi]
+                                if isinstance(frame, np.ndarray) and frame.shape == expected_frame_shape:
+                                    obs_arr[i, fi] = frame
+                                else:
+                                    row_ok = False
+                                    break
+                            if row_ok and n_avail < unroll_frames:
+                                obs_arr[i, n_avail:] = frames[-1]
+                        if not row_ok:
+                            use_fast_conv_obs = False
+                            obs_list = [
+                                game_lst[j].get_unroll_obs(
+                                    pos_in_game_segment_list[j], num_unroll_steps=num_unroll_steps, padding=True
+                                )
+                                for j in range(i)
+                            ]
+                    else:
+                        use_fast_conv_obs = False
+                        obs_list = [
+                            game_lst[j].get_unroll_obs(
+                                pos_in_game_segment_list[j], num_unroll_steps=num_unroll_steps, padding=True
+                            )
+                            for j in range(i)
+                        ]
+
+            if not use_fast_conv_obs:
+                obs_list.append(
+                    game.get_unroll_obs(
+                        pos_in_game_segment, num_unroll_steps=num_unroll_steps, padding=True
+                    )
                 )
-            )
-            # VERSION 3
-            # Zero out pad actions just to not crash GPU - this should not affect training because of the mask.
-            # action_list.append([a if a != -1 else 0 for a in root_sampled_actions_tmp])
 
-            # VERSION 2
-            # Create a new list for the batch
-            # processed_actions = []
-            # for a in root_sampled_actions_tmp:
-            #     # 1. Convert to numpy for easy comparison
-            #     a_arr = np.array(a)
-                
-            #     # 2. Check if the entire list/array is our padding value (-1)
-            #     # Using np.any() or checking the first element is usually sufficient
-            #     if (a_arr == -1).any():
-            #         processed_actions.append(0)  # Convert -1 to 0 for the GPU
-            #     else:
-            #         # If it's a valid action (array or int), extract it
-            #         # If a is a numpy array, take the value; otherwise keep it as is
-            #         processed_actions.append(int(a_arr.item() if a_arr.ndim == 0 else a_arr[0]))
-
-            # action_list.append(processed_actions)
-
-            # VERSION 1
             action_list.append(actions_tmp)
             root_sampled_actions_list.append(root_sampled_actions_tmp)
 
-            mask_list.append(mask_tmp)
-
         # formalize the input observations
-        obs_list = prepare_observation(obs_list, self._cfg.model.model_type)
+        if use_fast_conv_obs:
+            obs_list = obs_arr.reshape(
+                batch_size, unroll_frames * expected_frame_shape[0], expected_frame_shape[1], expected_frame_shape[2]
+            )
+        else:
+            obs_list = prepare_observation(obs_list, self._cfg.model.model_type)
         # ==============================================================
         # sampled related core code
         # ==============================================================
         # formalize the inputs of a batch
         current_batch = [
-            obs_list, action_list, root_sampled_actions_list, mask_list, batch_index_list, weights_list, make_time_list
+            obs_list,
+            np.asarray(action_list),
+            np.asarray(root_sampled_actions_list),
+            mask_arr,
+            np.asarray(batch_index_list),
+            np.asarray(weights_list),
+            np.asarray(make_time_list),
         ]
-
-        for i in range(len(current_batch)):
-            current_batch[i] = np.asarray(current_batch[i])
 
         total_transitions = self.get_num_of_transitions()
 
@@ -507,72 +562,166 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                     value_list = np.zeros(transition_batch_size, dtype=active_values.dtype)
                     value_list[active_indices] = active_values
 
-            if active_indices.size > 0:
-                # get last state value
-                if self._cfg.env_type == 'board_games' and to_play_segment[0][0] in [1, 2]:
-                    # TODO(pu): for board_games, very important, to check
-                    value_list = value_list.reshape(-1) * np.array(
-                        [
-                            self._cfg.discount_factor ** td_steps_list[i] if int(td_steps_list[i]) %
-                            2 == 0 else -self._cfg.discount_factor ** td_steps_list[i]
-                            for i in range(transition_batch_size)
-                        ]
-                    )
-                else:
-                    value_list = value_list.reshape(-1) * (
-                        np.array([self._cfg.discount_factor for _ in range(transition_batch_size)]) ** td_steps_list
-                    )
+            is_two_player_zero_sum = bool(
+                self._cfg.env_type == 'board_games'
+                and len(to_play_segment) > 0
+                and len(to_play_segment[0]) > 0
+                and to_play_segment[0][0] in (1, 2)
+            )
+            unroll_stride = int(self._cfg.num_unroll_steps) + 1
+            lstm_horizon_len = int(self._cfg.lstm_horizon_len)
 
-                value_list = value_list * value_mask_arr
-                value_list = value_list.tolist()
+            has_boot_values = active_indices.size > 0
+            if has_boot_values:
+                td_arr = np.asarray(td_steps_list, dtype=np.int64)
+                gamma_pows, gamma_list = self._get_discount_powers(int(td_arr.max()) + unroll_stride + 1)
+                discounts = gamma_pows[td_arr]
+                if is_two_player_zero_sum:
+                    discounts = np.where((td_arr & 1) == 0, discounts, -discounts)
+                val_list = (np.asarray(value_list, dtype=np.float64).reshape(-1) * discounts * value_mask_arr).tolist()
+            else:
+                max_span_est = int(self._cfg.td_steps) + unroll_stride + 1
+                gamma_pows, gamma_list = self._get_discount_powers(max_span_est)
+                val_list = None
 
-            horizon_id, value_index = 0, 0
-            for game_segment_len_non_re, reward_list, state_index, to_play_list in zip(game_segment_lens, rewards_list,
-                                                                                       pos_in_game_segment_list,
-                                                                                       to_play_segment):
-                target_values = []
-                target_value_prefixs = []
+            tv_rows = []
+            vp_rows = []
 
-                value_prefix = np.array(0.)
-                for current_index in range(state_index, state_index + self._cfg.num_unroll_steps + 1):
-                    bootstrap_index = current_index + td_steps_list[value_index]
-                    # for i, reward in enumerate(game.rewards[current_index:bootstrap_index]):
-                    for i, reward in enumerate(reward_list[current_index:bootstrap_index]):
-                        if self._cfg.env_type == 'board_games' and to_play_segment[0][0] in [1, 2]:
-                            # The reward of transition ``current_index + i`` is from the perspective of the
-                            # player to play at that transition, while the value target is from the perspective
-                            # of the player to play at the current state. Flip the sign when they differ
-                            # (players alternate, e.g. tictactoe self-play).
-                            if to_play_list[current_index + i] == to_play_list[current_index]:
-                                value_list[value_index] += reward * self._cfg.discount_factor ** i
-                            else:
-                                value_list[value_index] += -reward * self._cfg.discount_factor ** i
+            horizon_id = 0
+            value_index = 0
+            for game_segment_len_non_re, reward_list, state_index, to_play_list in zip(
+                game_segment_lens, rewards_list, pos_in_game_segment_list, to_play_segment
+            ):
+                r_len = len(reward_list)
+
+                # Compute exact upper bound touched by any unroll step in this segment.
+                max_boot = 0
+                for k in range(unroll_stride):
+                    bi = state_index + k + td_steps_list[value_index + k]
+                    if bi > max_boot:
+                        max_boot = bi
+                if max_boot > r_len:
+                    max_boot = r_len
+
+                span = max_boot - state_index
+                if span > 0:
+                    if span + 1 > len(gamma_list):
+                        gamma_pows, gamma_list = self._get_discount_powers(span + 1)
+
+                    if type(reward_list) is list:
+                        seg = reward_list[state_index:max_boot]
+                        nnz = len(seg) - seg.count(0.0)
+                        if nnz == 0:
+                            mode = 0
+                        elif nnz == 1 and seg[-1] != 0.0:
+                            mode = 1
+                            p0 = max_boot - 1
+                            r0 = float(seg[-1])
+                            tp0 = to_play_list[p0] if is_two_player_zero_sum else 0
+                        elif nnz <= 8:
+                            mode = 2
+                            nz_pos = []
+                            nz_vals = []
+                            nz_tp = [] if is_two_player_zero_sum else None
+                            for off, rv in enumerate(seg):
+                                if rv != 0.0:
+                                    p = state_index + off
+                                    nz_pos.append(p)
+                                    nz_vals.append(float(rv))
+                                    if is_two_player_zero_sum:
+                                        nz_tp.append(to_play_list[p])
                         else:
-                            value_list[value_index] += reward * self._cfg.discount_factor ** i
-                            # TODO(pu): why value don't use discount_factor factor
+                            mode = 3
+                            seg_arr = np.asarray(seg, dtype=np.float64)
+                            tp_arr = np.asarray(to_play_list[state_index:max_boot], dtype=np.int64) if is_two_player_zero_sum else None
+                    else:
+                        if isinstance(reward_list, np.ndarray):
+                            seg_view = reward_list[state_index:max_boot]
+                        else:
+                            seg_view = np.asarray(reward_list[state_index:max_boot], dtype=np.float64)
+                        nz_rel = seg_view.nonzero()[0]
+                        nnz = int(nz_rel.size)
+                        if nnz == 0:
+                            mode = 0
+                        elif nnz == 1:
+                            mode = 1
+                            off0 = int(nz_rel[0])
+                            p0 = state_index + off0
+                            r0 = float(seg_view[off0])
+                            tp0 = to_play_list[p0] if is_two_player_zero_sum else 0
+                        elif nnz <= 8:
+                            mode = 2
+                            nz_pos = [state_index + int(off) for off in nz_rel]
+                            nz_vals = [float(seg_view[int(off)]) for off in nz_rel]
+                            nz_tp = [to_play_list[p] for p in nz_pos] if is_two_player_zero_sum else None
+                        else:
+                            mode = 3
+                            seg_arr = seg_view.astype(np.float64, copy=False)
+                            tp_arr = np.asarray(to_play_list[state_index:max_boot], dtype=np.int64) if is_two_player_zero_sum else None
+                else:
+                    mode = 0
+
+                tv_row = [0.0] * unroll_stride
+                vp_row = [0.0] * unroll_stride
+                value_prefix = 0.0
+                for k in range(unroll_stride):
+                    current_index = state_index + k
+                    bootstrap_index = current_index + td_steps_list[value_index]
+                    boot_clamped = bootstrap_index if bootstrap_index < r_len else r_len
+
+                    acc = val_list[value_index] if has_boot_values else 0.0
+                    if mode == 1:
+                        if current_index <= p0 < boot_clamped:
+                            w = gamma_list[p0 - current_index]
+                            if is_two_player_zero_sum:
+                                acc += (r0 * w) if tp0 == to_play_list[current_index] else (-r0 * w)
+                            else:
+                                acc += r0 * w
+                    elif mode == 2:
+                        if current_index < boot_clamped:
+                            if is_two_player_zero_sum:
+                                cur_tp = to_play_list[current_index]
+                                for p, r_val, p_tp in zip(nz_pos, nz_vals, nz_tp):
+                                    if current_index <= p < boot_clamped:
+                                        w = gamma_list[p - current_index]
+                                        acc += (r_val * w) if p_tp == cur_tp else (-r_val * w)
+                            else:
+                                for p, r_val in zip(nz_pos, nz_vals):
+                                    if current_index <= p < boot_clamped:
+                                        acc += r_val * gamma_list[p - current_index]
+                    elif mode == 3:
+                        if current_index < boot_clamped:
+                            rel_start = current_index - state_index
+                            rel_end = boot_clamped - state_index
+                            r_slice = seg_arr[rel_start:rel_end]
+                            n_slice = rel_end - rel_start
+                            if is_two_player_zero_sum:
+                                cur_tp = tp_arr[rel_start]
+                                signed_r = np.where(tp_arr[rel_start:rel_end] == cur_tp, r_slice, -r_slice)
+                                acc += float(np.dot(signed_r, gamma_pows[:n_slice]))
+                            else:
+                                acc += float(np.dot(r_slice, gamma_pows[:n_slice]))
 
                     # reset every lstm_horizon_len
-                    if horizon_id % self._cfg.lstm_horizon_len == 0:
-                        value_prefix = np.array(0.)
+                    if horizon_id % lstm_horizon_len == 0:
+                        value_prefix = 0.0
                     horizon_id += 1
 
                     if current_index < game_segment_len_non_re:
-                        target_values.append(float(value_list[value_index]))
-                        # Since the horizon is small and the discount_factor is close to 1.
-                        # Compute the reward sum to approximate the value prefix for simplification
-                        value_prefix += float(reward_list[current_index])  # * config.discount_factor ** (current_index - base_index)
-                        target_value_prefixs.append(value_prefix.item())
+                        tv_row[k] = acc
+                        if mode != 0 or current_index >= max_boot:
+                            value_prefix += float(reward_list[current_index])
+                        vp_row[k] = value_prefix
                     else:
-                        target_values.append(0.)
-                        target_value_prefixs.append(value_prefix.item())
+                        vp_row[k] = value_prefix
 
                     value_index += 1
 
-                batch_value_prefixs.append(target_value_prefixs)
-                batch_target_values.append(target_values)
+                tv_rows.append(tv_row)
+                vp_rows.append(vp_row)
 
-        batch_value_prefixs = np.asarray(batch_value_prefixs)
-        batch_target_values = np.asarray(batch_target_values)
+            batch_value_prefixs = np.asarray(vp_rows, dtype=np.float64)
+            batch_target_values = np.asarray(tv_rows, dtype=np.float64)
 
         return batch_value_prefixs, batch_target_values
 
@@ -859,32 +1008,34 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
         Returns:
             - batch_target_policies_non_re (:obj:`np.ndarray`)
         """
-        batch_target_policies_non_re = []
         if policy_non_re_context is None:
-            return batch_target_policies_non_re
+            return []
 
         pos_in_game_segment_list, child_visits, game_segment_lens, action_mask_segment, to_play_segment = policy_non_re_context
+        batch_size = len(pos_in_game_segment_list)
+        unroll_stride = int(self._cfg.num_unroll_steps) + 1
+        zero_policy = [0.0] * policy_shape
+        uniform_policy = [1.0 / policy_shape] * policy_shape
+        flat_policies = []
 
-        for game_segment_len, child_visit, state_index in zip(game_segment_lens, child_visits, pos_in_game_segment_list):
-            target_policies = []
-            for current_index in range(state_index, state_index + self._cfg.num_unroll_steps + 1):
-                if current_index < game_segment_len:
-                    # child_visit[current_index] is already a K-length sampled distribution
-                    distributions = child_visit[current_index]
-                    if distributions is None or len(distributions) == 0:
-                        target_policies.append(
-                            list(np.ones(policy_shape) / policy_shape)
-                        )
-                    else:
-                        target_policies.append(list(distributions))
+        for game_segment_len, child_visit, state_index in zip(
+            game_segment_lens, child_visits, pos_in_game_segment_list
+        ):
+            max_k = game_segment_len - state_index
+            if max_k > unroll_stride:
+                max_k = unroll_stride
+            elif max_k < 0:
+                max_k = 0
+            for k in range(max_k):
+                distributions = child_visit[state_index + k]
+                if distributions is None or len(distributions) == 0:
+                    flat_policies.append(uniform_policy)
                 else:
-                    # Invalid padding: zero policy so cross_entropy_loss = 0
-                    target_policies.append([0. for _ in range(policy_shape)])
+                    flat_policies.append(distributions)
+            if max_k < unroll_stride:
+                flat_policies.extend([zero_policy] * (unroll_stride - max_k))
 
-            batch_target_policies_non_re.append(target_policies)
-
-        batch_target_policies_non_re = np.asarray(batch_target_policies_non_re)
-        return batch_target_policies_non_re
+        return np.asarray(flat_policies, dtype=np.float64).reshape(batch_size, unroll_stride, policy_shape)
 
     def update_priority(self, train_data: List[np.ndarray], batch_priorities: Any) -> None:
         """
