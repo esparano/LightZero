@@ -10,9 +10,11 @@
   Always pass `--load_fast=false --host 0.0.0.0` (the default Rust data server can hang in WSL), and verify the port is listening (`ss -tlnp | grep 6006` or the `TensorBoard ... at http://` log line) **before** giving the user the URL.
   Always link TensorBoard as a clean Markdown hyperlink (not a raw wall-of-text URL) using the `?pinnedCards=...#timeseries` format so key `*_iter/` + async metrics auto-pin:
   `[Open TensorBoard (Pinned Key Metrics)](http://localhost:6006/?pinnedCards=%5B%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22elo_iter/rating%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22elo_iter/win_rate_vs_champion%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22evaluator_iter/eval_episode_return_mean%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22evaluator_iter/eval/episode_length%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/value_loss_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/policy_loss_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/consistency_loss_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/policy_entropy_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/action0_taken_rate_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22learner_iter/policy_action0_prob_avg%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22async_learner/actor_learner_balance%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22async_learner/replay_ratio%22%7D%2C%7B%22plugin%22%3A%22scalars%22%2C%22tag%22%3A%22async_learner/ingested_envsteps%22%7D%5D#timeseries)`
-- **Elo Checkpoint-Ladder Evaluation & Offline Tournaments (`lzero.entry.async_split`):**
+- **Async Split Training, Hybrid Actors & Elo Evaluation (`lzero.entry.async_split`):**
+  - `python3 -m lzero.entry.async_split launch` spawns CPU actors (`--num-actors`, automatically isolated from CUDA via `CUDA_VISIBLE_DEVICES=''`) and optional CUDA GPU actors (`--num-gpu-actors`, `--gpu-actor-env-num` default `32`, `--gpu-actor-n-episode` default `32`) alongside the learner and evaluator. When `reanalyze_ratio == 0`, `--prefetch-workers` defaults to `0` (direct main-thread sampling).
   - Live async runs support `--eval-mode {bot,elo_ladder,both}` on both `evaluator` and `launch` (default `bot`). In `elo_ladder`/`both`, `AsyncEloEvaluator` runs paired side-swapped matches on matched map seeds, fits joint Bradley-Terry MLE ratings anchored at `bot:random = 0.0`, logs `elo_iter/*` & `elo_step/*` to `log/elo_evaluator/`, persists rungs/state under `elo_ladder/` (full `--resume` support), and saves `ckpt/elo_ckpt_best.pth.tar`.
   - Standalone offline tournaments run via `python3 -m lzero.entry.async_split tournament --config <cfg> --ckpt-dir <dir> --mode {ladder,round_robin}` (supports repeatable `--ckpt-dir`, cross-config `label=ckpt@cfg` specs, `--resume`, and `--write-tb`).
+  - **Galcon Symmetry & Behavioral Metrics:** Galcon configs use `symmetric_augment_on_the_fly='auto'` (vectorized `GalconEnv.reflect_batch` during learner sampling instead of storing reflected duplicates in replay). Behavioral metrics (`pass_rate_when_ahead`, redirect/attack/expansion rates, `behavior_p1_minus_p2_win_rate`, etc.) are logged under `elo_iter/behavior_*`, `evaluator_iter/behavior_*`, `collector_iter/behavior_*`, and `async_learner/behavior_*`.
 - **Shared Experiments Registry & Resource Balancer Coordination (`/home/evan/LightZero/data_sez/experiments_registry.md`):**
   - Before starting, stopping, pausing, or reallocating GPU/CPU resources for any training run, **always read `/home/evan/LightZero/data_sez/experiments_registry.md`** and follow its **Resource Balancer Protocol** (`RUNNING`, `PENDING_LAUNCH`, `LOCKED`, `PAUSED`, `STOPPED`, `COMPLETED`). Never auto-restart `PAUSED`, `STOPPED`, or `COMPLETED` runs, and preserve GPU/CPU headroom when a run is marked `PENDING_LAUNCH`.
   - After launching, stopping, pausing, planning, or rebalancing any run, update its row in the registry and append a 1-line timestamped entry to the **Cross-Conversation Handoff Log**.
@@ -33,11 +35,14 @@ Run the full Galcon + SampledEfficientZero + Elo ladder regression suite after c
   lzero/mcts/tests/test_ptree_sez_discrete_sampling.py \
   lzero/mcts/tests/test_sez_sign_flip.py \
   lzero/mcts/tests/test_sez_mcts_search.py \
+  lzero/mcts/tests/test_sez_reanalyze.py \
   lzero/mcts/tests/test_game_segment_pad_over.py \
   lzero/policy/tests/test_sampled_efficientzero_policy_learn_step.py \
+  lzero/policy/tests/test_sampled_efficientzero_collect_eval_init.py \
   lzero/policy/tests/test_galcon_sez_integration.py \
   lzero/worker/tests/test_elo_rating.py \
-  lzero/entry/tests/test_async_split_elo_ladder.py -q
+  lzero/entry/tests/test_async_split_elo_ladder.py \
+  lzero/entry/tests/test_async_split_e2e.py -q
 ```
 
 ## 3. Git & Review Workflow
