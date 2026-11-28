@@ -1041,3 +1041,57 @@ def test_head_to_head_and_elo_evaluator_support_mcts_anchor_bot(tmp_path):
     assert 'elo_iter/win_rate_vs_bot_sparky' in tb_tags
     assert 'elo_iter/win_rate_vs_bot_waffleopt' in tb_tags
 
+
+@pytest.mark.unittest
+def test_elo_evaluator_and_tournament_use_eval_only_policies(tmp_path):
+    """AsyncEloEvaluator and OfflineTournament must initialize eval-only policies (no optimizer/target model)."""
+    cfg_pair = _make_tiny_galcon_async_cfg()
+    run_dir = tmp_path / 'elo_eval_only'
+    dirs = AsyncSplitDirs.from_root(run_dir)
+    dirs.ensure_exists()
+
+    elo_eval = AsyncEloEvaluator(
+        input_cfg=cfg_pair,
+        run_dir=run_dir,
+        seed=0,
+        device='cpu',
+        evaluator_env_num=2,
+        games_per_opponent=2,
+        opponents_per_eval=1,
+        anchor_bots=('random',),
+    )
+    try:
+        for pol in (elo_eval.candidate_policy, elo_eval.opponent_policy):
+            assert not hasattr(pol, '_optimizer')
+            assert not hasattr(pol, '_learn_model')
+            assert not hasattr(pol, '_target_model')
+            assert hasattr(pol, '_eval_model')
+            assert hasattr(pol, 'value_inverse_scalar_transform_handle')
+    finally:
+        elo_eval.close()
+
+    ckpt_path = tmp_path / 'ckpt_0.pth.tar'
+    out_dir = tmp_path / 'tourn_eval_only'
+    t = OfflineTournament(
+        default_input_cfg=cfg_pair,
+        checkpoints=[],
+        output_dir=out_dir,
+        anchor_bots=('random',),
+        games_per_pair=2,
+        mode='round_robin',
+        seed=0,
+        device='cpu',
+        env_num=1,
+    )
+    try:
+        t._cfg_cache['__default__'] = t._prepare_cfg(cfg_pair, seed=0)
+        pol, _ = t._get_policy_slot(None, slot=0)
+        assert not hasattr(pol, '_optimizer')
+        assert not hasattr(pol, '_learn_model')
+        assert not hasattr(pol, '_target_model')
+        assert hasattr(pol, '_eval_model')
+        assert hasattr(pol, 'value_inverse_scalar_transform_handle')
+        assert not ckpt_path.exists()
+    finally:
+        t.close()
+

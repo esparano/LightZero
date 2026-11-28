@@ -539,7 +539,7 @@ class OfflineTournament:
         if (key, slot) not in self._policy_slots:
             compiled_cfg, _ = self._cfg_cache[key]
             policy = create_policy(
-                copy.deepcopy(compiled_cfg.policy), model=None, enable_field=['learn', 'eval']
+                copy.deepcopy(compiled_cfg.policy), model=None, enable_field=['eval']
             )
             self._policy_slots[(key, slot)] = (policy, compiled_cfg.policy)
         return self._policy_slots[(key, slot)]

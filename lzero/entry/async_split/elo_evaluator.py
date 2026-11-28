@@ -157,12 +157,12 @@ class AsyncEloEvaluator:
             )
             self.runner = HeadToHeadRunner(env_fn=env_fn, env_cfg=base_env_cfg, env_num=env_num)
 
-            # SampledEfficientZeroPolicy initializes value_inverse_scalar_transform_handle in _init_learn.
+            # Eval-only policies avoid allocating target models and optimizers in Elo workers.
             self.candidate_policy = create_policy(
-                copy.deepcopy(self.cfg.policy), model=None, enable_field=['learn', 'eval']
+                copy.deepcopy(self.cfg.policy), model=None, enable_field=['eval']
             )
             self.opponent_policy = create_policy(
-                copy.deepcopy(self.cfg.policy), model=None, enable_field=['learn', 'eval']
+                copy.deepcopy(self.cfg.policy), model=None, enable_field=['eval']
             )
             self._bot_players: Dict[str, EnvBotMatchPlayer] = {}
 
