@@ -105,10 +105,13 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
 
         target_model = policy._target_model
         target_device = torch.device(self._cfg.device)
-        first_param = next(target_model.parameters(), None)
-        if first_param is None or first_param.device != target_device:
+        if hasattr(target_model, 'parameters'):
+            first_param = next(target_model.parameters(), None)
+            if first_param is None or first_param.device != target_device:
+                target_model.to(target_device)
+        elif hasattr(target_model, 'to'):
             target_model.to(target_device)
-        if target_model.training:
+        if getattr(target_model, 'training', True) and hasattr(target_model, 'eval'):
             target_model.eval()
 
         reward_value_context, policy_re_context, policy_non_re_context, current_batch = self._make_batch(
@@ -1009,10 +1012,11 @@ class SampledEfficientZeroGameBuffer(EfficientZeroGameBuffer):
                                         new_sampled = np.asarray(root_sampled_actions[policy_index]).copy()
                                         if hasattr(existing_sampled, 'shape') and new_sampled.shape != existing_sampled.shape:
                                             new_sampled = new_sampled.reshape(existing_sampled.shape)
-                                        if hasattr(existing_sampled, 'dtype') and np.issubdtype(
-                                            existing_sampled.dtype, np.integer
-                                        ):
-                                            new_sampled = np.rint(new_sampled).astype(existing_sampled.dtype)
+                                        if hasattr(existing_sampled, 'dtype'):
+                                            if np.issubdtype(existing_sampled.dtype, np.integer):
+                                                new_sampled = np.rint(new_sampled).astype(existing_sampled.dtype)
+                                            elif new_sampled.dtype != existing_sampled.dtype:
+                                                new_sampled = new_sampled.astype(existing_sampled.dtype)
                                         child_visit[current_index] = policy
                                         root_value[current_index] = searched_value
                                         root_sampled_actions_seg[current_index] = new_sampled
