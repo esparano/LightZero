@@ -469,7 +469,8 @@ class DynamicsNetwork(nn.Module):
             - norm_type (:obj:`str`): The type of normalization in networks. Default sets it to 'BN'.
         """
         super().__init__()
-        assert norm_type in ['BN', 'LN'], "norm_type must in ['BN', 'LN']"
+        assert norm_type in ['BN', 'LN', 'GN'], "norm_type must in ['BN', 'LN', 'GN']"
+        mlp_norm_type = 'LN' if norm_type == 'GN' else norm_type
         assert num_channels > action_encoding_dim, f'num_channels:{num_channels} <= action_encoding_dim:{action_encoding_dim}'
 
         self.action_encoding_dim = action_encoding_dim
@@ -510,6 +511,8 @@ class DynamicsNetwork(nn.Module):
                     [self.num_latent_channels, math.ceil(observation_shape[-2] / 16), math.ceil(observation_shape[-1] / 16)])
             else:
                 self.norm_common = nn.LayerNorm([self.num_latent_channels, observation_shape[-2], observation_shape[-1]])
+        elif norm_type == 'GN':
+            self.norm_common = nn.GroupNorm(1, self.num_latent_channels)
 
         # Resblocks take the pure latent channel size
         self.resblocks = nn.ModuleList(
@@ -533,6 +536,8 @@ class DynamicsNetwork(nn.Module):
                 self.norm_reward = nn.LayerNorm([reward_head_channels, math.ceil(observation_shape[-2] / 16), math.ceil(observation_shape[-1] / 16)])
             else:
                 self.norm_reward = nn.LayerNorm([reward_head_channels, observation_shape[-2], observation_shape[-1]])
+        elif norm_type == 'GN':
+            self.norm_reward = nn.GroupNorm(1, reward_head_channels)
 
         # input_shape: （sequence_length，batch_size，input_size)
         # output_shape: (sequence_length, batch_size, hidden_size)
@@ -540,7 +545,7 @@ class DynamicsNetwork(nn.Module):
 
         if norm_type == 'BN':
             self.norm_value_prefix = nn.BatchNorm1d(self.lstm_hidden_size)
-        elif norm_type == 'LN':
+        elif norm_type in ('LN', 'GN'):
             self.norm_value_prefix = nn.LayerNorm(self.lstm_hidden_size)
 
         self.fc_reward_head = MLP(
@@ -549,7 +554,7 @@ class DynamicsNetwork(nn.Module):
             out_channels=output_support_size,
             layer_num=len(reward_head_hidden_channels) + 1,
             activation=self.activation,
-            norm_type=norm_type,
+            norm_type=mlp_norm_type,
             output_activation=False,
             output_norm=False,
             last_linear_layer_init_zero=last_linear_layer_init_zero

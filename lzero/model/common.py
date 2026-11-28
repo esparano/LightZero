@@ -287,8 +287,8 @@ class DownSample(nn.Module):
             - num_resblocks (:obj:`int`): The number of residual blocks in each stage.
         """
         super().__init__()
-        if norm_type not in ['BN', 'LN']:
-            raise ValueError(f"Unsupported norm_type: {norm_type}. Must be 'BN' or 'LN'.")
+        if norm_type not in ['BN', 'LN', 'GN']:
+            raise ValueError(f"Unsupported norm_type: {norm_type}. Must be 'BN', 'LN', or 'GN'.")
         # The original design was fixed to 1 resblock per stage.
         if num_resblocks != 1:
             logging.warning(f"DownSample is designed for num_resblocks=1, but got {num_resblocks}.")
@@ -303,6 +303,8 @@ class DownSample(nn.Module):
         elif norm_type == 'LN':
             self.norm1 = nn.LayerNorm([out_channels // 2, observation_shape[-2] // 2, observation_shape[-1] // 2],
                                       eps=1e-5)
+        elif norm_type == 'GN':
+            self.norm1 = nn.GroupNorm(1, out_channels // 2)
 
         # Stage 1 with residual blocks
         self.resblocks1 = nn.ModuleList([
@@ -831,8 +833,8 @@ class RepresentationNetwork(nn.Module):
             - group_size (:obj:`int`): Group size for `SimNorm`.
         """
         super().__init__()
-        if norm_type not in ['BN', 'LN']:
-            raise ValueError(f"Unsupported norm_type: {norm_type}. Must be 'BN' or 'LN'.")
+        if norm_type not in ['BN', 'LN', 'GN']:
+            raise ValueError(f"Unsupported norm_type: {norm_type}. Must be 'BN', 'LN', or 'GN'.")
 
         self.downsample = downsample
         self.activation = activation
@@ -850,6 +852,8 @@ class RepresentationNetwork(nn.Module):
                         eps=1e-5)
                 else:
                     self.norm = nn.LayerNorm([num_channels, observation_shape[-2], observation_shape[-1]], eps=1e-5)
+            elif norm_type == 'GN':
+                self.norm = nn.GroupNorm(1, num_channels)
 
         self.resblocks = nn.ModuleList([
             ResBlock(in_channels=num_channels, activation=activation, norm_type=norm_type, res_type='basic', bias=False)

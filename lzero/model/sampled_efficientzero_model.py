@@ -605,13 +605,14 @@ class FactoredSpatialPolicyHead(nn.Module):
 
         pass_hidden = list(pass_hidden_channels) if pass_hidden_channels is not None else []
         pass_hidden_dim = pass_hidden[0] if len(pass_hidden) > 0 else 2 * in_channels
+        mlp_norm_type = 'LN' if norm_type == 'GN' else norm_type
         self.pass_head = MLP(
             in_channels=2 * in_channels,
             hidden_channels=pass_hidden_dim,
             out_channels=1,
             layer_num=len(pass_hidden) + 1,
             activation=activation,
-            norm_type=norm_type,
+            norm_type=mlp_norm_type,
             output_activation=False,
             output_norm=False,
             last_linear_layer_init_zero=last_linear_layer_init_zero,
@@ -767,6 +768,10 @@ class PredictionNetwork(nn.Module):
         self.conv1x1_value = nn.Conv2d(num_channels, value_head_channels, 1)
         self.conv1x1_policy = nn.Conv2d(num_channels, policy_head_channels, 1)
 
+        if norm_type not in ('BN', 'LN', 'GN'):
+            raise ValueError(f"Unsupported norm_type: {norm_type}. Must be 'BN', 'LN', or 'GN'.")
+        mlp_norm_type = 'LN' if norm_type == 'GN' else norm_type
+
         if norm_type == 'BN':
             self.norm_value = nn.BatchNorm2d(value_head_channels)
             self.norm_policy = nn.BatchNorm2d(policy_head_channels)
@@ -779,6 +784,9 @@ class PredictionNetwork(nn.Module):
             else:
                 self.norm_value = nn.LayerNorm([value_head_channels, observation_shape[-2], observation_shape[-1]])
                 self.norm_policy = nn.LayerNorm([policy_head_channels, observation_shape[-2], observation_shape[-1]])
+        elif norm_type == 'GN':
+            self.norm_value = nn.GroupNorm(1, value_head_channels)
+            self.norm_policy = nn.GroupNorm(1, policy_head_channels)
 
         self.fc_value_head = MLP(
             in_channels=self.flatten_input_size_for_value_head,
@@ -786,7 +794,7 @@ class PredictionNetwork(nn.Module):
             out_channels=output_support_size,
             layer_num=len(value_head_hidden_channels) + 1,
             activation=activation,
-            norm_type=self.norm_type,
+            norm_type=mlp_norm_type,
             output_activation=False,
             output_norm=False,
             # last_linear_layer_init_zero=True is beneficial for convergence speed.
@@ -844,7 +852,7 @@ class PredictionNetwork(nn.Module):
                 out_channels=action_space_size,
                 layer_num=len(policy_head_hidden_channels) + 1,
                 activation=activation,
-                norm_type=self.norm_type,
+                norm_type=mlp_norm_type,
                 output_activation=False,
                 output_norm=False,
                 # last_linear_layer_init_zero=True is beneficial for convergence speed.

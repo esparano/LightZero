@@ -257,6 +257,101 @@ class TestSampledEfficientZeroModel:
         ]
         assert len(resblock_bns) == 4
 
+    @pytest.mark.parametrize('policy_head_type', ['flat', 'factored_spatial'])
+    def test_sampled_efficientzero_norm_type_gn(self, policy_head_type):
+        action_space_size = 1 + 4 * 4 * 4 * 4
+        conv_model = SampledEfficientZeroModel(
+            observation_shape=(4, 4, 4),
+            action_space_size=action_space_size,
+            num_res_blocks=2,
+            num_channels=8,
+            lstm_hidden_size=16,
+            reward_head_channels=4,
+            value_head_channels=4,
+            policy_head_channels=4,
+            reward_head_hidden_channels=[16],
+            value_head_hidden_channels=[16],
+            policy_head_hidden_channels=[16],
+            reward_support_range=(-1., 2., 1.),
+            value_support_range=(-1., 2., 1.),
+            proj_hid=32,
+            proj_out=32,
+            pred_hid=16,
+            pred_out=32,
+            continuous_action_space=False,
+            norm_type='GN',
+            embed_actions=True,
+            embedded_action_dim=4,
+            policy_head_type=policy_head_type,
+        )
+
+        # All 5 outer 2D conv norm layers must use GroupNorm(1, C) instead of per-pixel LayerNorm([C, H, W])
+        outer_norms = [
+            conv_model.representation_network.norm,
+            conv_model.dynamics_network.norm_common,
+            conv_model.dynamics_network.norm_reward,
+            conv_model.prediction_network.norm_value,
+            conv_model.prediction_network.norm_policy,
+        ]
+        for norm in outer_norms:
+            assert isinstance(norm, torch.nn.GroupNorm)
+            assert norm.num_groups == 1
+
+        # Zero BatchNorm and zero 3D spatial LayerNorm anywhere in repr / dynamics / prediction
+        for sub_name, sub_mod in [
+            ('representation_network', conv_model.representation_network),
+            ('dynamics_network', conv_model.dynamics_network),
+            ('prediction_network', conv_model.prediction_network),
+        ]:
+            bns = [
+                n for n, m in sub_mod.named_modules()
+                if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d))
+            ]
+            assert bns == [], f"Unexpected BatchNorm in {sub_name} under norm_type='GN': {bns}"
+            spatial_lns = [
+                n for n, m in sub_mod.named_modules()
+                if isinstance(m, torch.nn.LayerNorm) and len(m.normalized_shape) > 1
+            ]
+            assert spatial_lns == [], f"Unexpected spatial LayerNorm in {sub_name} under norm_type='GN': {spatial_lns}"
+
+        # 1D LSTM & MLP heads still use 1D LayerNorm
+        assert isinstance(conv_model.dynamics_network.norm_value_prefix, torch.nn.LayerNorm)
+        assert conv_model.dynamics_network.norm_value_prefix.normalized_shape == (16,)
+
+        # Batch size 1 in train() mode must succeed end-to-end (forward + backward)
+        conv_model.train()
+        obs = torch.randn(1, 4, 4, 4)
+        init_out = conv_model.initial_inference(obs)
+        rec_out = conv_model.recurrent_inference(
+            init_out.latent_state, init_out.reward_hidden_state, torch.zeros((1,), dtype=torch.long)
+        )
+        assert init_out.policy_logits.shape == torch.Size([1, action_space_size])
+        assert rec_out.latent_state.shape == torch.Size([1, 8, 4, 4])
+        assert rec_out.value_prefix.shape == torch.Size([1, 3])
+        (init_out.value.sum() + rec_out.value_prefix.sum() + rec_out.policy_logits.sum()).backward()
+
+        # Verify downsample=True path also supports norm_type='GN'
+        from lzero.model.common import RepresentationNetwork
+        ds_repr = RepresentationNetwork(
+            observation_shape=(3, 64, 64),
+            num_res_blocks=1,
+            num_channels=8,
+            downsample=True,
+            norm_type='GN',
+        )
+        assert isinstance(ds_repr.downsample_net.norm1, torch.nn.GroupNorm)
+        assert ds_repr.downsample_net.norm1.num_groups == 1
+
+        # Verify invalid norm_type raises ValueError cleanly
+        with pytest.raises(ValueError, match="Unsupported norm_type"):
+            SampledEfficientZeroModel(
+                observation_shape=(4, 4, 4),
+                action_space_size=action_space_size,
+                num_res_blocks=1,
+                num_channels=8,
+                norm_type='INVALID',
+            )
+
 
 if __name__ == "__main__":
     batch_size = 2

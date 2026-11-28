@@ -109,7 +109,7 @@ class TestFactoredSpatialPolicyHead:
 
     @pytest.mark.parametrize('grid_h,grid_w', [(4, 4), (3, 5)])
     @pytest.mark.parametrize('num_pair_layers', [1, 2])
-    @pytest.mark.parametrize('norm_type', ['LN', 'BN'])
+    @pytest.mark.parametrize('norm_type', ['LN', 'BN', 'GN'])
     def test_output_shape_and_exact_action_layout(self, grid_h, grid_w, num_pair_layers, norm_type):
         torch.manual_seed(0)
         n = grid_h * grid_w
