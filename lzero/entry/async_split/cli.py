@@ -339,6 +339,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument('--actor-device', default='cpu', choices=['cpu', 'cuda', 'auto'])
     p_launch.add_argument('--actor-env-num', type=int, default=None)
     p_launch.add_argument('--actor-n-episode', type=int, default=None)
+    p_launch.add_argument(
+        '--num-gpu-actors',
+        type=int,
+        default=0,
+        help='Number of additional CUDA self-play actor processes for hybrid CPU+GPU actor setups.',
+    )
+    p_launch.add_argument(
+        '--gpu-actor-env-num',
+        type=int,
+        default=None,
+        help='Override collector_env_num for --num-gpu-actors (e.g. 32; falls back to --actor-env-num).',
+    )
+    p_launch.add_argument(
+        '--gpu-actor-n-episode',
+        type=int,
+        default=None,
+        help='Override n_episode for --num-gpu-actors (defaults to --gpu-actor-env-num when set, else --actor-n-episode).',
+    )
     p_launch.add_argument('--learner-device', default='auto', choices=['cpu', 'cuda', 'auto'])
     p_launch.add_argument('--model-path', default=None)
     p_launch.add_argument(
@@ -473,8 +491,10 @@ def _run_launch(args: argparse.Namespace) -> int:
     proc_log_dir = dirs.log_dir / 'procs'
     proc_log_dir.mkdir(parents=True, exist_ok=True)
 
+    num_std_actors = max(0, int(args.num_actors))
+    num_gpu_actors = max(0, int(getattr(args, 'num_gpu_actors', 0) or 0))
     worker_env = _build_worker_env(
-        num_actors=int(args.num_actors),
+        num_actors=num_std_actors + num_gpu_actors,
         include_evaluator=not bool(args.no_evaluator),
         worker_threads=args.worker_threads,
     )
@@ -565,7 +585,7 @@ def _run_launch(args: argparse.Namespace) -> int:
                 exit_code = int(early_rc or 0)
                 return exit_code
 
-        for i in range(max(0, int(args.num_actors))):
+        for i in range(num_std_actors):
             actor_cmd = base_cmd + [
                 'actor',
                 '--config', args.config,
@@ -582,6 +602,38 @@ def _run_launch(args: argparse.Namespace) -> int:
             if args.env_manager is not None:
                 actor_cmd += ['--env-manager', args.env_manager]
             _spawn(f'actor_{i}', actor_cmd, device=args.actor_device)
+
+        gpu_env_num = (
+            args.gpu_actor_env_num
+            if getattr(args, 'gpu_actor_env_num', None) is not None
+            else args.actor_env_num
+        )
+        gpu_n_episode = (
+            args.gpu_actor_n_episode
+            if getattr(args, 'gpu_actor_n_episode', None) is not None
+            else (
+                args.gpu_actor_env_num
+                if getattr(args, 'gpu_actor_env_num', None) is not None
+                else args.actor_n_episode
+            )
+        )
+        for j in range(num_gpu_actors):
+            gpu_actor_cmd = base_cmd + [
+                'actor',
+                '--config', args.config,
+                '--run-dir', str(dirs.root_dir),
+                '--actor-id', f'gpu_actor_{j}',
+                '--seed', str(args.seed + 500 + j),
+                '--device', 'cuda',
+                '--wait-for-initial-weights',
+            ]
+            if gpu_env_num is not None:
+                gpu_actor_cmd += ['--env-num', str(gpu_env_num)]
+            if gpu_n_episode is not None:
+                gpu_actor_cmd += ['--n-episode', str(gpu_n_episode)]
+            if args.env_manager is not None:
+                gpu_actor_cmd += ['--env-manager', args.env_manager]
+            _spawn(f'gpu_actor_{j}', gpu_actor_cmd, device='cuda')
 
         if not args.no_evaluator:
             eval_cmd = base_cmd + [

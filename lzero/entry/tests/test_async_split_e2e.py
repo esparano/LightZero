@@ -716,3 +716,96 @@ def test_galcon_async_split_on_the_fly_symmetry_e2e(tmp_path):
     finally:
         actor.close()
         learner.close()
+
+
+@pytest.mark.unittest
+def test_launch_hybrid_cpu_and_gpu_actors(tmp_path, monkeypatch):
+    """Verify --num-gpu-actors launches hybrid CPU + CUDA actors with disjoint IDs/seeds,
+    proper env_num/n_episode defaulting, and CUDA isolation only on CPU workers.
+    """
+    from lzero.entry.async_split import cli as cli_mod
+    from lzero.entry.async_split.cli import build_parser
+
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0')
+    monkeypatch.setattr(cli_mod, 'load_config_from_py', lambda _p: (EasyDict(exp_name='x'), EasyDict()))
+
+    spawned = []
+
+    class _FakeProc:
+        def __init__(self, cmd, env):
+            self.cmd = list(cmd)
+            self.env = dict(env)
+            self._rc = 0 if cmd[3] == 'learner' else None
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            self._rc = 0
+
+        def wait(self, timeout=None):
+            self._rc = 0
+            return 0
+
+        def kill(self):
+            self._rc = -9
+
+    def _fake_popen(cmd, stdout=None, stderr=None, env=None):
+        proc = _FakeProc(cmd, env or {})
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli_mod.subprocess, 'Popen', _fake_popen)
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            'launch',
+            '--config', 'dummy.py',
+            '--run-dir', str(tmp_path / 'run_hybrid'),
+            '--seed', '7',
+            '--num-actors', '3',
+            '--actor-device', 'cpu',
+            '--actor-env-num', '4',
+            '--actor-n-episode', '4',
+            '--num-gpu-actors', '2',
+            '--gpu-actor-env-num', '32',
+            '--env-manager', 'base',
+            '--learner-device', 'cuda',
+            '--eval-device', 'cpu',
+            '--worker-threads', '1',
+        ]
+    )
+    rc = cli_mod._run_launch(args)
+    assert rc == 0
+    assert len(spawned) == 7  # 1 learner + 3 CPU actors + 2 GPU actors + 1 evaluator
+
+    def _flag_val(cmd, flag):
+        idx = cmd.index(flag)
+        return cmd[idx + 1]
+
+    actors = [p for p in spawned if p.cmd[3] == 'actor']
+    assert len(actors) == 5
+    cpu_actors = [p for p in actors if _flag_val(p.cmd, '--device') == 'cpu']
+    gpu_actors = [p for p in actors if _flag_val(p.cmd, '--device') == 'cuda']
+    assert len(cpu_actors) == 3
+    assert len(gpu_actors) == 2
+
+    # Disjoint actor IDs and seeds across CPU and GPU actors
+    all_ids = [_flag_val(p.cmd, '--actor-id') for p in actors]
+    all_seeds = [_flag_val(p.cmd, '--seed') for p in actors]
+    assert len(set(all_ids)) == 5
+    assert len(set(all_seeds)) == 5
+
+    # CPU actors isolate CUDA and keep env=4, n_episode=4
+    for p in cpu_actors:
+        assert p.env.get('CUDA_VISIBLE_DEVICES') == ''
+        assert _flag_val(p.cmd, '--env-num') == '4'
+        assert _flag_val(p.cmd, '--n-episode') == '4'
+
+    # GPU actors keep CUDA visible, use env=32, and default n_episode=32
+    for p in gpu_actors:
+        assert p.env.get('CUDA_VISIBLE_DEVICES') == '0'
+        assert _flag_val(p.cmd, '--env-num') == '32'
+        assert _flag_val(p.cmd, '--n-episode') == '32'
+        assert _flag_val(p.cmd, '--env-manager') == 'base'
