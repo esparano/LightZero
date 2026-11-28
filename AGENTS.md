@@ -6,6 +6,8 @@
   - Python: `/home/evan/miniconda3/envs/lightzero/bin/python3`
   - Pytest: `/home/evan/miniconda3/envs/lightzero/bin/pytest`
   - TensorBoard: `/home/evan/miniconda3/envs/lightzero/bin/tensorboard`
+- **Galcon dependency (`galcon-bot-arena`):**
+  Galcon's C++17 physics simulator, native C++ benchmark bots, MCTS search engine, Bradley-Terry Elo solver, and 20 Hz HTML5 replay viewer live in [`esparano/galcon-bot-arena`](https://github.com/esparano/galcon-bot-arena) (local checkout: `/mnt/c/Users/Evan/Documents/GitHub/galcon-bot-arena`). Install it into the `lightzero` conda env via `pip install -e /path/to/galcon-bot-arena` (or `pip install -r requirements-galcon.txt` / `pip install -e ".[galcon]"`). This environment currently links the local checkout via `galcon_bot_arena.pth`.
 - **Running TensorBoard on WSL:**
   Always pass `--load_fast=false --host 0.0.0.0` (the default Rust data server can hang in WSL), and verify the port is listening (`ss -tlnp | grep 6006` or the `TensorBoard ... at http://` log line) **before** giving the user the URL.
   Always link TensorBoard as a clean Markdown hyperlink (not a raw wall-of-text URL) using the `?pinnedCards=...#timeseries` format so key `*_iter/` + async metrics auto-pin:

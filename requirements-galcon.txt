@@ -1,0 +1,1 @@
+galcon-bot-arena @ git+https://github.com/esparano/galcon-bot-arena.git

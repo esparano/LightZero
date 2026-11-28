@@ -5,6 +5,7 @@ Scoped rules for work inside `zoo/board_games/galcon/`.
 ## 1. Environment & Observation Layout
 
 - **Primary env:** `zoo/board_games/galcon/envs/galcon_env.py` (`GalconEnv`, registered as `'galcon'`).
+- **Shared backend (`galcon_bot_arena`):** The C++17 simulator (`cpp_sim/`), native C++ benchmark bots (`cpp_bots/`), MCTS search (`mcts_bot.py`), Bradley-Terry Elo solver (`lzero/worker/elo_rating.py`), and 20 Hz HTML5 replay viewer (`eval/replay_viewer.py`) are thin shims delegating to [`esparano/galcon-bot-arena`](https://github.com/esparano/galcon-bot-arena) (`requirements-galcon.txt`). Edit simulator/bot/replay/Elo implementations in `galcon-bot-arena` rather than duplicating them here.
 - **Active training config:** `zoo/board_games/galcon/config/galcon_sez_sp_mode_config_SIMPLE_1map.py`.
 - **Observation shape:** `(C, H, W)` where `C = 8 (planets) + 2 * (fleet_top_k + 1) * 5 (friendly/enemy fleets) + len(LANDING_BUCKETS) * 4 (landings)`.
   - Currently `C = 40` for `fleet_top_k = 1` with 3 landing buckets (`(40, 8, 8)` on `SIMPLE_1map`).
