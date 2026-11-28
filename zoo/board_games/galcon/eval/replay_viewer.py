@@ -21,11 +21,8 @@ Example::
 from __future__ import annotations
 
 import argparse
-import base64
 import copy
 import importlib.util
-import io
-import json
 import math
 import os
 from collections import deque
@@ -34,6 +31,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from galcon_bot_arena.replay import (  # noqa: F401
+    BUNDLED_ASSETS_DIR,
+    BUNDLED_SHIP_SKINS,
+    DEFAULT_G2_DATA_DIRS,
+    G2_SHIP_SKINS,
+    TEMPLATE_PATH,
+    _alpha_key_g2_color_fx,
+    _find_landed_units,
+    _tint_g2_sprite,
+    find_g2_data_dir,
+    load_g2_sprites,
+    render_replay_html,
+)
 from zoo.board_games.galcon.envs.cpp_sim import (
     DEFAULT_PHYSICS_SUBSTEPS,
     GalconSim as _CppSimFallback,
@@ -41,207 +51,6 @@ from zoo.board_games.galcon.envs.cpp_sim import (
     step_physics_cpp,
 )
 from zoo.board_games.galcon.envs.galcon_env import GalconEnv
-
-TEMPLATE_PATH = Path(__file__).with_name("replay_viewer_template.html")
-BUNDLED_ASSETS_DIR = Path(__file__).with_name("assets")
-
-BUNDLED_SHIP_SKINS: Tuple[Tuple[str, str, str], ...] = (
-    ("classic", "Classic Hollow", "ship-classic.png"),
-)
-
-G2_SHIP_SKINS: Tuple[Tuple[str, str, str], ...] = (
-    ("classic", "G2 Classic (ship-0)", "ship-0.png"),
-)
-
-DEFAULT_G2_DATA_DIRS: Tuple[Path, ...] = (
-    Path("/mnt/c/Program Files (x86)/Steam/steamapps/common/Galcon 2/data"),
-    Path("/mnt/c/Program Files/Steam/steamapps/common/Galcon 2/data"),
-    Path(r"C:\Program Files (x86)\Steam\steamapps\common\Galcon 2\data"),
-    Path(r"C:\Program Files\Steam\steamapps\common\Galcon 2\data"),
-)
-
-
-def find_g2_data_dir(explicit_dir: Optional[str | os.PathLike] = None) -> Optional[Path]:
-    """Return the first existing Galcon 2 ``data/`` directory containing ``ship-0.png``."""
-    candidates: List[Path] = []
-    if explicit_dir is not None:
-        candidates.append(Path(explicit_dir))
-    env_dir = os.environ.get("GALCON2_DATA_DIR")
-    if env_dir:
-        candidates.append(Path(env_dir))
-    if explicit_dir is None and not env_dir:
-        candidates.extend(DEFAULT_G2_DATA_DIRS)
-    for path in candidates:
-        try:
-            if (path / "ship-0.png").is_file():
-                return path
-        except OSError:
-            continue
-    return None
-
-
-def _tint_g2_sprite(png_path: Path, rgb: Tuple[int, int, int]) -> str:
-    """Alpha-key a black-background grayscale G2 glow sprite into a neon-tinted PNG data URI."""
-    from PIL import Image
-
-    im = Image.open(png_path).convert("L")
-    w, h = im.size
-    out = Image.new("RGBA", (w, h))
-    src = im.load()
-    dst = out.load()
-    r0, g0, b0 = rgb
-    for y in range(h):
-        for x in range(w):
-            v = src[x, y] / 255.0
-            if v <= 0.004:
-                dst[x, y] = (0, 0, 0, 0)
-            else:
-                core = (v ** 3) * 0.42
-                r = int(min(255, round(r0 + (255 - r0) * core)))
-                g = int(min(255, round(g0 + (255 - g0) * core)))
-                b = int(min(255, round(b0 + (255 - b0) * core)))
-                a = int(min(255, round(v * 255)))
-                dst[x, y] = (r, g, b, a)
-    buf = io.BytesIO()
-    out.save(buf, format="PNG", optimize=True)
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-
-
-def _alpha_key_g2_color_fx(png_path: Path) -> str:
-    """Convert a black-background color G2 FX sprite (spark.png / spark-1.png) into RGBA."""
-    from PIL import Image
-
-    im = Image.open(png_path).convert("RGB")
-    w, h = im.size
-    out = Image.new("RGBA", (w, h))
-    src = im.load()
-    dst = out.load()
-    for y in range(h):
-        for x in range(w):
-            r, g, b = src[x, y]
-            mx = max(r, g, b)
-            if mx <= 2:
-                dst[x, y] = (0, 0, 0, 0)
-            else:
-                scale = 255.0 / mx
-                dst[x, y] = (
-                    min(255, int(round(r * scale))),
-                    min(255, int(round(g * scale))),
-                    min(255, int(round(b * scale))),
-                    mx,
-                )
-    buf = io.BytesIO()
-    out.save(buf, format="PNG", optimize=True)
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-
-
-def load_g2_sprites(
-    g2_data_dir: Optional[str | os.PathLike] = None,
-    use_bundled: bool = True,
-) -> Dict[str, Dict[str, Any]]:
-    """Load ship and spark sprites for the HTML replay viewer.
-
-    Uses the repo-bundled original sprites in ``zoo/board_games/galcon/eval/assets/`` by default
-    so replays render identically on every machine without copyrighted external assets. If
-    ``g2_data_dir`` (or ``GALCON2_DATA_DIR``) is explicitly provided and contains ``ship-0.png``,
-    those local sprites override the bundled ones.
-    """
-    try:
-        import PIL  # noqa: F401
-    except ImportError:
-        return {"ships": {}, "fx": {}}
-
-    explicit_g2 = g2_data_dir is not None or bool(os.environ.get("GALCON2_DATA_DIR"))
-    if explicit_g2:
-        g2_root = find_g2_data_dir(g2_data_dir)
-        if g2_root is not None:
-            assets: Dict[str, Dict[str, Any]] = {"ships": {}, "fx": {}}
-            for key, label, fname in G2_SHIP_SKINS:
-                fpath = g2_root / fname
-                if fpath.is_file():
-                    assets["ships"][key] = {
-                        "label": label,
-                        "file": fname,
-                        "p1": _tint_g2_sprite(fpath, (74, 158, 255)),
-                        "p2": _tint_g2_sprite(fpath, (255, 92, 92)),
-                    }
-            spark_path = g2_root / "spark.png"
-            spark_glow_path = g2_root / "spark-1.png"
-            if spark_path.is_file():
-                assets["fx"]["spark_hostile"] = _alpha_key_g2_color_fx(spark_path)
-            if spark_glow_path.is_file():
-                assets["fx"]["spark_glow"] = _alpha_key_g2_color_fx(spark_glow_path)
-            return assets
-
-    if use_bundled and (BUNDLED_ASSETS_DIR / "ship-classic.png").is_file():
-        assets = {"ships": {}, "fx": {}}
-        for key, label, fname in BUNDLED_SHIP_SKINS:
-            fpath = BUNDLED_ASSETS_DIR / fname
-            if fpath.is_file():
-                assets["ships"][key] = {
-                    "label": label,
-                    "file": fname,
-                    "p1": _tint_g2_sprite(fpath, (74, 158, 255)),
-                    "p2": _tint_g2_sprite(fpath, (255, 92, 92)),
-                }
-        spark_path = BUNDLED_ASSETS_DIR / "spark.png"
-        spark_glow_path = BUNDLED_ASSETS_DIR / "spark-glow.png"
-        if spark_path.is_file():
-            assets["fx"]["spark_hostile"] = _alpha_key_g2_color_fx(spark_path)
-        if spark_glow_path.is_file():
-            assets["fx"]["spark_glow"] = _alpha_key_g2_color_fx(spark_glow_path)
-        return assets
-
-    return {"ships": {}, "fx": {}}
-
-
-def _find_landed_units(
-    before_units: Sequence[Sequence[float]],
-    before_headings: Sequence[Sequence[float]],
-    after_units: Sequence[Sequence[float]],
-    step_dist: float,
-) -> List[Tuple[float, float]]:
-    """Order-preserving DP match over a single 0.05s substep to identify landed unit coordinates."""
-    n = len(before_units)
-    m = len(after_units)
-    if m >= n:
-        return []
-    if m == 0:
-        return [(float(u[0]), float(u[1])) for u in before_units]
-
-    inf = 1e18
-    dp = [[inf] * (m + 1) for _ in range(n + 1)]
-    take = [[False] * (m + 1) for _ in range(n + 1)]
-    for i in range(n + 1):
-        dp[i][0] = 0.0
-    for i in range(1, n + 1):
-        u = before_units[i - 1]
-        h = before_headings[i - 1]
-        px = float(u[0]) + step_dist * float(h[0])
-        py = float(u[1]) + step_dist * float(h[1])
-        for j in range(1, min(i, m) + 1):
-            best = dp[i - 1][j]
-            chose = False
-            b = after_units[j - 1]
-            dx = px - float(b[0])
-            dy = py - float(b[1])
-            c = dp[i - 1][j - 1] + dx * dx + dy * dy
-            if c < best:
-                best = c
-                chose = True
-            dp[i][j] = best
-            take[i][j] = chose
-
-    matched = set()
-    i, j = n, m
-    while j > 0 and i > 0:
-        if take[i][j]:
-            matched.add(i - 1)
-            i -= 1
-            j -= 1
-        else:
-            i -= 1
-    return [(float(before_units[k][0]), float(before_units[k][1])) for k in range(n) if k not in matched]
 
 
 def _step_one_substep_physics(env: GalconEnv, sub_dt: float) -> None:
@@ -469,25 +278,6 @@ def record_match_20hz(
         "planets": planets_static,
         "frames": frames,
     }
-
-
-def render_replay_html(
-    replays: Sequence[Dict[str, Any]],
-    g2_data_dir: Optional[str | os.PathLike] = None,
-    template_path: Path = TEMPLATE_PATH,
-) -> str:
-    """Embed recorded 20 Hz replays and optional real G2 sprites into a self-contained HTML string."""
-    html = Path(template_path).read_text(encoding="utf-8")
-    replays_json = json.dumps(list(replays), separators=(",", ":"))
-    sprites_json = json.dumps(load_g2_sprites(g2_data_dir), separators=(",", ":"))
-    if "/*__REPLAY_DATA__*/[]" not in html:
-        raise ValueError(f"Missing replay placeholder in {template_path}")
-    if "/*__G2_SPRITES__*/{ ships: {}, fx: {} }" not in html:
-        raise ValueError(f"Missing sprites placeholder in {template_path}")
-    return (
-        html.replace("/*__REPLAY_DATA__*/[]", replays_json, 1)
-        .replace("/*__G2_SPRITES__*/{ ships: {}, fx: {} }", sprites_json, 1)
-    )
 
 
 def _load_config_module(config_path: str):

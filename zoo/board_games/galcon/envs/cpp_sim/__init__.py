@@ -1,17 +1,31 @@
-"""Calibrated C++17 / Python Galcon multi-ship physics engine for LightZero GalconEnv."""
+"""Re-export shim delegating the C++17 / Python Galcon physics simulator to ``galcon_bot_arena.sim``."""
 
-from .fast_sim_cpp import EnvCppSimHandle, FastGalconCppSim, HAS_FAST_SIM_CPP, step_physics_cpp
-from .sim import (
+from galcon_bot_arena.sim import (  # noqa: F401
     BASE_ITEM_USERS,
+    DEFAULT_FLEET_SPEED,
+    DEFAULT_MAP_HEIGHT,
+    DEFAULT_MAP_WIDTH,
+    DEFAULT_MAX_TICKS,
     DEFAULT_PHYSICS_SUBSTEPS,
+    DEFAULT_TICK_DT,
+    EnvCppSimHandle,
+    FastGalconCppSim,
+    GalconSim,
+    HAS_FAST_SIM_CPP,
+    MIN_PLANET_GAP,
+    PRODUCTION_DIVISOR,
+    RedirOrder,
     SHIP_RADIUS,
     SPAWN_AREA_RADIUS,
-    Fleet as SimFleet,
-    GalconSim,
-    Planet as SimPlanet,
-    RedirOrder,
     SendOrder,
+    SimFleet,
+    SimPlanet,
+    _spawn_hash_u01,
+    evaluate_galcon_state,
+    generate_galcon_map,
     physical_ship_count,
+    planet_radius_from_production,
+    step_physics_cpp,
 )
 
 __all__ = [
@@ -21,12 +35,16 @@ __all__ = [
     "FastGalconCppSim",
     "GalconSim",
     "HAS_FAST_SIM_CPP",
+    "MIN_PLANET_GAP",
     "RedirOrder",
     "SHIP_RADIUS",
     "SPAWN_AREA_RADIUS",
     "SendOrder",
     "SimFleet",
     "SimPlanet",
+    "_spawn_hash_u01",
+    "evaluate_galcon_state",
+    "generate_galcon_map",
     "physical_ship_count",
     "step_physics_cpp",
 ]
