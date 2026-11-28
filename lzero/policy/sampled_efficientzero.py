@@ -221,6 +221,9 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         weight_decay=1e-4,
         momentum=0.9,
         grad_clip_value=10,
+        # (Optional[str]) Optional torch.compile mode for the discrete forward+loss step on CUDA
+        # (e.g. 'reduce-overhead' for Inductor + CUDA Graphs, 'default', or None to disable).
+        compile_mode=None,
         # You can use either "n_sample" or "n_episode" in collector.collect.
         # Get "n_episode" episodes per collect.
         n_episode=8,
@@ -411,6 +414,179 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             )
         self._init_scalar_transforms()
 
+        self._compiled_learn_loss_disc = None
+        compile_mode = getattr(self._cfg, 'compile_mode', None)
+        if compile_mode:
+            if (
+                not self._cfg.model.continuous_action_space
+                and str(self._cfg.device).startswith('cuda')
+                and torch.cuda.is_available()
+                and hasattr(torch, 'compile')
+            ):
+                self._compiled_learn_loss_disc = torch.compile(
+                    self._compute_learn_loss_disc, mode=compile_mode
+                )
+                logging.info(
+                    f'[SampledEfficientZeroPolicy] Enabled torch.compile(mode={compile_mode!r}) '
+                    'for discrete learn forward+loss (model state_dict keys unchanged).'
+                )
+            else:
+                logging.warning(
+                    f'[SampledEfficientZeroPolicy] Ignoring compile_mode={compile_mode!r} '
+                    '(requires discrete action space, CUDA device, and torch.compile).'
+                )
+
+    def _compute_learn_loss_disc(
+        self,
+        obs_batch: torch.Tensor,
+        obs_target_batch: torch.Tensor,
+        action_batch: torch.Tensor,
+        mask_batch: torch.Tensor,
+        target_value_prefix: torch.Tensor,
+        target_value: torch.Tensor,
+        target_policy: torch.Tensor,
+        weights: torch.Tensor,
+        child_sampled_actions_batch: torch.Tensor,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Pure-tensor discrete-action forward + unroll + loss computation.
+
+        Factored out of ``_forward_learn`` so it can be wrapped in ``torch.compile``
+        without wrapping ``self._learn_model`` (preserving ``state_dict`` keys).
+        """
+        target_value_prefix = target_value_prefix.view(self._cfg.batch_size, -1)
+        target_value = target_value.view(self._cfg.batch_size, -1)
+
+        transformed_target_value_prefix = scalar_transform(target_value_prefix)
+        transformed_target_value = scalar_transform(target_value)
+        target_value_prefix_categorical = phi_transform(self.reward_support, transformed_target_value_prefix)
+        target_value_categorical = phi_transform(self.value_support, transformed_target_value)
+
+        network_output = self._learn_model.initial_inference(obs_batch)
+        latent_state, value_prefix, reward_hidden_state, value, policy_logits = ez_network_output_unpack(
+            network_output
+        )
+
+        # Detach value before InverseScalarTransform (which uses in-place mul_ and is only
+        # used for priority/logging metrics, never backpropagated).
+        original_value = self.value_inverse_scalar_transform_handle(value.detach())
+
+        device = obs_batch.device
+        if self._cfg.monitor_extra_statistics:
+            predicted_values_sum = original_value.detach().mean()
+            predicted_value_prefixs_sum = torch.zeros((), device=device, dtype=original_value.dtype)
+        else:
+            predicted_values_sum = torch.zeros((), device=device, dtype=torch.float32)
+            predicted_value_prefixs_sum = torch.zeros((), device=device, dtype=torch.float32)
+
+        value_priority_tensor = L1Loss(reduction='none')(original_value.squeeze(-1), target_value[:, 0]).detach() + 1e-6
+
+        value_loss = cross_entropy_loss(value, target_value_categorical[:, 0])
+        policy_loss = torch.zeros(self._cfg.batch_size, device=device)
+
+        root_policy_action0_prob = torch.softmax(policy_logits.detach(), dim=-1)[:, 0].mean()
+        policy_loss, policy_entropy, policy_entropy_loss, target_policy_entropy, target_sampled_actions = (
+            self._calculate_policy_loss_disc(
+                policy_loss, policy_logits, target_policy, mask_batch, child_sampled_actions_batch, unroll_step=0
+            )
+        )
+
+        value_prefix_loss = torch.zeros(self._cfg.batch_size, device=device)
+        consistency_loss = torch.zeros(self._cfg.batch_size, device=device)
+
+        ssl_obs_projs = None
+        if (
+            self._cfg.model.self_supervised_learning_loss
+            and self._cfg.ssl_loss_weight > 0
+            and self._cfg.num_unroll_steps > 0
+        ):
+            target_obs_slices = [
+                obs_target_batch[:, beg:end]
+                for beg, end in (
+                    self._get_target_obs_index_in_step_k(k) for k in range(self._cfg.num_unroll_steps)
+                )
+            ]
+            batched_target_obs = torch.cat(target_obs_slices, dim=0)
+            with torch.no_grad():
+                if hasattr(self._learn_model, '_representation'):
+                    batched_repr_states = self._learn_model._representation(batched_target_obs)
+                else:
+                    batched_repr_states = self._learn_model.initial_inference(batched_target_obs).latent_state
+                batched_obs_proj = self._learn_model.project(batched_repr_states, with_grad=False)
+            ssl_obs_projs = batched_obs_proj.chunk(self._cfg.num_unroll_steps, dim=0)
+
+        for step_k in range(self._cfg.num_unroll_steps):
+            network_output = self._learn_model.recurrent_inference(
+                latent_state, reward_hidden_state, action_batch[:, step_k]
+            )
+            latent_state, value_prefix, reward_hidden_state, value, policy_logits = ez_network_output_unpack(
+                network_output
+            )
+
+            if ssl_obs_projs is not None:
+                dynamic_proj = self._learn_model.project(latent_state, with_grad=True)
+                observation_proj = ssl_obs_projs[step_k]
+                temp_loss = negative_cosine_similarity(dynamic_proj, observation_proj) * mask_batch[:, step_k]
+                consistency_loss = consistency_loss + temp_loss
+
+            policy_loss, policy_entropy, policy_entropy_loss, target_policy_entropy, target_sampled_actions = (
+                self._calculate_policy_loss_disc(
+                    policy_loss,
+                    policy_logits,
+                    target_policy,
+                    mask_batch,
+                    child_sampled_actions_batch,
+                    unroll_step=step_k + 1,
+                )
+            )
+
+            value_loss = value_loss + cross_entropy_loss(value, target_value_categorical[:, step_k + 1])
+            value_prefix_loss = value_prefix_loss + cross_entropy_loss(
+                value_prefix, target_value_prefix_categorical[:, step_k]
+            )
+
+            if (step_k + 1) % self._cfg.lstm_horizon_len == 0:
+                reward_hidden_state = (
+                    torch.zeros(1, self._cfg.batch_size, self._cfg.model.lstm_hidden_size, device=device),
+                    torch.zeros(1, self._cfg.batch_size, self._cfg.model.lstm_hidden_size, device=device),
+                )
+
+            if self._cfg.monitor_extra_statistics:
+                with torch.no_grad():
+                    predicted_value_prefixs_sum = predicted_value_prefixs_sum + self.reward_inverse_scalar_transform_handle(
+                        value_prefix.detach()
+                    ).mean()
+                    predicted_values_sum = predicted_values_sum + self.value_inverse_scalar_transform_handle(
+                        value.detach()
+                    ).mean()
+
+        loss = (
+            self._cfg.ssl_loss_weight * consistency_loss
+            + self._cfg.policy_loss_weight * policy_loss
+            + self._cfg.value_loss_weight * value_loss
+            + self._cfg.reward_loss_weight * value_prefix_loss
+            + self._cfg.policy_entropy_weight * policy_entropy_loss
+        )
+        weighted_total_loss = (weights * loss).mean()
+        return (
+            weighted_total_loss,
+            loss.detach().mean().float(),
+            policy_loss.detach().mean().float(),
+            policy_entropy.detach().float(),
+            target_policy_entropy.detach().float(),
+            value_prefix_loss.detach().mean().float(),
+            value_loss.detach().mean().float(),
+            consistency_loss.detach().mean().float(),
+            target_value_prefix.detach().mean().float(),
+            target_value.detach().mean().float(),
+            transformed_target_value_prefix.detach().mean().float(),
+            transformed_target_value.detach().mean().float(),
+            predicted_value_prefixs_sum.detach().float(),
+            predicted_values_sum.detach().float(),
+            target_sampled_actions.detach().float(),
+            root_policy_action0_prob.detach().float(),
+            value_priority_tensor,
+        )
+
     def _forward_learn(self, data: torch.Tensor) -> Dict[str, Union[float, int]]:
         # torch.autograd.set_detect_anomaly(True)
         """
@@ -472,6 +648,157 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
 
         assert obs_batch.size(0) == self._cfg.batch_size == target_value_prefix.size(0)
 
+        if not self._cfg.model.continuous_action_space:
+            compute_fn = (
+                self._compiled_learn_loss_disc
+                if self._compiled_learn_loss_disc is not None
+                else self._compute_learn_loss_disc
+            )
+            if (
+                self._compiled_learn_loss_disc is not None
+                and getattr(self._cfg, 'compile_mode', None) == 'reduce-overhead'
+                and hasattr(torch, 'compiler')
+                and hasattr(torch.compiler, 'cudagraph_mark_step_begin')
+            ):
+                torch.compiler.cudagraph_mark_step_begin()
+            (
+                weighted_total_loss,
+                loss_mean_s,
+                policy_loss_mean_s,
+                policy_entropy_s,
+                target_policy_entropy_s,
+                value_prefix_loss_mean_s,
+                value_loss_mean_s,
+                consistency_loss_mean_s,
+                target_value_prefix_mean_s,
+                target_value_mean_s,
+                transformed_target_value_prefix_mean_s,
+                transformed_target_value_mean_s,
+                predicted_value_prefixs_sum,
+                predicted_values_sum,
+                target_sampled_actions,
+                root_policy_action0_prob,
+                value_priority_tensor,
+            ) = compute_fn(
+                obs_batch,
+                obs_target_batch,
+                action_batch,
+                mask_batch,
+                target_value_prefix,
+                target_value,
+                target_policy,
+                weights,
+                child_sampled_actions_batch,
+            )
+
+            gradient_scale = 1 / self._cfg.num_unroll_steps
+            self._optimizer.zero_grad()
+            (weighted_total_loss * gradient_scale).backward()
+            if self._cfg.multi_gpu:
+                self.sync_gradients(self._learn_model)
+            total_grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
+                self._learn_model.parameters(), self._cfg.grad_clip_value
+            )
+            self._optimizer.step()
+            if self._cfg.cos_lr_scheduler or self._cfg.piecewise_decay_lr_scheduler:
+                self.lr_scheduler.step()
+
+            self._target_model.update(self._learn_model.state_dict())
+
+            with torch.no_grad():
+                device = weighted_total_loss.device
+                zero_scalar = torch.zeros((), device=device, dtype=torch.float32)
+                grad_norm_scalar = (
+                    total_grad_norm_before_clip.detach().float()
+                    if isinstance(total_grad_norm_before_clip, torch.Tensor)
+                    else torch.tensor(float(total_grad_norm_before_clip), device=device, dtype=torch.float32)
+                )
+                pred_vp_scalar = (
+                    (predicted_value_prefixs_sum / self._cfg.num_unroll_steps).detach().float()
+                    if (self._cfg.monitor_extra_statistics and self._cfg.num_unroll_steps > 0)
+                    else zero_scalar
+                )
+                pred_v_scalar = (
+                    (predicted_values_sum / (self._cfg.num_unroll_steps + 1)).detach().float()
+                    if self._cfg.monitor_extra_statistics
+                    else zero_scalar
+                )
+                tsa_f = target_sampled_actions.detach().float()
+                stat_tensors = [
+                    weighted_total_loss.detach().float(),
+                    loss_mean_s,
+                    policy_loss_mean_s,
+                    policy_entropy_s,
+                    target_policy_entropy_s,
+                    value_prefix_loss_mean_s,
+                    value_loss_mean_s,
+                    consistency_loss_mean_s,
+                    target_value_prefix_mean_s,
+                    target_value_mean_s,
+                    transformed_target_value_prefix_mean_s,
+                    transformed_target_value_mean_s,
+                    pred_vp_scalar,
+                    pred_v_scalar,
+                    grad_norm_scalar,
+                    tsa_f.max(),
+                    tsa_f.min(),
+                    tsa_f.mean(),
+                    (action_batch[:, 0] == 0).float().mean(),
+                    root_policy_action0_prob.detach().float(),
+                ]
+                stats_cpu = torch.stack(stat_tensors).cpu().tolist()
+
+            value_priority = value_priority_tensor.cpu().numpy()
+            (
+                weighted_total_loss_v,
+                total_loss_v,
+                policy_loss_v,
+                policy_entropy_v,
+                target_policy_entropy_v,
+                value_prefix_loss_v,
+                value_loss_v,
+                consistency_loss_v,
+                target_value_prefix_v,
+                target_value_v,
+                transformed_target_value_prefix_v,
+                transformed_target_value_v,
+                predicted_value_prefixs_mean,
+                predicted_values_mean,
+                total_grad_norm_v,
+                tsa_max,
+                tsa_min,
+                tsa_mean,
+                action0_rate,
+                action0_prob,
+            ) = stats_cpu
+
+            return {
+                'cur_lr': self._optimizer.param_groups[0]['lr'],
+                'collect_mcts_temperature': self._collect_mcts_temperature,
+                'weighted_total_loss': weighted_total_loss_v,
+                'total_loss': total_loss_v,
+                'policy_loss': policy_loss_v,
+                'policy_entropy': policy_entropy_v / (self._cfg.num_unroll_steps + 1),
+                'target_policy_entropy': target_policy_entropy_v / (self._cfg.num_unroll_steps + 1),
+                'value_prefix_loss': value_prefix_loss_v,
+                'value_loss': value_loss_v,
+                'consistency_loss': consistency_loss_v / self._cfg.num_unroll_steps,
+                'value_priority': float(value_priority.mean()),
+                'value_priority_orig': value_priority,
+                'target_value_prefix': target_value_prefix_v,
+                'target_value': target_value_v,
+                'transformed_target_value_prefix': transformed_target_value_prefix_v,
+                'transformed_target_value': transformed_target_value_v,
+                'predicted_value_prefixs': predicted_value_prefixs_mean,
+                'predicted_values': predicted_values_mean,
+                'target_sampled_actions_max': tsa_max,
+                'target_sampled_actions_min': tsa_min,
+                'target_sampled_actions_mean': tsa_mean,
+                'total_grad_norm_before_clip': total_grad_norm_v,
+                'action0_taken_rate': action0_rate,
+                'policy_action0_prob': action0_prob,
+            }
+
         # ``scalar_transform`` to transform the original value to the scaled value,
         # i.e. h(.) function in paper https://arxiv.org/pdf/1805.11593.pdf.
         transformed_target_value_prefix = scalar_transform(target_value_prefix)
@@ -490,7 +817,7 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
 
         # transform the scaled value or its categorical representation to its original value,
         # i.e. h^(-1)(.) function in paper https://arxiv.org/pdf/1805.11593.pdf.
-        original_value = self.value_inverse_scalar_transform_handle(value)
+        original_value = self.value_inverse_scalar_transform_handle(value.detach())
 
         # Note: The following accumulators stay on-device to avoid mid-loop GPU->CPU syncs.
         if self._cfg.monitor_extra_statistics:

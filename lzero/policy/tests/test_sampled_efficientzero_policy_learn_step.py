@@ -578,3 +578,122 @@ class TestSampledEfficientZeroPolicyLearn:
                     assert st['step'].device.type == 'cpu'
             out_cpu2 = policy_cpu._forward_learn(copy.deepcopy(batch))
             assert np.isfinite(float(out_cpu2['weighted_total_loss']))
+
+    @pytest.mark.parametrize('norm_type', ['BN', 'GN'])
+    def test_compile_mode_reduce_overhead_parity_and_state_dict(self, norm_type):
+        """Opt-in compile_mode='reduce-overhead' must leave state_dict keys unchanged,
+        fall back cleanly on CPU, and match eager forward+loss numerically on CUDA.
+        """
+        import copy
+
+        # CPU fallback: compile_mode ignored cleanly
+        cfg_cpu = _make_test_policy_and_buffer_cfg(grid_h=2, grid_w=2, channels=4, num_sampled_actions=4)
+        cfg_cpu.model.norm_type = norm_type
+        cfg_cpu.compile_mode = 'reduce-overhead'
+        pol_cpu = SampledEfficientZeroPolicy(cfg_cpu)
+        assert pol_cpu._compiled_learn_loss_disc is None
+
+        if not torch.cuda.is_available():
+            pytest.skip('CUDA required for torch.compile reduce-overhead parity check')
+
+        prev_tf32_mm = torch.backends.cuda.matmul.allow_tf32
+        prev_tf32_cudnn = torch.backends.cudnn.allow_tf32
+        prev_det = torch.backends.cudnn.deterministic
+        prev_bench = torch.backends.cudnn.benchmark
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+            cfg_eager = _make_test_policy_and_buffer_cfg(grid_h=2, grid_w=2, channels=4, num_sampled_actions=4)
+            cfg_eager.batch_size = 16
+            cfg_eager.model.norm_type = norm_type
+            cfg_eager.optim_type = 'AdamW'
+            cfg_eager.cuda = True
+            cfg_eager.device = 'cuda'
+            cfg_eager.compile_mode = None
+
+            cfg_comp = copy.deepcopy(cfg_eager)
+            cfg_comp.compile_mode = 'reduce-overhead'
+
+            torch.manual_seed(77)
+            pol_eager = SampledEfficientZeroPolicy(cfg_eager)
+            pol_eager._collect_mcts_temperature = 1.0
+
+            torch.manual_seed(77)
+            pol_comp = SampledEfficientZeroPolicy(cfg_comp)
+            pol_comp._collect_mcts_temperature = 1.0
+            pol_comp._learn_model.load_state_dict(copy.deepcopy(pol_eager._learn_model.state_dict()))
+            pol_comp._target_model.load_state_dict(copy.deepcopy(pol_eager._target_model.state_dict()))
+
+            assert pol_eager._compiled_learn_loss_disc is None
+            assert pol_comp._compiled_learn_loss_disc is not None
+            assert list(pol_comp._learn_model.state_dict().keys()) == list(pol_eager._learn_model.state_dict().keys())
+
+            buf = SampledEfficientZeroGameBuffer(cfg_eager)
+            np.random.seed(101)
+            segs = [_make_dummy_segment(cfg_eager, num_steps=10) for _ in range(4)]
+            metas = [
+                {
+                    'done': True,
+                    'priorities': np.ones(10, dtype=np.float32),
+                    'unroll_plus_td_steps': cfg_eager.num_unroll_steps + cfg_eager.td_steps,
+                }
+                for _ in range(4)
+            ]
+            buf.push_game_segments((segs, metas))
+
+            np.random.seed(2026)
+            batches = [buf.sample(batch_size=cfg_eager.batch_size, policy=pol_eager) for _ in range(3)]
+
+            for batch in batches:
+                out_e = pol_eager._forward_learn(copy.deepcopy(batch))
+                out_c = pol_comp._forward_learn(copy.deepcopy(batch))
+                assert out_c['weighted_total_loss'] == pytest.approx(out_e['weighted_total_loss'], rel=1e-4, abs=1e-4)
+                assert out_c['total_grad_norm_before_clip'] == pytest.approx(
+                    out_e['total_grad_norm_before_clip'], rel=1e-4, abs=1e-4
+                )
+
+            sd_e = pol_eager._learn_model.state_dict()
+            sd_c = pol_comp._learn_model.state_dict()
+            assert list(sd_c.keys()) == list(sd_e.keys())
+            for k in sd_e:
+                if not sd_e[k].is_floating_point():
+                    continue
+                if k.endswith('.bias') or 'running_' in k:
+                    continue
+                if k.startswith(('projection.', 'prediction_head.')):
+                    # AdamW can flip sign on individual near-zero SSL entries by ~lr; check tight mean diff
+                    mean_diff = (sd_c[k] - sd_e[k]).abs().mean().item()
+                    assert mean_diff < 1e-5, f'SSL weight mean_diff={mean_diff:.3e} on {norm_type} {k}'
+                else:
+                    assert torch.allclose(sd_c[k], sd_e[k], rtol=1e-4, atol=1e-4), f'weight mismatch on {norm_type} {k}'
+
+            # Full eval-mode inference parity after 3 training steps
+            pol_eager._learn_model.eval()
+            pol_comp._learn_model.eval()
+            test_obs = torch.randn(4, 4, 2, 2, device='cuda')
+            test_act = torch.tensor([0, 1, 2, 3], device='cuda', dtype=torch.long)
+            with torch.no_grad():
+                init_e = pol_eager._learn_model.initial_inference(test_obs)
+                init_c = pol_comp._learn_model.initial_inference(test_obs)
+                assert torch.allclose(init_c.value, init_e.value, atol=1e-4, rtol=1e-4)
+                assert torch.allclose(init_c.policy_logits, init_e.policy_logits, atol=1e-4, rtol=1e-4)
+                assert torch.allclose(init_c.latent_state, init_e.latent_state, atol=1e-4, rtol=1e-4)
+
+                rec_e = pol_eager._learn_model.recurrent_inference(
+                    init_e.latent_state, init_e.reward_hidden_state, test_act
+                )
+                rec_c = pol_comp._learn_model.recurrent_inference(
+                    init_c.latent_state, init_c.reward_hidden_state, test_act
+                )
+                assert torch.allclose(rec_c.value, rec_e.value, atol=1e-4, rtol=1e-4)
+                assert torch.allclose(rec_c.value_prefix, rec_e.value_prefix, atol=1e-4, rtol=1e-4)
+                assert torch.allclose(rec_c.policy_logits, rec_e.policy_logits, atol=1e-4, rtol=1e-4)
+                assert torch.allclose(rec_c.latent_state, rec_e.latent_state, atol=1e-4, rtol=1e-4)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_tf32_mm
+            torch.backends.cudnn.allow_tf32 = prev_tf32_cudnn
+            torch.backends.cudnn.deterministic = prev_det
+            torch.backends.cudnn.benchmark = prev_bench

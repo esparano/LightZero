@@ -635,12 +635,34 @@ class DynamicsNetwork(nn.Module):
         x = self.conv1x1_reward(next_latent_state)
         x = self.norm_reward(x)
         x = self.activation(x)
-        x = x.reshape(-1, self.flatten_input_size_for_reward_head).unsqueeze(0)
+        x = x.reshape(-1, self.flatten_input_size_for_reward_head)
 
         # use lstm to predict value_prefix and reward_hidden_state
-        value_prefix, next_reward_hidden_state = self.lstm(x, reward_hidden_state)
+        if (
+            hasattr(torch, 'compiler')
+            and torch.compiler.is_compiling()
+            and self.lstm.num_layers == 1
+            and not self.lstm.bidirectional
+            and not self.lstm.batch_first
+        ):
+            # Exact 1-step LSTM gate computation reusing self.lstm's parameters so torch.compile
+            # avoids Dynamo's nn.LSTM graph breaks / allow_rnn shape bugs with zero state_dict changes.
+            h0 = reward_hidden_state[0].squeeze(0)
+            c0 = reward_hidden_state[1].squeeze(0)
+            lstm_params = self.lstm._parameters
+            gates = (
+                F.linear(x, lstm_params['weight_ih_l0'], lstm_params.get('bias_ih_l0'))
+                + F.linear(h0, lstm_params['weight_hh_l0'], lstm_params.get('bias_hh_l0'))
+            )
+            i_g, f_g, g_g, o_g = gates.chunk(4, dim=-1)
+            c1 = torch.sigmoid(f_g) * c0 + torch.sigmoid(i_g) * torch.tanh(g_g)
+            h1 = torch.sigmoid(o_g) * torch.tanh(c1)
+            next_reward_hidden_state = (h1.unsqueeze(0), c1.unsqueeze(0))
+            value_prefix = h1
+        else:
+            value_prefix, next_reward_hidden_state = self.lstm(x.unsqueeze(0), reward_hidden_state)
+            value_prefix = value_prefix.squeeze(0)
 
-        value_prefix = value_prefix.squeeze(0)
         value_prefix = self.norm_value_prefix(value_prefix)
         value_prefix = self.activation(value_prefix)
         value_prefix = self.fc_reward_head(value_prefix)
