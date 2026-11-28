@@ -25,6 +25,7 @@ from galcon_bot_arena.sim import (  # noqa: F401
     generate_galcon_map,
     physical_ship_count,
     planet_radius_from_production,
+    spawn_fleet_units,
     step_physics_cpp,
 )
 
@@ -46,5 +47,7 @@ __all__ = [
     "evaluate_galcon_state",
     "generate_galcon_map",
     "physical_ship_count",
+    "planet_radius_from_production",
+    "spawn_fleet_units",
     "step_physics_cpp",
 ]

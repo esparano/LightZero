@@ -35,11 +35,13 @@ from zoo.board_games.galcon.envs.cpp_sim import (
     EnvCppSimHandle,
     GalconSim as _CppSimFallback,
     HAS_FAST_SIM_CPP,
-    SPAWN_AREA_RADIUS,
+    PRODUCTION_DIVISOR,
+    SHIP_RADIUS as _SIM_SHIP_RADIUS,
     physical_ship_count,
+    planet_radius_from_production,
+    spawn_fleet_units,
     step_physics_cpp,
 )
-from zoo.board_games.galcon.envs.cpp_sim.sim import _spawn_hash_u01
 
 
 @dataclass(slots=True)
@@ -202,10 +204,10 @@ class GalconEnv(BaseEnv):
     PLAYER_2 = 2
 
     # production=100 means 120 ships/min = 2 ships/sec => production / 50 ships/sec.
-    PRODUCTION_TO_SHIPS_PER_SECOND_DIVISOR = 50.0
+    PRODUCTION_TO_SHIPS_PER_SECOND_DIVISOR = PRODUCTION_DIVISOR
     # TODO: For now, fleet radius is just a constant.
     DUMMY_FLEET_RADIUS = 10.0
-    SHIP_RADIUS = 6.0
+    SHIP_RADIUS = _SIM_SHIP_RADIUS
     # Real Galcon 2 planets_settle padding per planet: 8 + sqrt(0.5) (~8.707 px),
     # giving a minimum surface-to-surface gap of 2 * (8 + sqrt(0.5)) = 16 + sqrt(2) (~17.414 px).
     PLANETS_SETTLE_PADDING = 8.0 + math.sqrt(0.5)
@@ -663,7 +665,7 @@ class GalconEnv(BaseEnv):
 
     @staticmethod
     def _radius_from_production(production: float) -> float:
-        return (production * 12.0 / 5.0 + 168.0) / 17.0
+        return planet_radius_from_production(production)
 
     def step(self, action: int) -> BaseEnvTimestep:
         if self.battle_mode == 'self_play_mode':
@@ -1587,65 +1589,17 @@ class GalconEnv(BaseEnv):
 
         source.ships = max(0.0, source.ships - ships_to_send)
 
-        dx = target.x - source.x
-        dy = target.y - source.y
-        raw_d = math.hypot(dx, dy)
-        d = raw_d if raw_d > 1e-6 else 1e-6
-        hx0 = (dx / d) if raw_d > 1e-6 else 1.0
-        hy0 = (dy / d) if raw_d > 1e-6 else 0.0
-        spawn_r = source.radius + self.SHIP_RADIUS
-        sx = source.x + hx0 * spawn_r
-        sy = source.y + hy0 * spawn_r
-
         fid = self._next_fleet_id
         self._next_fleet_id += 1
-
-        if parts == 1:
-            units = [[sx, sy]]
-            unit_headings = [[hx0, hy0]]
-            cx, cy, fl_radius = sx, sy, 0.0
-        else:
-            two_pi = 2.0 * math.pi
-            seed_base = (fid * 1000003) & 0xFFFFFFFF
-            spawn_disc_r = SPAWN_AREA_RADIUS * math.sqrt(float(parts))
-            units = []
-            unit_headings = []
-            sum_x = 0.0
-            sum_y = 0.0
-            min_x = 1e300
-            max_x = -1e300
-            min_y = 1e300
-            max_y = -1e300
-            tx, ty = target.x, target.y
-            for j in range(parts):
-                u1 = _spawn_hash_u01((seed_base + j * 2 + 1) & 0xFFFFFFFF)
-                u2 = _spawn_hash_u01((seed_base + j * 2 + 2) & 0xFFFFFFFF)
-                r = spawn_disc_r * math.sqrt(u1)
-                ang = two_pi * u2
-                xj = sx + r * math.cos(ang)
-                yj = sy + r * math.sin(ang)
-                units.append([xj, yj])
-                sum_x += xj
-                sum_y += yj
-                if xj < min_x:
-                    min_x = xj
-                if xj > max_x:
-                    max_x = xj
-                if yj < min_y:
-                    min_y = yj
-                if yj > max_y:
-                    max_y = yj
-                hdx = tx - xj
-                hdy = ty - yj
-                hd2 = hdx * hdx + hdy * hdy
-                if hd2 > 1e-12:
-                    hd = math.sqrt(hd2)
-                    unit_headings.append([hdx / hd, hdy / hd])
-                else:
-                    unit_headings.append([hx0, hy0])
-            cx = sum_x / float(parts)
-            cy = sum_y / float(parts)
-            fl_radius = ((max_x - min_x) + (max_y - min_y)) / 5.0
+        units, unit_headings, cx, cy, fl_radius = spawn_fleet_units(
+            fid,
+            parts,
+            source.x,
+            source.y,
+            source.radius,
+            target.x,
+            target.y,
+        )
 
         self.fleets.append(
             Fleet(
