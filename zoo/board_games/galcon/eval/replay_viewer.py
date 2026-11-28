@@ -23,8 +23,6 @@ from __future__ import annotations
 import argparse
 import copy
 import importlib.util
-import math
-import os
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -40,9 +38,12 @@ from galcon_bot_arena.replay import (  # noqa: F401
     _alpha_key_g2_color_fx,
     _find_landed_units,
     _tint_g2_sprite,
+    build_compact_snapshot,
+    collect_substep_hits,
     find_g2_data_dir,
     load_g2_sprites,
     render_replay_html,
+    snapshot_pre_substep_fleets,
 )
 from zoo.board_games.galcon.envs.cpp_sim import (
     DEFAULT_PHYSICS_SUBSTEPS,
@@ -74,55 +75,31 @@ def _step_one_substep_physics(env: GalconEnv, sub_dt: float) -> None:
 
 def _compact_snapshot(
     env: GalconEnv,
+    planet_by_id: Dict[int, Any],
+    pid_to_idx: Dict[int, int],
     step_idx: int,
     sub_idx: int,
     t_sec: float,
     act_rec: Optional[List[int]],
     hits: Optional[List[List[int]]],
 ) -> Dict[str, Any]:
-    p_dyn = [[int(p.owner), int(round(float(p.ships) * 10))] for p in env.planets]
-    fleets: List[List[Any]] = []
-    total_units = 0
-    for f in env.fleets:
-        flat: List[int] = []
-        units = f.units or [[f.x, f.y]]
-        headings = f.unit_headings if (f.unit_headings and len(f.unit_headings) == len(units)) else None
-        for idx, (ux, uy) in enumerate(units):
-            if headings is not None:
-                ang = math.atan2(headings[idx][1], headings[idx][0])
-            else:
-                tp = env.planets[f.target]
-                ang = math.atan2(tp.y - uy, tp.x - ux)
-            flat.append(int(round(float(ux) * 10)))
-            flat.append(int(round(float(uy) * 10)))
-            flat.append(int(round(ang * 100)))
-        total_units += len(units)
-        fleets.append([
-            int(f.id),
-            int(f.owner),
-            int(round(float(f.ships) * 10)),
-            int(f.target),
-            flat,
-        ])
-    rec: Dict[str, Any] = {
-        "k": int(step_idx),
-        "sb": int(sub_idx),
-        "t": int(round(t_sec * 100)),
-        "p": p_dyn,
-        "f": fleets,
-        "s": [
-            int(round(float(env._total_ships(1)))),
-            int(round(float(env._total_ships(2)))),
-            int(round(float(env._total_production(1)))),
-            int(round(float(env._total_production(2)))),
-        ],
-        "u": total_units,
-    }
-    if act_rec is not None:
-        rec["a"] = act_rec
-    if hits:
-        rec["h"] = hits
-    return rec
+    return build_compact_snapshot(
+        env.planets,
+        env.fleets,
+        planet_by_id=planet_by_id,
+        pid_to_idx=pid_to_idx,
+        step_idx=step_idx,
+        sub_idx=sub_idx,
+        t_sec=t_sec,
+        totals=(
+            env._total_ships(1),
+            env._total_ships(2),
+            env._total_production(1),
+            env._total_production(2),
+        ),
+        act_rec=act_rec,
+        hits=hits,
+    )
 
 
 def record_match_20hz(
@@ -163,6 +140,8 @@ def record_match_20hz(
     sub_dt = float(env.tick_seconds) / float(substeps)
     sub_step_dist = float(env.fleet_speed) * sub_dt
 
+    planet_by_id = {int(p.id): p for p in env.planets}
+    pid_to_idx = {int(p.id): idx for idx, p in enumerate(env.planets)}
     planets_static = [
         [
             int(p.id),
@@ -174,7 +153,7 @@ def record_match_20hz(
         for p in env.planets
     ]
 
-    frames = [_compact_snapshot(env, 0, 0, 0.0, None, None)]
+    frames = [_compact_snapshot(env, planet_by_id, pid_to_idx, 0, 0, 0.0, None, None)]
     max_units = 0
     sends = {1: 0, 2: 0}
     winner = -1
@@ -201,48 +180,32 @@ def record_match_20hz(
             sp = env._planet_at_cell(sx, sy, owner=acting_player)
             tp = env._planet_at_cell(tx, ty)
             if sp is not None and tp is not None and sp.id != tp.id:
-                act_rec = [acting_player, int(sp.id), int(tp.id)]
+                act_rec = [acting_player, int(pid_to_idx[sp.id]), int(pid_to_idx[tp.id])]
                 sends[acting_player] += 1
 
         step_idx = env._step_count + 1
         env._apply_action(action)
 
         for sb in range(1, substeps + 1):
-            pre_owners = {p.id: int(p.owner) for p in env.planets}
-            pre_fleets = {
-                f.id: (
-                    int(f.owner),
-                    int(f.target),
-                    [list(u) for u in (f.units or [[f.x, f.y]])],
-                    [list(h) for h in (f.unit_headings or [[1.0, 0.0]])],
-                )
-                for f in env.fleets
-            }
+            pre_owners = {int(p.id): int(p.owner) for p in env.planets}
+            pre_fleets = snapshot_pre_substep_fleets(env.fleets, planet_by_id)
 
             _step_one_substep_physics(env, sub_dt)
 
-            post_fleets = {f.id: f for f in env.fleets}
-            hits: List[List[int]] = []
-            for fid, (f_owner, f_tgt, pre_u, pre_h) in pre_fleets.items():
-                pf = post_fleets.get(fid)
-                post_u = pf.units if (pf is not None and pf.units) else []
-                if len(post_u) < len(pre_u):
-                    landed_pts = _find_landed_units(pre_u, pre_h, post_u, sub_step_dist)
-                    tp_planet = env.planets[f_tgt]
-                    hostile = 1 if (pre_owners[f_tgt] != f_owner) else 0
-                    for lx, ly in landed_pts:
-                        dx = lx - tp_planet.x
-                        dy = ly - tp_planet.y
-                        d = math.hypot(dx, dy)
-                        if d > 1e-6:
-                            ix = tp_planet.x + (dx / d) * tp_planet.radius
-                            iy = tp_planet.y + (dy / d) * tp_planet.radius
-                        else:
-                            ix, iy = lx, ly
-                        hits.append([int(round(ix * 10)), int(round(iy * 10)), f_owner, hostile])
+            post_fleets = {int(f.id): f for f in env.fleets}
+            hits = collect_substep_hits(pre_owners, pre_fleets, post_fleets, planet_by_id, sub_step_dist)
 
             t_sec = (step_idx - 1) * float(env.tick_seconds) + sb * sub_dt
-            snap = _compact_snapshot(env, step_idx, sb, t_sec, act_rec if sb == 1 else None, hits or None)
+            snap = _compact_snapshot(
+                env,
+                planet_by_id,
+                pid_to_idx,
+                step_idx,
+                sb,
+                t_sec,
+                act_rec if sb == 1 else None,
+                hits or None,
+            )
             max_units = max(max_units, snap["u"])
             frames.append(snap)
 
@@ -290,51 +253,46 @@ def _load_config_module(config_path: str):
 
 
 class _GalconRuleBotPlayer:
-    """Lightweight MatchPlayer wrapper for built-in Galcon bots without requiring compiled MCTS ctree."""
+    """Lightweight MatchPlayer wrapper delegating to ``build_galcon_bot`` without requiring compiled MCTS ctree."""
 
     def __init__(self, bot_type: str, player_id: Optional[str] = None) -> None:
         self.bot_type = str(bot_type).strip().lower()
         self.player_id = player_id or f"bot:{self.bot_type}"
         self.frame_stack_num = 1
+        self._env_bots: Dict[int, Tuple[int, Any]] = {}
 
     def reset(self, env_ids: Optional[Sequence[int]] = None) -> None:
-        return
+        ids = list(self._env_bots.keys()) if env_ids is None else list(env_ids)
+        for eid in ids:
+            cached = self._env_bots.get(eid)
+            if cached is not None and hasattr(cached[1], "reset"):
+                cached[1].reset()
 
     def select_actions(self, envs, env_ids, obs_stacks, action_masks, to_plays, timesteps) -> Dict[int, int]:
-        from zoo.board_games.galcon.envs.rule_bot import (
-            GalconFixedPolicyBot,
-            GalconMCTSBot,
-            GalconPassBot,
-            GalconRandomBot,
-        )
+        from zoo.board_games.galcon.envs.rule_bot import build_galcon_bot
 
         actions: Dict[int, int] = {}
         for env_id in env_ids:
             env = envs[env_id]
-            k = self.bot_type
-            if k == "random":
-                bot = GalconRandomBot(env)
-            elif k == "fixed":
-                bot = GalconFixedPolicyBot(env)
-            elif k == "pass":
-                bot = GalconPassBot(env)
-            elif k == "mcts":
-                bot = GalconMCTSBot(env)
-            elif k.startswith("mcts:") or (k.startswith("mcts") and k[4:].isdigit()):
-                sims = int(k.split(":", 1)[1] if ":" in k else k[4:])
-                bot = GalconMCTSBot(env, num_simulations=sims)
+            cached = self._env_bots.get(env_id)
+            if cached is None or cached[0] != id(env):
+                bot = build_galcon_bot(env, self.bot_type)
+                self._env_bots[env_id] = (id(env), bot)
             else:
-                raise ValueError(f"Unsupported Galcon bot_type: {self.bot_type!r}")
+                bot = cached[1]
             actions[env_id] = int(bot.get_action())
         return actions
 
 
 def _build_player_from_spec(spec_str: str, main_cfg: Any, create_cfg: Any, device: str = "cpu"):
+    from zoo.board_games.galcon.envs.cpp_bots import CPP_BOT_KINDS
+
     s = spec_str.strip()
-    if s.lower().startswith("bot:"):
+    low = s.lower()
+    if low.startswith("bot:"):
         bot_type = s[4:].strip()
         return _GalconRuleBotPlayer(bot_type=bot_type, player_id=f"bot:{bot_type}")
-    if s.lower() in {"random", "fixed", "pass", "mcts"} or s.lower().startswith("mcts:"):
+    if low in {"random", "fixed", "pass", "mcts"} or low.startswith("mcts:") or low in CPP_BOT_KINDS:
         return _GalconRuleBotPlayer(bot_type=s, player_id=f"bot:{s}")
 
     from lzero.worker.head_to_head import PolicyMatchPlayer

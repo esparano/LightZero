@@ -149,3 +149,27 @@ def test_render_replay_html_embeds_replays_and_bundled_sprites(tmp_path):
     assert "Unit Test Match" in html
     assert "bakeSmoothedVelocityAngles" in html
     assert "if (hit[3] !== 1) continue;" in html
+
+
+def test_replay_viewer_rule_bot_player_supports_cpp_bots_and_resets():
+    """_build_player_from_spec delegates to build_galcon_bot so C++ bots work in 20 Hz replay CLI."""
+    from zoo.board_games.galcon.envs.cpp_bots import HAS_CPP_BOTS
+    from zoo.board_games.galcon.eval.replay_viewer import _build_player_from_spec
+
+    p_rand = _build_player_from_spec("random", None, None)
+    assert p_rand.player_id == "bot:random"
+
+    if not HAS_CPP_BOTS:
+        return
+
+    p1 = _build_player_from_spec("waffleopt", None, None)
+    p2 = _build_player_from_spec("bot:expand", None, None)
+    assert p1.player_id == "bot:waffleopt"
+    assert p2.player_id == "bot:expand"
+
+    env_cfg = _base_env_cfg(max_steps=10)
+    rec = record_match_20hz(env_cfg, p1, p2, map_seed=42)
+    assert rec["p1_name"] == "bot:waffleopt"
+    assert rec["p2_name"] == "bot:expand"
+    assert len(rec["frames"]) > 1
+    assert rec["sends"][0] + rec["sends"][1] > 0
