@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from ding.torch_utils import MLP, ResBlock
 from ding.utils import MODEL_REGISTRY, SequenceType
 from numpy import ndarray
@@ -560,8 +561,12 @@ class DynamicsNetwork(nn.Module):
             last_linear_layer_init_zero=last_linear_layer_init_zero
         )
 
-    def forward(self, state_action_encoding: torch.Tensor,
-                reward_hidden_state: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, Tuple, torch.Tensor]:
+    def forward(
+        self,
+        state_action_encoding: torch.Tensor,
+        reward_hidden_state: Tuple[torch.Tensor, torch.Tensor],
+        discrete_action_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Tuple, torch.Tensor]:
         """
         Overview:
             Forward computation of the dynamics network. Predict next latent state, next reward hidden state and value prefix
@@ -576,23 +581,46 @@ class DynamicsNetwork(nn.Module):
             - next_reward_hidden_state (:obj:`torch.Tensor`): The input hidden state of LSTM about reward.
             - value_prefix (:obj:`torch.Tensor`): The predicted prefix sum of value for input state.
         """
-        # take the state encoding, state_action_encoding[:, -self.action_encoding_dim:, :, :] is action encoding
-        state_encoding = state_action_encoding[:, :-self.action_encoding_dim, :, :]
-
-        if self.embed_actions:
-            # 1. Separate the latent state from the action encoding
-            action_encoding = state_action_encoding[:, -self.action_encoding_dim:, :, :]
-
-            # 2. embed actions
-            embedded_action = self.action_conv(action_encoding)
-
-            # 3. rejoin latent state with the embedded action
+        if discrete_action_indices is not None:
+            if not self.embed_actions or self.action_conv.bias is not None:
+                raise ValueError(
+                    'discrete_action_indices fast path requires embed_actions=True and action_conv.bias is None.'
+                )
+            state_encoding = state_action_encoding
+            # Algebraically identical to 1x1 conv on a spatially broadcast one-hot tensor, reusing
+            # action_conv.weight directly (preserving exact state_dict keys, init, and gradients).
+            weight_table = self.action_conv.weight[:, :, 0, 0].t()
+            embedded_action = (
+                F.embedding(discrete_action_indices, weight_table)
+                .unsqueeze(-1)
+                .unsqueeze(-1)
+                .expand(
+                    state_encoding.shape[0],
+                    self.embedded_action_dim,
+                    state_encoding.shape[2],
+                    state_encoding.shape[3],
+                )
+            )
             compressed_state_action = torch.cat([state_encoding, embedded_action], dim=1)
-
-            # 4. PROCESS: Pass the much smaller tensor through the heavy 3x3 dynamics conv
             x = self.conv(compressed_state_action)
         else:
-            x = self.conv(state_action_encoding)
+            # take the state encoding, state_action_encoding[:, -self.action_encoding_dim:, :, :] is action encoding
+            state_encoding = state_action_encoding[:, :-self.action_encoding_dim, :, :]
+
+            if self.embed_actions:
+                # 1. Separate the latent state from the action encoding
+                action_encoding = state_action_encoding[:, -self.action_encoding_dim:, :, :]
+
+                # 2. embed actions
+                embedded_action = self.action_conv(action_encoding)
+
+                # 3. rejoin latent state with the embedded action
+                compressed_state_action = torch.cat([state_encoding, embedded_action], dim=1)
+
+                # 4. PROCESS: Pass the much smaller tensor through the heavy 3x3 dynamics conv
+                x = self.conv(compressed_state_action)
+            else:
+                x = self.conv(state_action_encoding)
 
         x = self.norm_common(x)
 

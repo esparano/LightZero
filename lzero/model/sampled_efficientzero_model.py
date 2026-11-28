@@ -421,6 +421,34 @@ class SampledEfficientZeroModel(nn.Module):
         """
         # NOTE: the discrete action encoding type is important for some environments
 
+        # Fast exact embedding path for discrete one-hot + 1x1 action_conv (avoids materializing
+        # dense (B, action_space_size, H, W) one-hot tensors while reusing action_conv.weight).
+        if (
+            not self.continuous_action_space
+            and self.discrete_action_encoding_type == 'one_hot'
+            and getattr(self.dynamics_network, 'embed_actions', False)
+            and hasattr(self.dynamics_network, 'action_conv')
+            and self.dynamics_network.action_conv.bias is None
+            and self.dynamics_network.action_conv.kernel_size == (1, 1)
+            and self.dynamics_network.action_conv.stride == (1, 1)
+            and self.dynamics_network.action_conv.padding == (0, 0)
+            and self.dynamics_network.action_conv.groups == 1
+        ):
+            action_idx = action.reshape(-1).to(device=latent_state.device, dtype=torch.long)
+            if action_idx.shape[0] != latent_state.shape[0]:
+                raise ValueError(
+                    f'Expected 1 discrete action index per batch element, got action shape {tuple(action.shape)} '
+                    f'for batch size {latent_state.shape[0]}.'
+                )
+            next_latent_state, next_reward_hidden_state, value_prefix = self.dynamics_network(
+                latent_state, reward_hidden_state, discrete_action_indices=action_idx
+            )
+            if not self.state_norm:
+                return next_latent_state, next_reward_hidden_state, value_prefix
+            else:
+                next_latent_state_normalized = renormalize(next_latent_state)
+                return next_latent_state_normalized, next_reward_hidden_state, value_prefix
+
         if not self.continuous_action_space:
             # discrete action space
             if self.discrete_action_encoding_type == 'one_hot':
