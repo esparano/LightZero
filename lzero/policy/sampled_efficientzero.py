@@ -1063,11 +1063,19 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             )
 
             pred_values = self.value_inverse_scalar_transform_handle(pred_values).detach().cpu().numpy()
-            latent_state_roots = latent_state_roots.detach().cpu().numpy()
-            reward_hidden_state_roots = (
-                reward_hidden_state_roots[0].detach().cpu().numpy(),
-                reward_hidden_state_roots[1].detach().cpu().numpy()
-            )
+            if self._cfg.mcts_ctree:
+                # Keep root latent and LSTM hidden states on device for device-resident CTree MCTS pool.
+                latent_state_roots = latent_state_roots.detach()
+                reward_hidden_state_roots = (
+                    reward_hidden_state_roots[0].detach(),
+                    reward_hidden_state_roots[1].detach(),
+                )
+            else:
+                latent_state_roots = latent_state_roots.detach().cpu().numpy()
+                reward_hidden_state_roots = (
+                    reward_hidden_state_roots[0].detach().cpu().numpy(),
+                    reward_hidden_state_roots[1].detach().cpu().numpy()
+                )
             policy_logits = policy_logits.detach().cpu().numpy().tolist()
 
             if self._cfg.model.continuous_action_space is True:
@@ -1078,7 +1086,10 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                 ]
             else:
                 legal_actions = [
-                    [i for i, x in enumerate(action_mask[j]) if x == 1] for j in range(active_collect_env_num)
+                    np.flatnonzero(action_mask[j] == 1).tolist()
+                    if isinstance(action_mask[j], np.ndarray)
+                    else [i for i, x in enumerate(action_mask[j]) if x == 1]
+                    for j in range(active_collect_env_num)
                 ]
 
             if self._cfg.mcts_ctree:
@@ -1220,13 +1231,21 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             if not self._eval_model.training:
                 # if not in training, obtain the scalars of the value/reward
                 pred_values = self.value_inverse_scalar_transform_handle(pred_values).detach().cpu().numpy()  # shape（B, 1）
-                latent_state_roots = latent_state_roots.detach().cpu().numpy()
-                # Intentionally all zeros at root (depth 0): the value-prefix LSTM has no unrolled steps yet
-                # and is populated during recurrent_inference (resetting every lstm_horizon_len steps).
-                reward_hidden_state_roots = (
-                    reward_hidden_state_roots[0].detach().cpu().numpy(),
-                    reward_hidden_state_roots[1].detach().cpu().numpy()
-                )
+                if self._cfg.mcts_ctree:
+                    # Keep root latent and LSTM hidden states on device for device-resident CTree MCTS pool.
+                    latent_state_roots = latent_state_roots.detach()
+                    reward_hidden_state_roots = (
+                        reward_hidden_state_roots[0].detach(),
+                        reward_hidden_state_roots[1].detach(),
+                    )
+                else:
+                    latent_state_roots = latent_state_roots.detach().cpu().numpy()
+                    # Intentionally all zeros at root (depth 0): the value-prefix LSTM has no unrolled steps yet
+                    # and is populated during recurrent_inference (resetting every lstm_horizon_len steps).
+                    reward_hidden_state_roots = (
+                        reward_hidden_state_roots[0].detach().cpu().numpy(),
+                        reward_hidden_state_roots[1].detach().cpu().numpy()
+                    )
                 policy_logits = policy_logits.detach().cpu().numpy().tolist()  # list shape（B, A）
 
             if self._cfg.model.continuous_action_space is True:
@@ -1237,7 +1256,10 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
                 ]
             else:
                 legal_actions = [
-                    [i for i, x in enumerate(action_mask[j]) if x == 1] for j in range(active_eval_env_num)
+                    np.flatnonzero(action_mask[j] == 1).tolist()
+                    if isinstance(action_mask[j], np.ndarray)
+                    else [i for i, x in enumerate(action_mask[j]) if x == 1]
+                    for j in range(active_eval_env_num)
                 ]
 
             # cpp mcts_tree

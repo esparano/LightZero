@@ -498,65 +498,84 @@ class SampledEfficientZeroMCTSCtree(object):
 
             # preparation some constant
             batch_size = roots.num
-            device = self._cfg.device
+            device = torch.device(self._cfg.device)
+            num_simulations = int(self._cfg.num_simulations)
             pb_c_base, pb_c_init, discount_factor = self._cfg.pb_c_base, self._cfg.pb_c_init, self._cfg.discount_factor
+            continuous_action_space = bool(self._cfg.model.continuous_action_space)
+            is_not_board_games = (self._cfg.env_type == 'not_board_games')
+            lstm_horizon_len = int(self._cfg.lstm_horizon_len)
+            assert lstm_horizon_len > 0
 
-            # the data storage of latent states: storing the latent state of all the nodes in one search.
-            latent_state_batch_in_search_path = [latent_state_roots]
-            # the data storage of value prefix hidden states in LSTM
-            reward_hidden_state_c_pool = [reward_hidden_state_roots[0]]
-            reward_hidden_state_h_pool = [reward_hidden_state_roots[1]]
+            # Keep latent states and LSTM reward hidden states directly on the inference device
+            # across all simulations (accepting either device tensors or NumPy/list inputs).
+            if torch.is_tensor(latent_state_roots):
+                root_latent = latent_state_roots.detach().to(device=device)
+            else:
+                root_latent = torch.as_tensor(np.asarray(latent_state_roots), device=device)
+
+            if torch.is_tensor(reward_hidden_state_roots[0]):
+                root_c = reward_hidden_state_roots[0].detach().to(device=device)
+                root_h = reward_hidden_state_roots[1].detach().to(device=device)
+            else:
+                root_c = torch.as_tensor(np.asarray(reward_hidden_state_roots[0]), device=device)
+                root_h = torch.as_tensor(np.asarray(reward_hidden_state_roots[1]), device=device)
+
+            # Preallocate device-resident pools: depth = num_simulations + 1 (root at index 0).
+            # root_c / root_h have shape (1, B, H_lstm); store (depth, B, H_lstm) in pools.
+            pool_depth = num_simulations + 1
+            latent_pool = torch.empty(
+                (pool_depth,) + tuple(root_latent.shape), dtype=root_latent.dtype, device=device
+            )
+            c_pool = torch.empty(
+                (pool_depth,) + tuple(root_c[0].shape), dtype=root_c.dtype, device=device
+            )
+            h_pool = torch.empty(
+                (pool_depth,) + tuple(root_h[0].shape), dtype=root_h.dtype, device=device
+            )
+            latent_pool[0] = root_latent
+            c_pool[0] = root_c[0]
+            h_pool[0] = root_h[0]
 
             # minimax value storage
             min_max_stats_lst = tree_sampled_efficientzero.MinMaxStatsList(batch_size)
             min_max_stats_lst.set_delta(self._cfg.value_delta_max)
 
-            for simulation_index in range(self._cfg.num_simulations):
-                # In each simulation, we expanded a new node, so in one search, we have ``num_simulations`` num of nodes at most.
-                latent_states = []
-                hidden_states_c_reward = []
-                hidden_states_h_reward = []
-
+            for simulation_index in range(num_simulations):
                 # prepare a result wrapper to transport results between python and c++ parts
                 results = tree_sampled_efficientzero.ResultsWrapper(num=batch_size)
 
-                # latent_state_index_in_search_path: the first index of leaf node states in latent_state_batch_in_search_path, i.e. is current_latent_state_index in one the search.
-                # latent_state_index_in_batch: the second index of leaf node states in latent_state_batch_in_search_path, i.e. the index in the batch, whose maximum is ``batch_size``.
-                # e.g. the latent state of the leaf node in (x, y) is latent_state_batch_in_search_path[x, y], where x is current_latent_state_index, y is batch_index.
-                # The index of value prefix hidden state of the leaf node are in the same manner.
                 """
                 MCTS stage 1: Selection
                     Each simulation starts from the internal root state s0, and finishes when the simulation reaches a leaf node s_l.
                 """
-                if self._cfg.env_type == 'not_board_games':
+                if is_not_board_games:
                     latent_state_index_in_search_path, latent_state_index_in_batch, last_actions, virtual_to_play_batch = tree_sampled_efficientzero.batch_traverse(
                         roots, pb_c_base, pb_c_init, discount_factor, min_max_stats_lst, results,
-                        to_play_batch, self._cfg.model.continuous_action_space
+                        to_play_batch, continuous_action_space
                     )
                 else:
-                    # the ``to_play_batch`` is only used in board games, here we need to deepcopy it to avoid changing the original data.
+                    # the ``to_play_batch`` is only used in board games, here we need a copy to avoid mutating the caller's list.
                     latent_state_index_in_search_path, latent_state_index_in_batch, last_actions, virtual_to_play_batch = tree_sampled_efficientzero.batch_traverse(
                         roots, pb_c_base, pb_c_init, discount_factor, min_max_stats_lst, results,
-                        copy.deepcopy(to_play_batch), self._cfg.model.continuous_action_space
+                        list(to_play_batch) if isinstance(to_play_batch, list) else copy.deepcopy(to_play_batch),
+                        continuous_action_space
                     )
 
                 # obtain the search horizon for leaf nodes
                 search_lens = results.get_search_len()
-                # obtain the latent state for leaf node
-                for ix, iy in zip(latent_state_index_in_search_path, latent_state_index_in_batch):
-                    latent_states.append(latent_state_batch_in_search_path[ix][iy])
-                    hidden_states_c_reward.append(reward_hidden_state_c_pool[ix][0][iy])
-                    hidden_states_h_reward.append(reward_hidden_state_h_pool[ix][0][iy])
-                latent_states = torch.from_numpy(np.asarray(latent_states)).to(device)
-                hidden_states_c_reward = torch.from_numpy(np.asarray(hidden_states_c_reward)).to(device).unsqueeze(0)
-                hidden_states_h_reward = torch.from_numpy(np.asarray(hidden_states_h_reward)).to(device).unsqueeze(0)
 
-                if self._cfg.model.continuous_action_space is True:
-                    # continuous action
-                    last_actions = torch.from_numpy(np.asarray(last_actions)).to(device)
+                # Gather leaf latent & LSTM hidden states directly on-device (no CPU round-trip).
+                idx_path = torch.as_tensor(latent_state_index_in_search_path, dtype=torch.long, device=device)
+                idx_batch = torch.as_tensor(latent_state_index_in_batch, dtype=torch.long, device=device)
+                latent_states = latent_pool[idx_path, idx_batch]
+                hidden_states_c_reward = c_pool[idx_path, idx_batch].unsqueeze(0)
+                hidden_states_h_reward = h_pool[idx_path, idx_batch].unsqueeze(0)
+
+                if continuous_action_space:
+                    last_actions_t = torch.as_tensor(np.asarray(last_actions), device=device)
                 else:
-                    # discrete action
-                    last_actions = torch.from_numpy(np.asarray(last_actions)).to(device).long()
+                    last_actions_t = torch.as_tensor(last_actions, dtype=torch.long, device=device)
+
                 """
                 MCTS stage 2: Expansion
                     At the final time-step l of the simulation, the next_latent_state and reward/value_prefix are computed by the dynamics function.
@@ -565,48 +584,57 @@ class SampledEfficientZeroMCTSCtree(object):
                     At the end of the simulation, the statistics along the trajectory are updated.
                 """
                 network_output = model.recurrent_inference(
-                    latent_states, (hidden_states_c_reward, hidden_states_h_reward), last_actions
+                    latent_states, (hidden_states_c_reward, hidden_states_h_reward), last_actions_t
                 )
 
-                [
-                    network_output.latent_state, network_output.policy_logits, network_output.value,
-                    network_output.value_prefix
-                ] = to_detach_cpu_numpy(
-                    [
-                        network_output.latent_state,
-                        network_output.policy_logits,
-                        self.value_inverse_scalar_transform_handle(network_output.value),
-                        self.reward_inverse_scalar_transform_handle(network_output.value_prefix),
-                    ]
-                )
-                network_output.reward_hidden_state = (
-                    network_output.reward_hidden_state[0].detach().cpu().numpy(),
-                    network_output.reward_hidden_state[1].detach().cpu().numpy()
-                )
-                latent_state_batch_in_search_path.append(network_output.latent_state)
-                # tolist() is to be compatible with cpp datatype.
-                value_prefix_pool = network_output.value_prefix.reshape(-1).tolist()
-                value_pool = network_output.value.reshape(-1).tolist()
-                policy_logits_pool = network_output.policy_logits.tolist()
-                reward_latent_state_batch = network_output.reward_hidden_state
+                # Store next latent & LSTM hidden states directly on-device (never copied to CPU).
+                # NOTE: simulation_index + 1 is the pool slot of the newly expanded leaf nodes.
+                current_latent_state_index = simulation_index + 1
+                latent_pool[current_latent_state_index] = network_output.latent_state.detach()
 
-                # reset the hidden states in LSTM every ``lstm_horizon_len`` steps in one search.
-                # which enable the model only need to predict the value prefix in a range (e.g.: [s0,...,s5]).
-                assert self._cfg.lstm_horizon_len > 0
-                reset_idx = (np.array(search_lens) % self._cfg.lstm_horizon_len == 0)
+                next_c = network_output.reward_hidden_state[0].detach()[0]
+                next_h = network_output.reward_hidden_state[1].detach()[0]
+
+                # Reset LSTM hidden states every ``lstm_horizon_len`` steps in one search.
+                reset_idx = (np.asarray(search_lens) % lstm_horizon_len == 0)
                 assert len(reset_idx) == batch_size
-                reward_latent_state_batch[0][:, reset_idx, :] = 0
-                reward_latent_state_batch[1][:, reset_idx, :] = 0
+                if np.any(reset_idx):
+                    reset_mask = torch.as_tensor(reset_idx, dtype=torch.bool, device=device).unsqueeze(-1)
+                    next_c = next_c.masked_fill(reset_mask, 0.0)
+                    next_h = next_h.masked_fill(reset_mask, 0.0)
+                c_pool[current_latent_state_index] = next_c
+                h_pool[current_latent_state_index] = next_h
                 is_reset_list = reset_idx.astype(np.int32).tolist()
-                reward_hidden_state_c_pool.append(reward_latent_state_batch[0])
-                reward_hidden_state_h_pool.append(reward_latent_state_batch[1])
+
+                # Transfer ONLY the outputs needed by C++ batch_backpropagate (value, value_prefix,
+                # policy_logits), coalesced into a single D2H copy when shapes/dtypes allow.
+                val_t = self.value_inverse_scalar_transform_handle(network_output.value).detach()
+                vp_t = self.reward_inverse_scalar_transform_handle(network_output.value_prefix).detach()
+                logits_t = network_output.policy_logits.detach()
+
+                if (
+                    logits_t.ndim == 2
+                    and logits_t.shape[0] == batch_size
+                    and val_t.numel() == batch_size
+                    and vp_t.numel() == batch_size
+                    and val_t.dtype == logits_t.dtype
+                    and vp_t.dtype == logits_t.dtype
+                ):
+                    packed = torch.cat(
+                        (val_t.reshape(batch_size, 1), vp_t.reshape(batch_size, 1), logits_t),
+                        dim=1,
+                    ).cpu().numpy()
+                    value_pool = packed[:, 0].tolist()
+                    value_prefix_pool = packed[:, 1].tolist()
+                    policy_logits_pool = packed[:, 2:].tolist()
+                else:
+                    value_pool = val_t.cpu().numpy().reshape(-1).tolist()
+                    value_prefix_pool = vp_t.cpu().numpy().reshape(-1).tolist()
+                    policy_logits_pool = logits_t.cpu().numpy().tolist()
 
                 # In ``batch_backpropagate()``, we first expand the leaf node using ``the policy_logits`` and
                 # ``reward`` predicted by the model, then perform backpropagation along the search path to update the
                 # statistics.
-
-                # NOTE: simulation_index + 1 is very important, which is the depth of the current leaf node.
-                current_latent_state_index = simulation_index + 1
                 tree_sampled_efficientzero.batch_backpropagate(
                     current_latent_state_index, discount_factor, value_prefix_pool, value_pool, policy_logits_pool,
                     min_max_stats_lst, results, is_reset_list, virtual_to_play_batch
