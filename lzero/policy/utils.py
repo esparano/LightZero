@@ -478,7 +478,7 @@ def prepare_obs_stack_for_unizero(obs_batch_ori: np.ndarray, cfg: EasyDict) -> T
     return obs_batch, obs_target_batch
 
 
-def prepare_obs(obs_batch_ori: np.ndarray, cfg: EasyDict, task_id = None) -> Tuple[torch.Tensor, torch.Tensor]:
+def prepare_obs(obs_batch_ori: Union[np.ndarray, torch.Tensor], cfg: EasyDict, task_id = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Overview:
         Prepare the observations for the model by converting the original batch of observations
@@ -486,7 +486,7 @@ def prepare_obs(obs_batch_ori: np.ndarray, cfg: EasyDict, task_id = None) -> Tup
         and for calculating the consistency loss if required.
 
     Arguments:
-        - obs_batch_ori (:obj:`np.ndarray`): The original observations in a batch style.
+        - obs_batch_ori (:obj:`Union[np.ndarray, torch.Tensor]`): The original observations in a batch style.
         - cfg (:obj:`EasyDict`): The configuration dictionary containing model settings.
         - task_id (:obj:`int`, optional): The global task ID, used in multitask settings to select the appropriate observation shape.
 
@@ -495,13 +495,19 @@ def prepare_obs(obs_batch_ori: np.ndarray, cfg: EasyDict, task_id = None) -> Tup
         - obs_target_batch (:obj:`torch.Tensor`): The tensor containing the observations for calculating
                                                    the consistency loss, if applicable.
     """
-    # Convert the numpy array of original observations to a PyTorch tensor and transfer it to the specified device.
+    # Convert the numpy array (or already-pinned CPU tensor) of original observations to a PyTorch
+    # tensor and transfer it to the specified device (asynchronously when pinned).
     # Also, ensure the tensor is of the correct floating-point type for the model.
     # Some Gymnasium environments (including MiniGrid's FlatObsWrapper) emit
     # uint8 vector observations.  MLP/linear layers require floating-point
     # inputs, so normalize the dtype at the policy boundary while retaining the
     # compact replay-buffer representation.
-    obs_batch_ori = torch.from_numpy(obs_batch_ori).to(cfg.device).float()
+    if isinstance(obs_batch_ori, torch.Tensor):
+        obs_batch_ori = obs_batch_ori.to(cfg.device, non_blocking=obs_batch_ori.is_pinned())
+    else:
+        obs_batch_ori = torch.from_numpy(obs_batch_ori).to(cfg.device)
+    if obs_batch_ori.dtype != torch.float32:
+        obs_batch_ori = obs_batch_ori.float()
 
     # Calculate the dimension size to slice based on the model configuration.
     # For convolutional models ('conv'), use the number of frames to stack times the number of channels.
@@ -753,26 +759,36 @@ def concat_output(output_lst: List, data_type: str = 'muzero') -> Tuple:
         )
 
 
-def to_torch_float_tensor(data_list: Union[np.ndarray, List[np.ndarray]], device: torch.device) -> Union[
-    torch.Tensor, List[torch.Tensor]]:
+def _to_single_float_tensor(data: Union[np.ndarray, torch.Tensor], device: torch.device) -> torch.Tensor:
+    if isinstance(data, torch.Tensor):
+        t = data.to(device, non_blocking=data.is_pinned())
+        return t if t.dtype == torch.float32 else t.float()
+    t = torch.from_numpy(data)
+    if t.dtype == torch.float64:
+        t = t.float()
+    t = t.to(device)
+    return t if t.dtype == torch.float32 else t.float()
+
+
+def to_torch_float_tensor(
+    data_list: Union[np.ndarray, torch.Tensor, List[Union[np.ndarray, torch.Tensor]]],
+    device: torch.device,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
     """
     Overview:
         convert the data or data list to torch float tensor
     Arguments:
-        - data_list (:obj:`Union[np.ndarray, List[np.ndarray]]`): The data or data list.
+        - data_list (:obj:`Union[np.ndarray, torch.Tensor, List[Union[np.ndarray, torch.Tensor]]]`): The data or data list.
         - device (:obj:`torch.device`): The device.
     Returns:
         - output_data_list (:obj:`Union[torch.Tensor, List[torch.Tensor]]`): The output data or data list.
     """
-    if isinstance(data_list, np.ndarray):
-        return (torch.from_numpy(data_list).to(device).float())
-    elif isinstance(data_list, list) and all(isinstance(data, np.ndarray) for data in data_list):
-        output_data_list = []
-        for data in data_list:
-            output_data_list.append(torch.from_numpy(data).to(device).float())
-        return output_data_list
+    if isinstance(data_list, (np.ndarray, torch.Tensor)):
+        return _to_single_float_tensor(data_list, device)
+    elif isinstance(data_list, list) and all(isinstance(data, (np.ndarray, torch.Tensor)) for data in data_list):
+        return [_to_single_float_tensor(data, device) for data in data_list]
     else:
-        raise TypeError("The type of input must be np.ndarray or List[np.ndarray]")
+        raise TypeError("The type of input must be np.ndarray, torch.Tensor, or a list thereof")
 
 
 def to_detach_cpu_numpy(data_list: Union[torch.Tensor, List[torch.Tensor]]) -> Union[np.ndarray, List[np.ndarray]]:

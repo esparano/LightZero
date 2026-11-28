@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
+import numpy as np
 import psutil
 import torch
 from ding.config import compile_config
@@ -217,6 +218,55 @@ class _PrefetchPolicyProxy:
         return getattr(self._policy, name)
 
 
+def _to_pinned_tensor(arr: Any, cast_float64_to_float32: bool = False) -> Any:
+    """Convert a NumPy array / CPU tensor to a pinned CPU tensor (GIL-free C++ copy)."""
+    if isinstance(arr, np.ndarray):
+        if cast_float64_to_float32 and arr.dtype == np.float64:
+            arr = arr.astype(np.float32, copy=False)
+        t = torch.from_numpy(arr)
+        return t.pin_memory()
+    if isinstance(arr, torch.Tensor):
+        if cast_float64_to_float32 and arr.dtype == torch.float64:
+            arr = arr.float()
+        return arr if arr.is_pinned() else arr.pin_memory()
+    return arr
+
+
+def _pin_sampled_batch(batch: Any) -> Any:
+    """Pin GPU-bound arrays in a sampled ``[current_batch, target_batch]`` pair off the main thread.
+
+    Preserves CPU-only priority bookkeeping fields (``batch_index_list`` and ``make_time_list``)
+    as NumPy arrays / lists so ``replay_buffer.update_priority()`` works unchanged.
+    """
+    if not isinstance(batch, (list, tuple)) or len(batch) != 2:
+        return batch
+    current_batch, target_batch = batch
+    if not isinstance(current_batch, (list, tuple)) or not isinstance(target_batch, (list, tuple)):
+        return batch
+
+    pinned_current = list(current_batch)
+    if len(pinned_current) == 7:
+        # SampledEfficientZero / SampledMuZero:
+        # [obs, action, root_sampled_actions, mask, indices, weights, make_time]
+        pinned_current[0] = _to_pinned_tensor(pinned_current[0], cast_float64_to_float32=True)
+        pinned_current[1] = _to_pinned_tensor(pinned_current[1], cast_float64_to_float32=False)
+        pinned_current[2] = _to_pinned_tensor(pinned_current[2], cast_float64_to_float32=False)
+        pinned_current[3] = _to_pinned_tensor(pinned_current[3], cast_float64_to_float32=True)
+        pinned_current[5] = _to_pinned_tensor(pinned_current[5], cast_float64_to_float32=True)
+    elif len(pinned_current) == 6:
+        # EfficientZero / MuZero / GumbelMuZero:
+        # [obs, action, mask, indices, weights, make_time]
+        pinned_current[0] = _to_pinned_tensor(pinned_current[0], cast_float64_to_float32=True)
+        pinned_current[1] = _to_pinned_tensor(pinned_current[1], cast_float64_to_float32=False)
+        pinned_current[2] = _to_pinned_tensor(pinned_current[2], cast_float64_to_float32=True)
+        pinned_current[4] = _to_pinned_tensor(pinned_current[4], cast_float64_to_float32=True)
+    else:
+        return batch
+
+    pinned_target = [_to_pinned_tensor(x, cast_float64_to_float32=True) for x in target_batch]
+    return [pinned_current, pinned_target]
+
+
 class _BackgroundBatchPrefetcher:
     """Samples training batches on background thread(s) to overlap CPU buffer work with GPU training."""
 
@@ -231,6 +281,7 @@ class _BackgroundBatchPrefetcher:
         num_workers: int = 1,
         max_queue_size: Optional[int] = None,
         poll_interval: float = 0.05,
+        pin_memory: bool = False,
     ) -> None:
         self._replay_buffer = replay_buffer
         self._policy_proxy = policy_proxy
@@ -242,6 +293,7 @@ class _BackgroundBatchPrefetcher:
         q_size = int(max_queue_size) if max_queue_size is not None else max(2, self.num_workers * 2)
         self.max_queue_size = max(1, q_size)
         self._poll_interval = max(0.01, float(poll_interval))
+        self.pin_memory = bool(pin_memory)
         self.queue: 'queue.Queue[Any]' = queue.Queue(maxsize=self.max_queue_size)
         self._stop_event = threading.Event()
         self._error_lock = threading.Lock()
@@ -301,6 +353,8 @@ class _BackgroundBatchPrefetcher:
                     else:
                         with self._target_rwlock.read_lock():
                             batch = self._replay_buffer.sample(self._batch_size, self._policy_proxy)
+                if batch is not None and self.pin_memory and not self._stop_event.is_set():
+                    batch = _pin_sampled_batch(batch)
             except Exception as exc:
                 with self._error_lock:
                     if self._last_error is None:
@@ -815,6 +869,11 @@ class AsyncLearner:
             )
             effective_workers = 1
         self._prefetch_policy_proxy = _PrefetchPolicyProxy(self.policy)
+        use_pin_memory = bool(
+            self.cfg.policy.cuda
+            and torch.cuda.is_available()
+            and self.create_cfg.policy.type == 'sampled_efficientzero'
+        )
         self._batch_prefetcher = _BackgroundBatchPrefetcher(
             replay_buffer=self.replay_buffer,
             policy_proxy=self._prefetch_policy_proxy,
@@ -825,12 +884,14 @@ class AsyncLearner:
             num_workers=effective_workers,
             max_queue_size=self.prefetch_queue_size,
             poll_interval=min(0.05, self.poll_interval),
+            pin_memory=use_pin_memory,
         )
         self._batch_prefetcher.start()
         logging.info(
             f'[AsyncLearner] Started background batch prefetcher '
             f'(workers={self._batch_prefetcher.num_workers}, '
-            f'queue_size={self._batch_prefetcher.max_queue_size})'
+            f'queue_size={self._batch_prefetcher.max_queue_size}, '
+            f'pin_memory={self._batch_prefetcher.pin_memory})'
         )
 
     def _sync_prefetch_target_model(self) -> None:

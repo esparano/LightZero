@@ -445,7 +445,10 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
 
         # shape: (batch_size, num_unroll_steps, action_dim)
         # NOTE: .float() in continuous action space.
-        action_batch = torch.from_numpy(action_batch).to(self._cfg.device)
+        if isinstance(action_batch, torch.Tensor):
+            action_batch = action_batch.to(self._cfg.device, non_blocking=action_batch.is_pinned())
+        else:
+            action_batch = torch.from_numpy(action_batch).to(self._cfg.device)
         data_list = [
             mask_batch,
             target_value_prefix,
@@ -457,7 +460,12 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         # sampled related core code
         # ==============================================================
         # shape: (batch_size, num_unroll_steps+1, num_of_sampled_actions, action_dim), e.g. (4, 6, 5, 1)
-        child_sampled_actions_batch = torch.from_numpy(child_sampled_actions_batch).to(self._cfg.device)
+        if isinstance(child_sampled_actions_batch, torch.Tensor):
+            child_sampled_actions_batch = child_sampled_actions_batch.to(
+                self._cfg.device, non_blocking=child_sampled_actions_batch.is_pinned()
+            )
+        else:
+            child_sampled_actions_batch = torch.from_numpy(child_sampled_actions_batch).to(self._cfg.device)
 
         target_value_prefix = target_value_prefix.view(self._cfg.batch_size, -1)
         target_value = target_value.view(self._cfg.batch_size, -1)
@@ -599,8 +607,8 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
             # reset hidden states every ``lstm_horizon_len`` unroll steps.
             if (step_k + 1) % self._cfg.lstm_horizon_len == 0:
                 reward_hidden_state = (
-                    torch.zeros(1, self._cfg.batch_size, self._cfg.model.lstm_hidden_size).to(self._cfg.device),
-                    torch.zeros(1, self._cfg.batch_size, self._cfg.model.lstm_hidden_size).to(self._cfg.device)
+                    torch.zeros(1, self._cfg.batch_size, self._cfg.model.lstm_hidden_size, device=self._cfg.device),
+                    torch.zeros(1, self._cfg.batch_size, self._cfg.model.lstm_hidden_size, device=self._cfg.device),
                 )
 
             if self._cfg.monitor_extra_statistics:
@@ -641,71 +649,146 @@ class SampledEfficientZeroPolicy(MuZeroPolicy):
         # ==============================================================
         self._target_model.update(self._learn_model.state_dict())
 
-        if self._cfg.monitor_extra_statistics:
-            predicted_value_prefixs_mean = (
-                predicted_value_prefixs_sum / self._cfg.num_unroll_steps
-            ).item() if self._cfg.num_unroll_steps > 0 else 0.0
-            predicted_values_mean = (predicted_values_sum / (self._cfg.num_unroll_steps + 1)).item()
-        else:
-            predicted_value_prefixs_mean = 0.0
-            predicted_values_mean = 0.0
+        # Batch all scalar logging reductions into a single device-to-host transfer
+        # instead of ~20 sequential .item() stream-synchronizing round trips.
+        with torch.no_grad():
+            device = weighted_total_loss.device
+            zero_scalar = torch.zeros((), device=device, dtype=torch.float32)
+            tpe_scalar = (
+                target_policy_entropy.detach().float()
+                if isinstance(target_policy_entropy, torch.Tensor)
+                else torch.tensor(float(target_policy_entropy), device=device, dtype=torch.float32)
+            )
+            grad_norm_scalar = (
+                total_grad_norm_before_clip.detach().float()
+                if isinstance(total_grad_norm_before_clip, torch.Tensor)
+                else torch.tensor(float(total_grad_norm_before_clip), device=device, dtype=torch.float32)
+            )
+            pred_vp_scalar = (
+                (predicted_value_prefixs_sum / self._cfg.num_unroll_steps).detach().float()
+                if (self._cfg.monitor_extra_statistics and self._cfg.num_unroll_steps > 0)
+                else zero_scalar
+            )
+            pred_v_scalar = (
+                (predicted_values_sum / (self._cfg.num_unroll_steps + 1)).detach().float()
+                if self._cfg.monitor_extra_statistics
+                else zero_scalar
+            )
+            stat_tensors = [
+                weighted_total_loss.detach().float(),
+                loss.detach().mean().float(),
+                policy_loss.detach().mean().float(),
+                policy_entropy.detach().float(),
+                tpe_scalar,
+                value_prefix_loss.detach().mean().float(),
+                value_loss.detach().mean().float(),
+                consistency_loss.detach().mean().float(),
+                target_value_prefix.detach().mean().float(),
+                target_value.detach().mean().float(),
+                transformed_target_value_prefix.detach().mean().float(),
+                transformed_target_value.detach().mean().float(),
+                pred_vp_scalar,
+                pred_v_scalar,
+                grad_norm_scalar,
+            ]
+            if self._cfg.model.continuous_action_space:
+                mu0 = mu[:, 0].detach().float()
+                sig = sigma.detach().float()
+                tsa0 = target_sampled_actions[:, :, 0].detach().float()
+                stat_tensors.extend([
+                    mu0.max(), mu0.min(), mu0.mean(),
+                    sig.max(), sig.min(), sig.mean(),
+                    tsa0.max(), tsa0.min(), tsa0.mean(),
+                ])
+            else:
+                tsa_f = target_sampled_actions.detach().float()
+                stat_tensors.extend([
+                    tsa_f.max(), tsa_f.min(), tsa_f.mean(),
+                    (action_batch[:, 0] == 0).float().mean(),
+                    root_policy_action0_prob.detach().float(),
+                ])
+            stats_cpu = torch.stack(stat_tensors).cpu().tolist()
 
         value_priority = value_priority_tensor.cpu().numpy()
+
+        (
+            weighted_total_loss_v,
+            total_loss_v,
+            policy_loss_v,
+            policy_entropy_v,
+            target_policy_entropy_v,
+            value_prefix_loss_v,
+            value_loss_v,
+            consistency_loss_v,
+            target_value_prefix_v,
+            target_value_v,
+            transformed_target_value_prefix_v,
+            transformed_target_value_v,
+            predicted_value_prefixs_mean,
+            predicted_values_mean,
+            total_grad_norm_v,
+        ) = stats_cpu[:15]
 
         return_data = {
             'cur_lr': self._optimizer.param_groups[0]['lr'],
             'collect_mcts_temperature': self._collect_mcts_temperature,
-            'weighted_total_loss': weighted_total_loss.item(),
-            'total_loss': loss.mean().item(),
-            'policy_loss': policy_loss.mean().item(),
-            'policy_entropy': policy_entropy.item() / (self._cfg.num_unroll_steps + 1),
-            'target_policy_entropy': target_policy_entropy / (self._cfg.num_unroll_steps + 1),
-            'value_prefix_loss': value_prefix_loss.mean().item(),
-            'value_loss': value_loss.mean().item(),
-            'consistency_loss': consistency_loss.mean().item() / self._cfg.num_unroll_steps,
+            'weighted_total_loss': weighted_total_loss_v,
+            'total_loss': total_loss_v,
+            'policy_loss': policy_loss_v,
+            'policy_entropy': policy_entropy_v / (self._cfg.num_unroll_steps + 1),
+            'target_policy_entropy': target_policy_entropy_v / (self._cfg.num_unroll_steps + 1),
+            'value_prefix_loss': value_prefix_loss_v,
+            'value_loss': value_loss_v,
+            'consistency_loss': consistency_loss_v / self._cfg.num_unroll_steps,
 
             # ==============================================================
             # priority related
             # ==============================================================
-            'value_priority': value_priority.flatten().mean().item(),
+            'value_priority': float(value_priority.mean()),
             'value_priority_orig': value_priority,
-            'target_value_prefix': target_value_prefix.detach().mean().item(),
-            'target_value': target_value.detach().mean().item(),
-            'transformed_target_value_prefix': transformed_target_value_prefix.detach().mean().item(),
-            'transformed_target_value': transformed_target_value.detach().mean().item(),
+            'target_value_prefix': target_value_prefix_v,
+            'target_value': target_value_v,
+            'transformed_target_value_prefix': transformed_target_value_prefix_v,
+            'transformed_target_value': transformed_target_value_v,
             'predicted_value_prefixs': predicted_value_prefixs_mean,
             'predicted_values': predicted_values_mean
         }
 
         if self._cfg.model.continuous_action_space:
+            (
+                mu_max, mu_min, mu_mean,
+                sigma_max, sigma_min, sigma_mean,
+                tsa_max, tsa_min, tsa_mean,
+            ) = stats_cpu[15:]
             return_data.update({
                 # ==============================================================
                 # sampled related core code
                 # ==============================================================
-                'policy_mu_max': mu[:, 0].max().item(),
-                'policy_mu_min': mu[:, 0].min().item(),
-                'policy_mu_mean': mu[:, 0].mean().item(),
-                'policy_sigma_max': sigma.max().item(),
-                'policy_sigma_min': sigma.min().item(),
-                'policy_sigma_mean': sigma.mean().item(),
+                'policy_mu_max': mu_max,
+                'policy_mu_min': mu_min,
+                'policy_mu_mean': mu_mean,
+                'policy_sigma_max': sigma_max,
+                'policy_sigma_min': sigma_min,
+                'policy_sigma_mean': sigma_mean,
                 # take the fist dim in action space
-                'target_sampled_actions_max': target_sampled_actions[:, :, 0].max().item(),
-                'target_sampled_actions_min': target_sampled_actions[:, :, 0].min().item(),
-                'target_sampled_actions_mean': target_sampled_actions[:, :, 0].mean().item(),
-                'total_grad_norm_before_clip': total_grad_norm_before_clip.item()
+                'target_sampled_actions_max': tsa_max,
+                'target_sampled_actions_min': tsa_min,
+                'target_sampled_actions_mean': tsa_mean,
+                'total_grad_norm_before_clip': total_grad_norm_v
             })
         else:
+            tsa_max, tsa_min, tsa_mean, action0_rate, action0_prob = stats_cpu[15:]
             return_data.update({
                 # ==============================================================
                 # sampled related core code
                 # ==============================================================
                 # take the fist dim in action space
-                'target_sampled_actions_max': target_sampled_actions[:, :].float().max().item(),
-                'target_sampled_actions_min': target_sampled_actions[:, :].float().min().item(),
-                'target_sampled_actions_mean': target_sampled_actions[:, :].float().mean().item(),
-                'action0_taken_rate': (action_batch[:, 0] == 0).float().mean().item(),
-                'policy_action0_prob': root_policy_action0_prob.item(),
-                'total_grad_norm_before_clip': total_grad_norm_before_clip.item()
+                'target_sampled_actions_max': tsa_max,
+                'target_sampled_actions_min': tsa_min,
+                'target_sampled_actions_mean': tsa_mean,
+                'action0_taken_rate': action0_rate,
+                'policy_action0_prob': action0_prob,
+                'total_grad_norm_before_clip': total_grad_norm_v
             })
 
         return return_data

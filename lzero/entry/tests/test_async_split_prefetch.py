@@ -16,6 +16,7 @@ from lzero.entry.async_split.learner import (
     _BackgroundBatchPrefetcher,
     _PrefetchPolicyProxy,
     _RWLock,
+    _pin_sampled_batch,
 )
 from zoo.board_games.galcon.config.galcon_sez_sp_mode_config_SIMPLE_1map import (
     create_config as _base_create_cfg,
@@ -431,6 +432,168 @@ class TestAsyncLearnerPrefetchIntegration:
 
             assert batch is None
             assert max_concurrent == 1
+        finally:
+            actor.close()
+            learner.close()
+
+
+@pytest.mark.unittest
+class TestPinnedMemoryPrefetchAndTensorBatch:
+
+    def test_prepare_obs_and_to_torch_float_tensor_accept_tensors(self):
+        from lzero.policy.utils import prepare_obs, to_torch_float_tensor
+
+        cfg = EasyDict(
+            device='cpu',
+            model=EasyDict(
+                model_type='conv',
+                frame_stack_num=2,
+                image_channel=3,
+                self_supervised_learning_loss=True,
+            ),
+        )
+        obs_np = np.arange(2 * 12 * 4 * 4, dtype=np.uint8).reshape(2, 12, 4, 4)
+        obs_t = torch.from_numpy(obs_np.copy())
+
+        o_np, t_np = prepare_obs(obs_np, cfg)
+        o_t, t_t = prepare_obs(obs_t, cfg)
+        assert o_t.dtype == torch.float32
+        assert t_t.dtype == torch.float32
+        assert torch.equal(o_np, o_t)
+        assert torch.equal(t_np, t_t)
+
+        arr_f64 = np.array([[1.5, -2.5], [0.25, 3.0]], dtype=np.float64)
+        arr_t = torch.from_numpy(arr_f64.astype(np.float32))
+        single_np = to_torch_float_tensor(arr_f64, 'cpu')
+        single_t = to_torch_float_tensor(arr_t, 'cpu')
+        assert single_np.dtype == torch.float32
+        assert single_t.dtype == torch.float32
+        assert torch.equal(single_np, single_t)
+
+        mixed = to_torch_float_tensor([arr_f64, arr_t], 'cpu')
+        assert len(mixed) == 2
+        assert torch.equal(mixed[0], mixed[1])
+
+        with pytest.raises(TypeError):
+            to_torch_float_tensor('invalid', 'cpu')
+
+    def test_pin_sampled_batch_converts_gpu_fields_and_preserves_cpu_metadata(self, monkeypatch):
+        pinned_ids = []
+
+        def _fake_pin_memory(self):
+            pinned_ids.append((tuple(self.shape), self.dtype))
+            return self
+
+        monkeypatch.setattr(torch.Tensor, 'pin_memory', _fake_pin_memory)
+
+        current_batch = [
+            np.zeros((4, 12, 4, 4), dtype=np.float32),       # [0] obs
+            np.zeros((4, 2), dtype=np.int64),                 # [1] action
+            np.zeros((4, 3, 4, 1), dtype=np.int64),           # [2] root_sampled_actions
+            np.ones((4, 3), dtype=np.float64),                # [3] mask
+            np.array([10, 11, 12, 13], dtype=np.int64),       # [4] indices (CPU only)
+            np.ones((4,), dtype=np.float64),                  # [5] weights
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64), # [6] make_time (CPU only)
+        ]
+        target_batch = [
+            np.zeros((4, 3), dtype=np.float64),               # target_value_prefix
+            np.zeros((4, 3), dtype=np.float64),               # target_value
+            np.full((4, 3, 4), 0.25, dtype=np.float64),       # target_policy
+        ]
+
+        pinned_cur, pinned_tgt = _pin_sampled_batch([current_batch, target_batch])
+
+        # GPU-bound tensors converted with float64->float32 cast on float fields and int64 preserved
+        assert isinstance(pinned_cur[0], torch.Tensor) and pinned_cur[0].dtype == torch.float32
+        assert isinstance(pinned_cur[1], torch.Tensor) and pinned_cur[1].dtype == torch.int64
+        assert isinstance(pinned_cur[2], torch.Tensor) and pinned_cur[2].dtype == torch.int64
+        assert isinstance(pinned_cur[3], torch.Tensor) and pinned_cur[3].dtype == torch.float32
+        assert isinstance(pinned_cur[5], torch.Tensor) and pinned_cur[5].dtype == torch.float32
+        assert all(isinstance(t, torch.Tensor) and t.dtype == torch.float32 for t in pinned_tgt)
+        assert len(pinned_ids) == 8
+
+        # CPU-only priority bookkeeping metadata remains untouched NumPy arrays
+        assert isinstance(pinned_cur[4], np.ndarray)
+        assert isinstance(pinned_cur[6], np.ndarray)
+        np.testing.assert_array_equal(pinned_cur[4], current_batch[4])
+        np.testing.assert_array_equal(pinned_cur[6], current_batch[6])
+
+        # Non-standard objects pass through safely
+        passthrough = {'custom': 1}
+        assert _pin_sampled_batch(passthrough) is passthrough
+
+    def test_sez_forward_learn_matches_between_numpy_and_tensor_batches(self, tmp_path, monkeypatch):
+        import copy
+
+        from ding.config import compile_config
+        from ding.policy import create_policy
+
+        cfg, create_cfg = _make_tiny_galcon_cfg()
+        run_dir = tmp_path / 'run_equiv'
+
+        learner = AsyncLearner(
+            input_cfg=(cfg, create_cfg),
+            run_dir=run_dir,
+            seed=0,
+            device='cpu',
+            save_ckpt_every_n_updates=0,
+            max_replay_ratio=None,
+            min_transitions=8,
+            use_bg_reader=False,
+            prefetch_workers=0,
+        )
+        actor = SelfPlayActor(
+            input_cfg=(cfg, create_cfg),
+            run_dir=run_dir,
+            actor_id='actor_0',
+            seed=10,
+            device='cpu',
+            collector_env_num=2,
+            n_episode=2,
+            num_simulations=4,
+            env_manager_type='base',
+            wait_for_initial_weights=False,
+        )
+        try:
+            actor.step_once()
+            actor.step_once()
+            learner.ingest_pending_segments()
+
+            np.random.seed(99)
+            raw_batch = learner.replay_buffer.sample(int(cfg.policy.batch_size), learner.policy)
+
+            # Avoid touching CUDA in CPU test while still exercising _pin_sampled_batch conversion
+            monkeypatch.setattr(torch.Tensor, 'pin_memory', lambda self: self)
+            tensor_batch = _pin_sampled_batch(copy.deepcopy(raw_batch))
+
+            # Build two identical policies with identical weights and RNG state
+            compiled = compile_config(
+                EasyDict(copy.deepcopy(cfg)), seed=0, env=None, auto=True, create_cfg=EasyDict(copy.deepcopy(create_cfg)), save_cfg=False
+            )
+            pol_np = create_policy(compiled.policy, model=None, enable_field=['learn', 'collect'])
+            pol_t = create_policy(compiled.policy, model=None, enable_field=['learn', 'collect'])
+            pol_t._learn_model.load_state_dict(copy.deepcopy(pol_np._learn_model.state_dict()))
+            pol_t._target_model.load_state_dict(copy.deepcopy(pol_np._target_model.state_dict()))
+            pol_np._collect_mcts_temperature = 1.0
+            pol_t._collect_mcts_temperature = 1.0
+
+            torch.manual_seed(1234)
+            ret_np = pol_np._forward_learn(raw_batch)
+            torch.manual_seed(1234)
+            ret_t = pol_t._forward_learn(tensor_batch)
+
+            assert set(ret_np.keys()) == set(ret_t.keys())
+            for k in ret_np:
+                v_np, v_t = ret_np[k], ret_t[k]
+                if isinstance(v_np, np.ndarray):
+                    np.testing.assert_allclose(v_t, v_np, rtol=1e-6, atol=1e-6, err_msg=f'mismatch on {k}')
+                else:
+                    assert isinstance(v_t, (float, int)), f'expected scalar for {k}, got {type(v_t)}'
+                    assert v_t == pytest.approx(float(v_np), rel=1e-6, abs=1e-6), f'mismatch on {k}'
+
+            for name, p_np in pol_np._learn_model.state_dict().items():
+                p_t = pol_t._learn_model.state_dict()[name]
+                assert torch.allclose(p_t, p_np, rtol=1e-6, atol=1e-6), f'param mismatch on {name}'
         finally:
             actor.close()
             learner.close()
